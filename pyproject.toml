@@ -32,7 +32,7 @@ dependencies = [
     "identify ~= 2.0",
     "linesep ~= 0.4",
     "packaging",
-    "pydantic ~= 1.8",
+    "pydantic ~= 2.0",
     "ruamel.yaml",
     "typing_extensions",
     "zarr_checksum ~= 0.4.0",
@@ -76,4 +76,3 @@ ignore_missing_imports = true
 
 [tool.pydantic-mypy]
 init_forbid_extra = true
-warn_untypes_fields = true
