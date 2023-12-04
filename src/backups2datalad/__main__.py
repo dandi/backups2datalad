@@ -66,6 +66,11 @@ async def main(
     backup_root: Path,
     config: Path | None,
 ) -> None:
+    """
+    Mirror Dandisets as git-annex repositories.
+
+    Visit <https://github.com/dandi/backups2datalad> for more information.
+    """
     if config is None:
         cfg = BackupConfig()
     else:

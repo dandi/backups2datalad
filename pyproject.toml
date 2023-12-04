@@ -1,0 +1,78 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "backups2datalad"
+version = "0.0.0"
+description = "Mirror Dandisets as git-annex repositories"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = { paths = ["LICENSE"] }
+authors = [
+    { name = "DANDI Developers", email = "team@dandiarchive.org" }
+]
+maintainers = [
+    { name = "John Thorvald Wodder II", email = "backups2datalad@varonathe.org" }
+]
+
+classifiers = ["Private :: Keep Off PyPI"]
+
+dependencies = [
+    "aiobotocore",
+    "anyio ~= 4.0",
+    "asyncclick >= 8.0.1",
+    "dandi >= 0.55.0",
+    "dandischema",
+    "datalad >= 0.17.0",
+    "ghrepo ~= 0.1",
+    "httpx ~= 0.22",
+    "humanize",
+    "identify ~= 2.0",
+    "linesep ~= 0.4",
+    "packaging",
+    "pydantic ~= 1.8",
+    "typing_extensions",
+    "zarr_checksum ~= 0.2.11",
+]
+
+[project.scripts]
+backups2datalad = "backups2datalad.__main__:main"
+
+[project.urls]
+"Source Code" = "https://github.com/dandi/backups2datalad"
+"Bug Tracker" = "https://github.com/dandi/backups2datalad/issues"
+
+[tool.hatch.envs.default]
+python = "3"
+
+[tool.mypy]
+allow_incomplete_defs = false
+allow_untyped_defs = false
+ignore_missing_imports = false
+# <https://github.com/python/mypy/issues/7773>:
+no_implicit_optional = true
+implicit_reexport = false
+local_partial_types = true
+pretty = true
+show_error_codes = true
+show_traceback = true
+strict_equality = true
+warn_redundant_casts = true
+warn_return_any = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = [
+    "dandi.*",
+    "datalad.*",
+    # <https://github.com/zarr-developers/zarr-python/issues/1566>
+    "zarr.*",
+]
+ignore_missing_imports = true
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+warn_untypes_fields = true

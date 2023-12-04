@@ -1,11 +1,6 @@
-*.pyc
-*.pyo
-*.swp
 .coverage*
-.hypothesis
-.idea
+.mypy_cache/
+.nox/
+.tox/
 __pycache__/
-venv/
-venvs/
-dandisets/
-dandizarrs/
+dist/
