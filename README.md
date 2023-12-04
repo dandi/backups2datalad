@@ -11,13 +11,14 @@ Setup
 
 Before running `backups2datalad`, the following setup must be performed:
 
-- A Python environment must be set up with the packages listed in
-  `backups2datalad.req.txt` installed.  The minimum required Python version is
-  given in a comment at the top of the file.
+- `backups2datalad` must be installed in a Python environment using either `pip
+  install .` (run from a clone of this repository) or `pip install
+  git+https://github.com/dandi/backups2datalad`.  At least Python 3.10 is
+  required.
 
-- [git-annex](https://git-annex.branchable.com) must be installed.  The minimum
-  required version is given in a comment near the top of
-  `backups2datalad.req.txt`.
+- [git-annex](https://git-annex.branchable.com) must be installed.  At least
+  version 10.20230126 is required, though you should endeavor to obtain the
+  latest version.
 
 - A configuration file should be written.  This is a YAML file containing a
   mapping with the following keys:
@@ -137,7 +138,7 @@ Before running `backups2datalad`, the following setup must be performed:
 
         - `"force"` — always back up
 
-        - `"verify"`  — always back up, but error if there are any changes
+        - `"verify"` — always back up, but error if there are any changes
           without a change to the "modified" timestamp
 
       This option can also be set via the `--mode` option of the
@@ -171,12 +172,12 @@ Before running `backups2datalad`, the following setup must be performed:
 Usage
 -----
 
-Run `backups2datalad` from this directory with:
+Run `backups2datalad` with:
 
-    python3 -m backups2datalad --config path/to/config/file <subcommand> ...
+    backups2datalad --config path/to/config/file <subcommand> ...
 
-Run `python3 -m backups2datalad --help` for details on the global options and
-summaries of the subcommands.
+Run `backups2datalad --help` for details on the global options and summaries of
+the subcommands.
 
 `backups2datalad` subcommands:
 
@@ -200,8 +201,8 @@ summaries of the subcommands.
 
 - `zarr-checksum` — Computes the Zarr checksum for a given Zarr mirror
 
-Run `python3 -m backups2datalad <subcommand> --help` for further details on
-each subcommand.
+Run `backups2datalad <subcommand> --help` for further details on each
+subcommand.
 
 The primary mirroring subcommands are `update-from-backup`, `populate`, and
 `populate-zarrs`; the other subcommands are for minor/maintenance tasks and
