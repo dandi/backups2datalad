@@ -11,7 +11,7 @@ DEFAULT_GIT_ANNEX_JOBS = 10
 DEFAULT_WORKERS = 5
 
 # Maximum number of Zarrs to process at once
-ZARR_LIMIT = 32
+ZARR_LIMIT = 10
 
 USER_AGENT = "backups2datalad ({}) httpx/{} {}/{}".format(
     __url__,
