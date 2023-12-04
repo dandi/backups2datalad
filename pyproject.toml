@@ -34,7 +34,7 @@ dependencies = [
     "packaging",
     "pydantic ~= 1.8",
     "typing_extensions",
-    "zarr_checksum ~= 0.2.11",
+    "zarr_checksum ~= 0.3.1",
 ]
 
 [project.scripts]
