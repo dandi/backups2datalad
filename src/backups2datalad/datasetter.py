@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import partial
 import json
 import logging
@@ -542,7 +542,8 @@ class DandiDatasetter(AsyncResource):
         await self.ensure_superdataset()
         logdir = self.config.dandiset_root / ".git" / "dandi" / "backups2datalad"
         logdir.mkdir(exist_ok=True, parents=True)
-        filename = f"{datetime.utcnow():%Y.%m.%d.%H.%M.%SZ}.log"
+        ts = datetime.now(timezone.utc)
+        filename = f"{ts:%Y.%m.%d.%H.%M.%SZ}.log"
         self.logfile = logdir / filename
         handler = logging.FileHandler(self.logfile, encoding="utf-8")
         handler.setLevel(logging.DEBUG)
