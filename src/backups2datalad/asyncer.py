@@ -178,6 +178,7 @@ class Downloader:
                             )
                             downloading = False
                         else:
+                            assert isinstance(asset, RemoteZarrAsset)
                             self.nursery.start_soon(
                                 self.process_zarr,
                                 asset,
