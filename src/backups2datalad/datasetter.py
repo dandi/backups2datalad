@@ -17,7 +17,7 @@ import subprocess
 
 import anyio
 from anyio.abc import AsyncResource
-from dandi.consts import dandiset_metadata_file
+from dandi.consts import EmbargoStatus, dandiset_metadata_file
 from dandi.exceptions import NotFoundError
 from datalad.api import clone
 from ghrepo import GHRepo
@@ -96,13 +96,18 @@ class DandiDatasetter(AsyncResource):
             await self.set_superds_description(superds)
 
     async def init_dataset(
-        self, dsdir: Path, dandiset_id: str, create_time: datetime
+        self,
+        dsdir: Path,
+        dandiset_id: str,
+        create_time: datetime,
+        embargo_status: EmbargoStatus,
     ) -> AsyncDataset:
         ds = AsyncDataset(dsdir)
         await ds.ensure_installed(
             desc=f"Dandiset {dandiset_id}",
             commit_date=create_time,
             backup_remote=self.config.dandisets.remote,
+            embargo_status=embargo_status,
         )
         return ds
 
@@ -122,11 +127,15 @@ class DandiDatasetter(AsyncResource):
         self, dandiset: RemoteDandiset, ds: AsyncDataset | None = None
     ) -> bool:
         # Returns true iff any changes were committed to the repository
+        if dandiset.embargo_status is EmbargoStatus.UNEMBARGOING:
+            log.info("Dandiset %s is unembargoing; not syncing", dandiset.identifier)
+            return False
         if ds is None:
             ds = await self.init_dataset(
                 self.config.dandiset_root / dandiset.identifier,
                 dandiset_id=dandiset.identifier,
                 create_time=dandiset.version.created,
+                embargo_status=dandiset.embargo_status,
             )
         dmanager = self.manager.with_sublogger(f"Dandiset {dandiset.identifier}")
         state = ds.get_assets_state()

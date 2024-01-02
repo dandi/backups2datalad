@@ -17,6 +17,7 @@ from urllib.parse import urlparse, urlunparse
 
 import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
+from dandi.consts import EmbargoStatus
 from dandi.dandiapi import AssetType
 from dandi.exceptions import NotFoundError
 from dandischema.models import DigestType
@@ -106,6 +107,7 @@ class Report:
 @dataclass
 class Downloader:
     dandiset_id: str
+    embargoed: bool
     ds: AsyncDataset
     manager: Manager
     tracker: AssetTracker
@@ -168,6 +170,12 @@ class Downloader:
                 self.tracker.remote_assets.add(asset.path)
                 if downloading:
                     if asset.asset_type == AssetType.ZARR:
+                        if self.embargoed:
+                            raise RuntimeError(
+                                f"Dandiset {self.dandiset_id} is embargoed and"
+                                f" contains a Zarr at {asset.path}; do not know"
+                                " how to handle"
+                            )
                         try:
                             zarr_digest = asset.get_digest_value()
                         except NotFoundError:
@@ -284,7 +292,8 @@ class Downloader:
                         PurePosixPath(asset.path).name, asset.size, sha256_digest
                     )
                     await self.annex.from_key(key, asset.path)
-                    await self.register_url(asset.path, key, bucket_url)
+                    if not self.embargoed:
+                        await self.register_url(asset.path, key, bucket_url)
                     await self.register_url(asset.path, key, asset.base_download_url)
                     remotes = await self.annex.get_key_remotes(key)
                     if (
@@ -310,11 +319,17 @@ class Downloader:
                         bucket_url,
                     )
                     await self.ensure_addurl()
+                    if self.embargoed:
+                        url = asset.base_download_url
+                        extra_urls = []
+                    else:
+                        url = bucket_url
+                        extra_urls = [asset.base_download_url]
                     await sender.send(
                         ToDownload(
                             path=asset.path,
-                            url=bucket_url,
-                            extra_urls=[asset.base_download_url],
+                            url=url,
+                            extra_urls=extra_urls,
                             sha256_digest=sha256_digest,
                         )
                     )
@@ -520,6 +535,7 @@ async def async_assets(
                 ) as s3client, anyio.create_task_group() as nursery:
                     dm = Downloader(
                         dandiset_id=dandiset.identifier,
+                        embargoed=dandiset.embargo_status is EmbargoStatus.EMBARGOED,
                         ds=ds,
                         manager=manager,
                         tracker=tracker,

@@ -14,6 +14,7 @@ import textwrap
 from typing import Any, ClassVar
 
 import anyio
+from dandi.consts import EmbargoStatus
 from datalad.api import Dataset
 from datalad.runner.exception import CommandError
 from ghrepo import GHRepo
@@ -25,6 +26,8 @@ from .config import BackupConfig, Remote
 from .consts import DEFAULT_BRANCH, GIT_OPTIONS
 from .logging import log
 from .util import custom_commit_env, exp_wait, is_meta_file, key2hash
+
+EMBARGO_STATUS_KEY = "dandi.dandiset.embargo-status"
 
 
 @dataclass
@@ -55,6 +58,7 @@ class AsyncDataset:
         backup_remote: Remote | None = None,
         backend: str = "SHA256E",
         cfg_proc: str | None = "text2git",
+        embargo_status: EmbargoStatus = EmbargoStatus.OPEN,
     ) -> bool:
         # Returns True if the dataset was freshly created
         if self.ds.is_installed():
@@ -72,6 +76,11 @@ class AsyncDataset:
                 "GIT_CONFIG_PARAMETERS": f"'init.defaultBranch={DEFAULT_BRANCH}'",
             },
         )
+        if embargo_status is not EmbargoStatus.OPEN:
+            await self.set_embargo_status(embargo_status)
+            await self.save(
+                "[backups2datalad] Set embargo status", commit_date=commit_date
+            )
         await self.call_annex(
             "initremote",
             "--sameas=web",
@@ -121,6 +130,34 @@ class AsyncDataset:
     async def get_datalad_id(self) -> str:
         return await self.read_git(
             "config", "--file", ".datalad/config", "--get", "datalad.dataset.id"
+        )
+
+    async def get_embargo_status(self) -> EmbargoStatus:
+        try:
+            value = await self.read_git(
+                "config",
+                "--file",
+                ".datalad/config",
+                "--get",
+                EMBARGO_STATUS_KEY,
+            )
+        except subprocess.CalledProcessError as e:
+            if e.returncode == 1:
+                return EmbargoStatus.OPEN
+            else:
+                raise
+        else:
+            return EmbargoStatus(value)
+
+    async def set_embargo_status(self, status: EmbargoStatus) -> None:
+        await self.call_git(
+            "config",
+            "--file",
+            ".datalad/config",
+            "--replace-all",
+            EMBARGO_STATUS_KEY,
+            "--",
+            status.value,
         )
 
     async def call_git(self, *args: str | Path, **kwargs: Any) -> None:
@@ -370,6 +407,7 @@ class AsyncDataset:
         # Returns True iff sibling was created
         if "github" not in (await self.read_git("remote")).splitlines():
             log.info("Creating GitHub sibling for %s", name)
+            private = await self.get_embargo_status() is EmbargoStatus.EMBARGOED
             await anyio.to_thread.run_sync(
                 partial(
                     self.ds.create_sibling_github,
@@ -381,6 +419,7 @@ class AsyncDataset:
                     publish_depends=backup_remote.name
                     if backup_remote is not None
                     else None,
+                    private=private,
                 )
             )
             for key, value in [
