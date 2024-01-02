@@ -104,7 +104,9 @@ class AsyncDandiClient(AsyncResource):
 
     async def get_dandisets(self) -> AsyncGenerator[RemoteDandiset, None]:
         # Unlike the synchronous method, this always uses the draft version
-        async with aclosing(self.paginate("/dandisets/")) as ait:
+        async with aclosing(
+            self.paginate("/dandisets/", params={"embargoed": "true"})
+        ) as ait:
             async for data in ait:
                 yield RemoteDandiset.from_data(self, data)
 
