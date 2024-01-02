@@ -40,7 +40,8 @@ def capture_all_logs(caplog: pytest.LogCaptureFixture) -> None:
 
 @pytest.fixture
 async def dandi_client() -> AsyncIterator[AsyncDandiClient]:
-    api_token = os.environ["DANDI_API_KEY"]
+    api_token = os.environ["DANDI_API_KEY"].strip()
+    assert api_token != "", "DANDI_API_KEY not set"
     async with AsyncDandiClient.for_dandi_instance(
         "dandi-staging", token=api_token
     ) as client:
