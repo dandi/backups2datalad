@@ -513,6 +513,10 @@ class AsyncDataset:
     async def get_commit_hash(self) -> str:
         return await self.read_git("show", "-s", "--format=%H")
 
+    async def get_last_commit_date(self) -> datetime:
+        ts = await self.read_git("show", "-s", "--format=%aI")
+        return datetime.fromisoformat(ts)
+
     def assert_no_duplicates_in_gitmodules(self) -> None:
         filepath = self.pathobj / ".gitmodules"
         if not filepath.exists():

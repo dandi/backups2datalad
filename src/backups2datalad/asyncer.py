@@ -13,7 +13,6 @@ import os.path
 from pathlib import Path, PurePosixPath
 import subprocess
 from types import TracebackType
-from urllib.parse import urlparse, urlunparse
 
 import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
@@ -24,12 +23,12 @@ from dandischema.models import DigestType
 import datalad
 from datalad.api import clone
 import httpx
-from identify.identify import tags_from_filename
 
-from .adandi import RemoteAsset, RemoteDandiset, RemoteZarrAsset
+from .adandi import RemoteAsset, RemoteBlobAsset, RemoteDandiset, RemoteZarrAsset
 from .adataset import AssetsState, AsyncDataset
-from .aioutil import TextProcess, arequest, aruncmd, open_git_annex
+from .aioutil import TextProcess, aruncmd, open_git_annex
 from .annex import AsyncAnnex
+from .blob import BlobBackup
 from .config import BackupConfig, ZarrMode
 from .consts import GIT_OPTIONS, USER_AGENT
 from .logging import PrefixedLogger, log
@@ -47,10 +46,9 @@ from .zarr import ZarrLink, sync_zarr
 
 @dataclass
 class ToDownload:
-    path: str
+    blob: BlobBackup
     url: str
     extra_urls: list[str]
-    sha256_digest: str
 
 
 @dataclass
@@ -194,6 +192,7 @@ class Downloader:
                                 name=f"process_zarr:{asset.path}",
                             )
                     else:
+                        assert isinstance(asset, RemoteBlobAsset)
                         try:
                             sha256_digest = asset.get_digest_value(DigestType.sha2_256)
                             assert sha256_digest is not None
@@ -205,12 +204,18 @@ class Downloader:
                             )
                             downloading = False
                         else:
+                            blob = BlobBackup(
+                                asset=asset,
+                                sha256_digest=sha256_digest,
+                                manager=self.manager.with_sublogger(
+                                    f"Asset {asset.path}"
+                                ),
+                            )
                             self.nursery.start_soon(
-                                self.process_asset,
-                                asset,
-                                sha256_digest,
+                                self.process_blob,
+                                blob,
                                 self.download_sender.clone(),
-                                name=f"process_asset:{asset.path}",
+                                name=f"process_blob:{asset.path}",
                             )
                 # Not `else`, as we want to "fall through" if `downloading`
                 # is negated above.
@@ -231,107 +236,96 @@ class Downloader:
                             )
                             self.report.old_unhashed += 1
 
-    async def process_asset(
+    async def process_blob(
         self,
-        asset: RemoteAsset,
-        sha256_digest: str,
+        blob: BlobBackup,
         sender: MemoryObjectSendStream[ToDownload],
     ) -> None:
         async with sender:
-            self.last_timestamp = maxdatetime(self.last_timestamp, asset.created)
-            dest = self.repo / asset.path
-            if not self.tracker.register_asset(asset, force=self.config.force):
-                self.log.debug(
-                    "%s: metadata unchanged; not taking any further action",
-                    asset.path,
-                )
-                self.tracker.finish_asset(asset.path)
+            self.last_timestamp = maxdatetime(self.last_timestamp, blob.asset.created)
+            dest = self.repo / blob.path
+            if not self.tracker.register_asset(blob.asset, force=self.config.force):
+                blob.log.debug("metadata unchanged; not taking any further action")
+                self.tracker.finish_asset(blob.path)
                 return
-            if not self.config.match_asset(asset.path):
-                self.log.debug("%s: Skipping asset", asset.path)
-                self.tracker.finish_asset(asset.path)
+            if not self.config.match_asset(blob.path):
+                blob.log.debug("Skipping asset")
+                self.tracker.finish_asset(blob.path)
                 return
             if self.error_on_change:
                 raise UnexpectedChangeError(
                     f"Dandiset {self.dandiset_id}: Metadata for asset"
-                    f" {asset.path} was changed/added but draft timestamp was"
+                    f" {blob.path} was changed/added but draft timestamp was"
                     " not updated on server"
                 )
-            self.log.info("%s: Syncing", asset.path)
+            blob.log.info("Syncing")
             dest.parent.mkdir(parents=True, exist_ok=True)
             to_update = False
             if not (dest.exists() or dest.is_symlink()):
-                self.log.info("%s: Not in dataset; will add", asset.path)
+                blob.log.info("Not in dataset; will add")
                 to_update = True
                 self.report.added += 1
             else:
-                self.log.debug("%s: About to fetch hash from annex", asset.path)
-                if sha256_digest == await self.get_annex_hash(dest):
-                    self.log.info(
-                        "%s: Asset in dataset, and hash shows no modification;"
+                blob.log.debug("About to fetch hash from annex")
+                if blob.sha256_digest == await self.get_annex_hash(dest):
+                    blob.log.info(
+                        "Asset in dataset, and hash shows no modification;"
                         " will not update",
-                        asset.path,
                     )
-                    self.tracker.finish_asset(asset.path)
+                    self.tracker.finish_asset(blob.path)
                 else:
-                    self.log.info(
-                        "%s: Asset in dataset, and hash shows modification;"
-                        " will update",
-                        asset.path,
+                    blob.log.info(
+                        "Asset in dataset, and hash shows modification; will update",
                     )
                     to_update = True
                     self.report.updated += 1
             if to_update:
-                bucket_url = await self.get_file_bucket_url(asset)
-                await self.ds.remove(asset.path)
-                if "text" not in tags_from_filename(asset.path):
-                    self.log.info(
-                        "%s: File is binary; registering key with git-annex", asset.path
-                    )
+                await self.ds.remove(blob.path)
+                if blob.is_binary():
+                    blob.log.info("File is binary; registering key with git-annex")
                     key = await self.annex.mkkey(
-                        PurePosixPath(asset.path).name, asset.size, sha256_digest
+                        PurePosixPath(blob.path).name,
+                        blob.asset.size,
+                        blob.sha256_digest,
                     )
-                    await self.annex.from_key(key, asset.path)
+                    await self.annex.from_key(key, blob.path)
                     if not self.embargoed:
-                        await self.register_url(asset.path, key, bucket_url)
-                    await self.register_url(asset.path, key, asset.base_download_url)
+                        bucket_url = await blob.get_file_bucket_url(self.s3client)
+                        await blob.register_url(self.annex, key, bucket_url)
+                    await blob.register_url(
+                        self.annex, key, blob.asset.base_download_url
+                    )
                     remotes = await self.annex.get_key_remotes(key)
                     if (
                         remotes is not None
                         and self.config.dandisets.remote is not None
                         and self.config.dandisets.remote.name not in remotes
                     ):
-                        self.log.info(
-                            "%s: Not in backup remote %r",
-                            asset.path,
+                        blob.log.info(
+                            "Not in backup remote %r",
                             self.config.dandisets.remote.name,
                         )
-                    self.tracker.finish_asset(asset.path)
+                    self.tracker.finish_asset(blob.path)
                     self.report.registered += 1
-                elif asset.size > (10 << 20):
+                elif blob.asset.size > (10 << 20):
                     raise RuntimeError(
-                        f"{asset.path} identified as text but is {asset.size} bytes!"
+                        f"{blob.path} identified as text but is"
+                        f" {blob.asset.size} bytes!"
                     )
                 else:
-                    self.log.info(
-                        "%s: File is text; sending off for download from %s",
-                        asset.path,
-                        bucket_url,
-                    )
                     await self.ensure_addurl()
                     if self.embargoed:
-                        url = asset.base_download_url
+                        url = blob.asset.base_download_url
                         extra_urls = []
                     else:
-                        url = bucket_url
-                        extra_urls = [asset.base_download_url]
+                        url = await blob.get_file_bucket_url(self.s3client)
+                        extra_urls = [blob.asset.base_download_url]
+                    blob.log.info(
+                        "File is text; sending off for download from %s",
+                        url,
+                    )
                     await sender.send(
-                        ToDownload(
-                            path=asset.path,
-                            url=url,
-                            extra_urls=extra_urls,
-                            sha256_digest=sha256_digest,
-                        )
+                        ToDownload(blob=blob, url=url, extra_urls=extra_urls)
                     )
 
     async def process_zarr(
@@ -373,22 +367,6 @@ class Downloader:
                 self.manager.with_sublogger(f"Zarr {asset.zarr}"),
             )
             self.zarrs[asset.zarr] = zl
-
-    async def get_file_bucket_url(self, asset: RemoteAsset) -> str:
-        self.log.debug("%s: Fetching bucket URL", asset.path)
-        aws_url = asset.get_content_url(self.config.content_url_regex)
-        urlbits = urlparse(aws_url)
-        key = urlbits.path.lstrip("/")
-        self.log.debug("%s: About to query S3", asset.path)
-        r = await arequest(
-            self.s3client,
-            "HEAD",
-            f"https://{self.config.s3bucket}.s3.amazonaws.com/{key}",
-        )
-        r.raise_for_status()
-        version_id = r.headers["x-amz-version-id"]
-        self.log.debug("%s: Got bucket URL", asset.path)
-        return urlunparse(urlbits._replace(query=f"versionId={version_id}"))
 
     async def get_annex_hash(self, filepath: Path) -> str:
         # OPT: do not bother checking or talking to annex --
@@ -434,9 +412,9 @@ class Downloader:
                         # Lock dataset while there are any downloads in
                         # progress in order to prevent conflicts with `git rm`.
                         await self.ds.lock.acquire()
-                    self.in_progress[td.path] = td
-                    self.log.info("%s: Downloading from %s", td.path, td.url)
-                    await self.addurl.send(f"{td.url} {td.path}\n")
+                    self.in_progress[td.blob.path] = td
+                    td.blob.log.info("Downloading from %s", td.url)
+                    await self.addurl.send(f"{td.url} {td.blob.path}\n")
                 self.log.debug("Done feeding URLs to addurl")
 
     def pop_in_progress(self, path: str) -> ToDownload:
@@ -475,26 +453,20 @@ class Downloader:
                 self.log.info("%s: Finished downloading (key = %s)", path, key)
                 self.report.downloaded += 1
                 dl = self.pop_in_progress(path)
-                self.tracker.finish_asset(dl.path)
+                self.tracker.finish_asset(dl.blob.path)
                 self.nursery.start_soon(
                     self.check_unannexed_hash,
-                    dl.path,
-                    dl.sha256_digest,
-                    name=f"check_unannexed_hash:{dl.path}",
+                    dl.blob,
+                    name=f"check_unannexed_hash:{dl.blob.path}",
                 )
         self.log.debug("Done reading from addurl")
 
-    async def register_url(self, path: str, key: str, url: str) -> None:
-        self.log.info("%s: Registering URL %s", path, url)
-        await self.annex.register_url(key, url)
-
-    async def check_unannexed_hash(self, asset_path: str, sha256_digest: str) -> None:
-        annex_hash = await self.asha256(self.repo / asset_path)
-        if sha256_digest != annex_hash:
-            self.log.error(
-                "%s: Hash mismatch!  Dandiarchive reports %s, local file has %s",
-                asset_path,
-                sha256_digest,
+    async def check_unannexed_hash(self, blob: BlobBackup) -> None:
+        annex_hash = await self.asha256(self.repo / blob.path)
+        if blob.sha256_digest != annex_hash:
+            blob.log.error(
+                "Hash mismatch!  Dandiarchive reports %s, local file has %s",
+                blob.sha256_digest,
                 annex_hash,
             )
             self.report.hash_mismatches += 1

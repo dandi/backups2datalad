@@ -187,12 +187,18 @@ class DandiDatasetter(AsyncResource):
         if await ds.is_dirty():
             raise RuntimeError(f"Dirty {dandiset}; clean or save before running")
         tracker = await anyio.to_thread.run_sync(AssetTracker.from_dataset, ds.pathobj)
-        syncer = Syncer(manager=manager, dandiset=dandiset, ds=ds, tracker=tracker)
+        syncer = Syncer(
+            manager=manager,
+            dandiset=dandiset,
+            ds=ds,
+            tracker=tracker,
+            error_on_change=error_on_change,
+        )
+        await syncer.update_embargo_status()
         await update_dandiset_metadata(dandiset, ds, log=manager.log)
-        await syncer.sync_assets(error_on_change)
-        await syncer.prune_deleted(error_on_change)
+        await syncer.sync_assets()
+        await syncer.prune_deleted()
         await syncer.dump_asset_metadata()
-        assert syncer.report is not None
         manager.log.debug("Checking whether repository is dirty ...")
         if await ds.is_dirty():
             manager.log.info("Committing changes")
