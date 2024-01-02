@@ -5,6 +5,7 @@ from contextlib import aclosing
 from functools import partial, wraps
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import shlex
@@ -79,8 +80,13 @@ async def main(
         cfg.backup_root = backup_root
     if jobs is not None:
         cfg.jobs = jobs
+    api_token = os.environ.get("DANDI_API_KEY", "").strip()
+    if api_token == "":
+        raise click.UsageError("DANDI_API_KEY environment variable not set")
     ctx.obj = DandiDatasetter(
-        dandi_client=AsyncDandiClient.for_dandi_instance(cfg.dandi_instance),
+        dandi_client=AsyncDandiClient.for_dandi_instance(
+            cfg.dandi_instance, token=api_token
+        ),
         config=cfg,
     )
     if pdb:
