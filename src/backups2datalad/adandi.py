@@ -254,6 +254,18 @@ class RemoteDandiset(SyncRemoteDandiset):
             f"No published versions found for Dandiset {self.identifier}"
         )
 
+    async def unembargo(self, max_time: float = 120) -> None:
+        await arequest(self.aclient.session, "POST", f"{self.api_path}unembargo/")
+        log.debug("Waiting for Dandiset %s to unembargo ...", self.identifier)
+        start = time()
+        while time() - start < max_time:
+            data = await self.aclient.get(self.api_path)
+            if data["embargo_status"] == "OPEN":
+                break
+            await anyio.sleep(0.5)
+        else:
+            raise ValueError(f"Dandiset {self.identifier} did not unembargo in time")
+
     async def adelete(self) -> None:
         await self.aclient.delete(self.api_path)
 

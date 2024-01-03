@@ -254,6 +254,44 @@ async def new_dandiset(
         await d.adelete()
 
 
+@pytest.fixture()
+async def embargoed_dandiset(
+    dandi_client: AsyncDandiClient, tmp_path_factory: pytest.TempPathFactory
+) -> AsyncIterator[SampleDandiset]:
+    d = await dandi_client.create_dandiset(
+        "Embargoed Dandiset for testing backups2datalad",
+        {
+            "name": "Embargoed Dandiset for testing backups2datalad",
+            "description": "A test embargoed Dandiset",
+            "contributor": [
+                {
+                    "schemaKey": "Person",
+                    "name": "Wodder, John",
+                    "roleName": ["dcite:Author", "dcite:ContactPerson"],
+                }
+            ],
+            "license": ["spdx:CC0-1.0"],
+        },
+        embargo=True,
+    )
+    dandiset_id = d.identifier
+    dspath = tmp_path_factory.mktemp("embargoed_dandiset")
+    (dspath / dandiset_metadata_file).write_text(f"identifier: '{dandiset_id}'\n")
+    ds = SampleDandiset(
+        client=dandi_client,
+        dspath=dspath,
+        dandiset=d,
+        dandiset_id=d.identifier,
+    )
+    try:
+        yield ds
+    finally:
+        async with aclosing(d.aget_versions(include_draft=False)) as vit:
+            async for v in vit:
+                await dandi_client.delete(f"{d.api_path}versions/{v.identifier}/")
+        await d.adelete()
+
+
 @dataclass
 class PopulateManifest:
     keys2blobs: dict[str, bytes]

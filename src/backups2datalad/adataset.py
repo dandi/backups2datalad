@@ -156,7 +156,6 @@ class AsyncDataset:
             ".datalad/config",
             "--replace-all",
             EMBARGO_STATUS_KEY,
-            "--",
             status.value,
         )
 
