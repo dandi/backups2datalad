@@ -48,7 +48,6 @@ from .zarr import ZarrLink, sync_zarr
 class ToDownload:
     blob: BlobBackup
     url: str
-    extra_urls: list[str]
 
 
 @dataclass
@@ -314,19 +313,12 @@ class Downloader:
                     )
                 else:
                     await self.ensure_addurl()
-                    if self.embargoed:
-                        url = blob.asset.base_download_url
-                        extra_urls = []
-                    else:
-                        url = await blob.get_file_bucket_url(self.s3client)
-                        extra_urls = [blob.asset.base_download_url]
+                    url = blob.asset.base_download_url
                     blob.log.info(
                         "File is text; sending off for download from %s",
                         url,
                     )
-                    await sender.send(
-                        ToDownload(blob=blob, url=url, extra_urls=extra_urls)
-                    )
+                    await sender.send(ToDownload(blob=blob, url=url))
 
     async def process_zarr(
         self, asset: RemoteZarrAsset, zarr_digest: str | None

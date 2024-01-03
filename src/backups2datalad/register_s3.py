@@ -41,6 +41,11 @@ async def register_s3urls(
                     try:
                         key = paths2keys.pop(blob.path)
                     except KeyError:
+                        # Either the asset is text (and thus not annexed and
+                        # thus not eligible to have URLs registered) or it was
+                        # added to the Dandiset since the previous backup (and
+                        # thus we don't have a local backup to register any
+                        # URLs on)
                         continue
                     if key2hash(key) == blob.sha256_digest:
                         bucket_url = await blob.get_file_bucket_url(s3client)
