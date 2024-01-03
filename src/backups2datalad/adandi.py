@@ -118,11 +118,15 @@ class AsyncDandiClient(AsyncResource):
             yield RemoteDandiset.from_data(self, data)
 
     async def create_dandiset(
-        self, name: str, metadata: dict[str, Any]
+        self, name: str, metadata: dict[str, Any], embargo: bool = False
     ) -> RemoteDandiset:
         return RemoteDandiset.from_data(
             self,
-            await self.post("/dandisets/", json={"name": name, "metadata": metadata}),
+            await self.post(
+                "/dandisets/",
+                json={"name": name, "metadata": metadata},
+                params={"embargo": str(embargo).lower()},
+            ),
         )
 
 
