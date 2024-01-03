@@ -208,6 +208,9 @@ the subcommands.
 
 - `zarr-checksum` — Computes the Zarr checksum for a given Zarr mirror
 
+- `register-s3urls` — Ensure that all blob assets in the backup of the given
+  Dandiset have their S3 URLs registered with git-annex
+
 Run `backups2datalad <subcommand> --help` for further details on each
 subcommand.
 
