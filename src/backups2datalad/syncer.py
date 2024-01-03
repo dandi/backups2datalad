@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from dandi.consts import EmbargoStatus
+from ghrepo import GHRepo
 
 from .adandi import RemoteDandiset
 from .adataset import AsyncDataset
@@ -61,6 +62,13 @@ class Syncer:
             ):
                 self.log.info("Registering S3 URLs ...")
                 await register_s3urls(self.manager, self.dandiset, self.ds)
+                if self.config.gh_org is not None and await self.ds.has_github_remote():
+                    self.log.info("Making GitHub repository public ...")
+                    dandiset_id = self.dandiset.identifier
+                    await self.manager.edit_github_repo(
+                        GHRepo(self.config.gh_org, dandiset_id),
+                        private=False,
+                    )
 
     async def sync_assets(self) -> None:
         self.log.info("Syncing assets...")

@@ -396,6 +396,9 @@ class AsyncDataset:
         log.debug("Computed Zarr checksum %s for %s", checksum, self.pathobj)
         return checksum
 
+    async def has_github_remote(self) -> bool:
+        return "github" in (await self.read_git("remote")).splitlines()
+
     async def create_github_sibling(
         self,
         owner: str,
@@ -405,7 +408,7 @@ class AsyncDataset:
         existing: str = "reconfigure",
     ) -> bool:
         # Returns True iff sibling was created
-        if "github" not in (await self.read_git("remote")).splitlines():
+        if not await self.has_github_remote():
             log.info("Creating GitHub sibling for %s", name)
             private = await self.get_embargo_status() is EmbargoStatus.EMBARGOED
             await anyio.to_thread.run_sync(
