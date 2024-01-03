@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import aclosing
+import textwrap
 
 from dandi.exceptions import NotFoundError
 from dandischema.models import DigestType
@@ -38,7 +39,7 @@ async def register_s3urls(
                         manager=manager.with_sublogger(f"Asset {asset.path}"),
                     )
                     try:
-                        key = paths2keys[blob.path]
+                        key = paths2keys.pop(blob.path)
                     except KeyError:
                         continue
                     if key2hash(key) == blob.sha256_digest:
@@ -46,3 +47,9 @@ async def register_s3urls(
                         await blob.register_url(annex, key, bucket_url)
             # else: asset is a Zarr and thus could not have been added while
             # embargoed and thus is not missing S3 URLs
+    if paths2keys:
+        manager.log.warning(
+            "The following assets are no longer in the Dandiset's draft"
+            " version, and thus their S3 URLs could not be determined:\n%s",
+            textwrap.indent("\n".join(sorted(paths2keys)), " " * 4),
+        )
