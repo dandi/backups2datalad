@@ -616,7 +616,7 @@ async def async_assets(
                         ts = timestamp
                     await ds.set_assets_state(AssetsState(timestamp=ts))
                     manager.log.debug("Checking whether repository is dirty ...")
-                    if await ds.is_unclean():
+                    if await ds.is_dirty():
                         manager.log.info("Committing changes")
                         await ds.commit(
                             message=dm.report.get_commit_message(),

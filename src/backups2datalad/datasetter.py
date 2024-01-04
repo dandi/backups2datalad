@@ -185,7 +185,7 @@ class DandiDatasetter(AsyncResource):
         await syncer.dump_asset_metadata()
         assert syncer.report is not None
         manager.log.debug("Checking whether repository is dirty ...")
-        if await ds.is_unclean():
+        if await ds.is_dirty():
             manager.log.info("Committing changes")
             await ds.commit(
                 message=syncer.get_commit_message(),
