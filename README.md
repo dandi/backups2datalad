@@ -20,6 +20,10 @@ Before running `backups2datalad`, the following setup must be performed:
   version 10.20230126 is required, though you should endeavor to obtain the
   latest version.
 
+- An API token needs to be obtained for the DANDI instance that is being
+  mirrored.  When invoking `backups2datalad`, the environment variable
+  `DANDI_API_KEY` must be set to the token.
+
 - A configuration file should be written.  This is a YAML file containing a
   mapping with the following keys:
 
@@ -176,6 +180,9 @@ Run `backups2datalad` with:
 
     backups2datalad --config path/to/config/file <subcommand> ...
 
+The environment variable `DANDI_API_KEY` must be set to an API token for the
+DANDI instance being mirrored.
+
 Run `backups2datalad --help` for details on the global options and summaries of
 the subcommands.
 
@@ -200,6 +207,9 @@ the subcommands.
   special remote
 
 - `zarr-checksum` — Computes the Zarr checksum for a given Zarr mirror
+
+- `register-s3urls` — Ensure that all blob assets in the backup of the given
+  Dandiset have their S3 URLs registered with git-annex
 
 Run `backups2datalad <subcommand> --help` for further details on each
 subcommand.

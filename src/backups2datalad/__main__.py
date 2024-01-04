@@ -5,6 +5,7 @@ from contextlib import aclosing
 from functools import partial, wraps
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import shlex
@@ -22,6 +23,7 @@ from .config import BackupConfig, Mode, ZarrMode
 from .consts import GIT_OPTIONS
 from .datasetter import DandiDatasetter
 from .logging import log
+from .register_s3 import register_s3urls
 from .util import format_errors, pdb_excepthook, quantify
 
 
@@ -79,8 +81,13 @@ async def main(
         cfg.backup_root = backup_root
     if jobs is not None:
         cfg.jobs = jobs
+    api_token = os.environ.get("DANDI_API_KEY", "").strip()
+    if api_token == "":
+        raise click.UsageError("DANDI_API_KEY environment variable not set")
     ctx.obj = DandiDatasetter(
-        dandi_client=AsyncDandiClient.for_dandi_instance(cfg.dandi_instance),
+        dandi_client=AsyncDandiClient.for_dandi_instance(
+            cfg.dandi_instance, token=api_token
+        ),
         config=cfg,
     )
     if pdb:
@@ -481,6 +488,27 @@ async def zarr_checksum(dirpath: Path) -> None:
     """
     ds = AsyncDataset(dirpath)
     print(await ds.compute_zarr_checksum())
+
+
+@main.command("register-s3urls")
+@click.argument("dandiset_id")
+@click.pass_obj
+@print_logfile
+async def register_s3urls_cmd(datasetter: DandiDatasetter, dandiset_id: str) -> None:
+    """
+    Ensure that all blob assets in the backup of the given Dandiset have their
+    S3 URLs registered with git-annex.
+
+    This command should only be necessary if something went wrong when
+    processing the unembargoing of a Dandiset.
+    """
+    async with datasetter:
+        p = datasetter.config.dandiset_root / dandiset_id
+        ds = AsyncDataset(p)
+        if not ds.ds.is_installed():
+            raise click.UsageError(f"Dataset at {p} not installed")
+        d = await datasetter.dandi_client.get_dandiset(dandiset_id, "draft")
+        await register_s3urls(manager=datasetter.manager, dandiset=d, ds=ds)
 
 
 async def populate(

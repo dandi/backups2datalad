@@ -40,7 +40,8 @@ def capture_all_logs(caplog: pytest.LogCaptureFixture) -> None:
 
 @pytest.fixture
 async def dandi_client() -> AsyncIterator[AsyncDandiClient]:
-    api_token = os.environ["DANDI_API_KEY"]
+    api_token = os.environ["DANDI_API_KEY"].strip()
+    assert api_token != "", "DANDI_API_KEY not set"
     async with AsyncDandiClient.for_dandi_instance(
         "dandi-staging", token=api_token
     ) as client:
@@ -237,6 +238,44 @@ async def new_dandiset(
     )
     dandiset_id = d.identifier
     dspath = tmp_path_factory.mktemp("new_dandiset")
+    (dspath / dandiset_metadata_file).write_text(f"identifier: '{dandiset_id}'\n")
+    ds = SampleDandiset(
+        client=dandi_client,
+        dspath=dspath,
+        dandiset=d,
+        dandiset_id=d.identifier,
+    )
+    try:
+        yield ds
+    finally:
+        async with aclosing(d.aget_versions(include_draft=False)) as vit:
+            async for v in vit:
+                await dandi_client.delete(f"{d.api_path}versions/{v.identifier}/")
+        await d.adelete()
+
+
+@pytest.fixture()
+async def embargoed_dandiset(
+    dandi_client: AsyncDandiClient, tmp_path_factory: pytest.TempPathFactory
+) -> AsyncIterator[SampleDandiset]:
+    d = await dandi_client.create_dandiset(
+        "Embargoed Dandiset for testing backups2datalad",
+        {
+            "name": "Embargoed Dandiset for testing backups2datalad",
+            "description": "A test embargoed Dandiset",
+            "contributor": [
+                {
+                    "schemaKey": "Person",
+                    "name": "Wodder, John",
+                    "roleName": ["dcite:Author", "dcite:ContactPerson"],
+                }
+            ],
+            "license": ["spdx:CC0-1.0"],
+        },
+        embargo=True,
+    )
+    dandiset_id = d.identifier
+    dspath = tmp_path_factory.mktemp("embargoed_dandiset")
     (dspath / dandiset_metadata_file).write_text(f"identifier: '{dandiset_id}'\n")
     ds = SampleDandiset(
         client=dandi_client,

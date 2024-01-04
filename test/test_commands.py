@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from traceback import format_exception
 
 from asyncclick.testing import CliRunner, Result
 from conftest import SampleDandiset
+from dandi.consts import known_instances
 from datalad.api import Dataset
 from datalad.tests.utils_pytest import assert_repo_status
 import numpy as np
@@ -13,6 +15,7 @@ from test_util import GitRepo
 
 from backups2datalad.__main__ import main
 from backups2datalad.adataset import AssetsState, AsyncDataset
+from backups2datalad.aioutil import areadcmd
 from backups2datalad.config import BackupConfig, Remote, ResourceConfig
 from backups2datalad.logging import log as plog
 from backups2datalad.manager import Manager
@@ -259,3 +262,117 @@ async def test_backup_committed_zarr(
         asset.zarr for asset in assets.values()
     )
     await new_dandiset.check_all_zarrs(ds.ds, backup_root / "zarr")
+
+
+async def test_backup_embargoed(
+    embargoed_dandiset: SampleDandiset, tmp_path: Path
+) -> None:
+    embargoed_dandiset.add_blob("nulls.dat", b"\0\0\0\0\0")
+    embargoed_dandiset.add_blob(
+        "hi.txt.gz",
+        bytes.fromhex(
+            "1f 8b 08 08 0b c1 a0 62 00 03 68 69 2e 74 78 74"
+            "00 f3 c8 e4 02 00 9a 3c 22 d5 03 00 00 00"
+        ),
+    )
+    embargoed_dandiset.add_blob(
+        "img/png/pixel.png",
+        bytes.fromhex(
+            "89 50 4e 47 0d 0a 1a 0a 00 00 00 0d 49 48 44 52"
+            "00 00 00 01 00 00 00 01 01 00 00 00 00 37 6e f9"
+            "24 00 00 00 0a 49 44 41 54 08 99 63 68 00 00 00"
+            "82 00 81 cb 13 b2 61 00 00 00 00 49 45 4e 44 ae"
+            "42 60 82"
+        ),
+    )
+    await embargoed_dandiset.upload()
+
+    cfgfile = tmp_path / "config.yaml"
+    cfgfile.write_text(
+        "dandi_instance: dandi-staging\n"
+        "s3bucket: dandi-api-staging-dandisets\n"
+        "dandisets:\n"
+        "  path: ds\n"
+    )
+
+    r = await CliRunner().invoke(
+        main,
+        [
+            "--backup-root",
+            str(tmp_path),
+            "-c",
+            str(cfgfile),
+            "update-from-backup",
+            embargoed_dandiset.dandiset_id,
+        ],
+        standalone_mode=False,
+    )
+    assert r.exit_code == 0, show_result(r)
+    assert_repo_status(tmp_path / "ds")
+    ds = Dataset(tmp_path / "ds" / embargoed_dandiset.dandiset_id)
+    await embargoed_dandiset.check_backup(ds)
+
+    embargo_status = await areadcmd(
+        "git",
+        "config",
+        "--file",
+        ".datalad/config",
+        "--get",
+        "dandi.dandiset.embargo-status",
+        cwd=ds.path,
+    )
+    assert embargo_status == "EMBARGOED"
+
+    for path in embargoed_dandiset.blob_assets.keys():
+        whereis = json.loads(
+            await areadcmd("git-annex", "whereis", "--json", "--", path, cwd=ds.path)
+        )
+        (web_urls,) = [
+            w["urls"] for w in whereis["whereis"] if w["description"] == "web"
+        ]
+        assert len(web_urls) == 1
+        assert web_urls[0].startswith(known_instances["dandi-staging"].api)
+
+    await embargoed_dandiset.dandiset.unembargo()
+
+    r = await CliRunner().invoke(
+        main,
+        [
+            "--backup-root",
+            str(tmp_path),
+            "-c",
+            str(cfgfile),
+            "update-from-backup",
+            embargoed_dandiset.dandiset_id,
+        ],
+        standalone_mode=False,
+    )
+    assert r.exit_code == 0, show_result(r)
+    assert_repo_status(tmp_path / "ds")
+    ds = Dataset(tmp_path / "ds" / embargoed_dandiset.dandiset_id)
+    await embargoed_dandiset.check_backup(ds)
+
+    embargo_status = await areadcmd(
+        "git",
+        "config",
+        "--file",
+        ".datalad/config",
+        "--get",
+        "dandi.dandiset.embargo-status",
+        cwd=ds.path,
+    )
+    assert embargo_status == "OPEN"
+
+    for path in embargoed_dandiset.blob_assets.keys():
+        whereis = json.loads(
+            await areadcmd("git-annex", "whereis", "--json", "--", path, cwd=ds.path)
+        )
+        (web_urls,) = [
+            w["urls"] for w in whereis["whereis"] if w["description"] == "web"
+        ]
+        assert len(web_urls) == 2
+        assert any(u.startswith(known_instances["dandi-staging"].api) for u in web_urls)
+        assert any(
+            u.startswith("https://dandi-api-staging-dandisets.s3.amazonaws.com")
+            for u in web_urls
+        )
