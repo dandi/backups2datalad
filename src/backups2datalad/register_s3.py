@@ -31,7 +31,12 @@ async def register_s3urls(
                     sha256_digest = asset.get_digest_value(DigestType.sha2_256)
                     assert sha256_digest is not None
                 except NotFoundError:
-                    raise NotImplementedError
+                    manager.log.info(
+                        "%s: SHA256 has not been computed yet; not fetching any"
+                        " more assets",
+                        asset.path,
+                    )
+                    break
                 else:
                     blob = BlobBackup(
                         asset=asset,
