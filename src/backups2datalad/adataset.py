@@ -7,7 +7,6 @@ from dataclasses import InitVar, dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from functools import partial
-from operator import attrgetter
 from pathlib import Path
 import re
 import subprocess
@@ -98,15 +97,17 @@ class AsyncDataset:
         return True
 
     async def is_dirty(self) -> bool:
-        return await anyio.to_thread.run_sync(attrgetter("dirty"), self.ds.repo)
-
-    async def is_unclean(self) -> bool:
-        def _unclean() -> bool:
-            return any(
-                r["state"] != "clean" for r in self.ds.status(result_renderer=None)
+        return (
+            await self.read_git(
+                "status",
+                "--porcelain",
+                # Forcibly use default values for these options in case they
+                # were overridden by user's gitconfig:
+                "--untracked-files=normal",
+                "--ignore-submodules=none",
             )
-
-        return await anyio.to_thread.run_sync(_unclean)
+            != ""
+        )
 
     async def get_repo_config(self, key: str) -> str | None:
         try:
