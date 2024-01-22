@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from dandi.consts import EmbargoStatus
+from ghrepo import GHRepo
+
 from .adandi import RemoteDandiset
 from .adataset import AsyncDataset
 from .asyncer import Report, async_assets
 from .config import BackupConfig
 from .logging import PrefixedLogger
 from .manager import Manager
+from .register_s3 import register_s3urls
 from .util import AssetTracker, UnexpectedChangeError, quantify
 
 
@@ -17,10 +21,11 @@ class Syncer:
     dandiset: RemoteDandiset
     ds: AsyncDataset
     tracker: AssetTracker
+    error_on_change: bool
     deleted: int = 0
     # value of garbage_assets will be assigned but to pacify mypy - assign factory
     garbage_assets: list[str] = field(default_factory=list)
-    report: Report | None = None
+    report: Report = field(init=False, default_factory=Report)
 
     @property
     def config(self) -> BackupConfig:
@@ -30,23 +35,59 @@ class Syncer:
     def log(self) -> PrefixedLogger:
         return self.manager.log
 
-    async def sync_assets(self, error_on_change: bool = False) -> None:
+    async def update_embargo_status(self) -> None:
+        old_status = await self.ds.get_embargo_status()
+        new_status = self.dandiset.embargo_status
+        if old_status != new_status:
+            if self.error_on_change:
+                raise UnexpectedChangeError(
+                    f"Dandiset {self.dandiset.identifier}: Embargo status"
+                    f" changed from {old_status.value} to {new_status.value}"
+                    " but timestamp was not updated on server"
+                )
+            self.log.info(
+                "Updating embargo status from %s to %s",
+                old_status.value,
+                new_status.value,
+            )
+            await self.ds.set_embargo_status(self.dandiset.embargo_status)
+            commit_date = await self.ds.get_last_commit_date()
+            await self.ds.save(
+                "[backups2datalad] Update embargo status", commit_date=commit_date
+            )
+            self.report.commits += 1
+            if (
+                old_status is EmbargoStatus.EMBARGOED
+                and new_status is EmbargoStatus.OPEN
+            ):
+                self.log.info("Registering S3 URLs ...")
+                await register_s3urls(self.manager, self.dandiset, self.ds)
+                if self.config.gh_org is not None and await self.ds.has_github_remote():
+                    self.log.info("Making GitHub repository public ...")
+                    dandiset_id = self.dandiset.identifier
+                    await self.manager.edit_github_repo(
+                        GHRepo(self.config.gh_org, dandiset_id),
+                        private=False,
+                    )
+
+    async def sync_assets(self) -> None:
         self.log.info("Syncing assets...")
-        self.report = await async_assets(
-            self.dandiset, self.ds, self.manager, self.tracker, error_on_change
+        report = await async_assets(
+            self.dandiset, self.ds, self.manager, self.tracker, self.error_on_change
         )
         self.log.info("Asset sync complete!")
-        self.log.info("%s added", quantify(self.report.added, "asset"))
-        self.log.info("%s updated", quantify(self.report.updated, "asset"))
-        self.log.info("%s registered", quantify(self.report.registered, "asset"))
+        self.log.info("%s added", quantify(report.added, "asset"))
+        self.log.info("%s updated", quantify(report.updated, "asset"))
+        self.log.info("%s registered", quantify(report.registered, "asset"))
         self.log.info(
-            "%s successfully downloaded", quantify(self.report.downloaded, "asset")
+            "%s successfully downloaded", quantify(report.downloaded, "asset")
         )
-        self.report.check()
+        report.check()
+        self.report.update(report)
 
-    async def prune_deleted(self, error_on_change: bool = False) -> None:
+    async def prune_deleted(self) -> None:
         for asset_path in self.tracker.get_deleted(self.config):
-            if error_on_change:
+            if self.error_on_change:
                 raise UnexpectedChangeError(
                     f"Dandiset {self.dandiset.identifier}: Asset {asset_path!r}"
                     " deleted from Dandiset but timestamp was not updated on"
@@ -76,7 +117,6 @@ class Syncer:
     def get_commit_message(self) -> str:
         msgparts = []
         if self.dandiset.version_id != "draft":
-            assert self.report is not None
             if self.report.added:
                 msgparts.append(f"{quantify(self.report.added, 'file')} added")
             if self.report.updated:

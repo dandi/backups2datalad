@@ -104,7 +104,9 @@ class AsyncDandiClient(AsyncResource):
 
     async def get_dandisets(self) -> AsyncGenerator[RemoteDandiset, None]:
         # Unlike the synchronous method, this always uses the draft version
-        async with aclosing(self.paginate("/dandisets/")) as ait:
+        async with aclosing(
+            self.paginate("/dandisets/", params={"embargoed": "true"})
+        ) as ait:
             async for data in ait:
                 yield RemoteDandiset.from_data(self, data)
 
@@ -116,11 +118,15 @@ class AsyncDandiClient(AsyncResource):
             yield RemoteDandiset.from_data(self, data)
 
     async def create_dandiset(
-        self, name: str, metadata: dict[str, Any]
+        self, name: str, metadata: dict[str, Any], embargo: bool = False
     ) -> RemoteDandiset:
         return RemoteDandiset.from_data(
             self,
-            await self.post("/dandisets/", json={"name": name, "metadata": metadata}),
+            await self.post(
+                "/dandisets/",
+                json={"name": name, "metadata": metadata},
+                params={"embargo": str(embargo).lower()},
+            ),
         )
 
 
@@ -247,6 +253,18 @@ class RemoteDandiset(SyncRemoteDandiset):
         raise AssertionError(
             f"No published versions found for Dandiset {self.identifier}"
         )
+
+    async def unembargo(self, max_time: float = 120) -> None:
+        await arequest(self.aclient.session, "POST", f"{self.api_path}unembargo/")
+        log.debug("Waiting for Dandiset %s to unembargo ...", self.identifier)
+        start = time()
+        while time() - start < max_time:
+            data = await self.aclient.get(self.api_path)
+            if data["embargo_status"] == "OPEN":
+                break
+            await anyio.sleep(0.5)
+        else:
+            raise ValueError(f"Dandiset {self.identifier} did not unembargo in time")
 
     async def adelete(self) -> None:
         await self.aclient.delete(self.api_path)
