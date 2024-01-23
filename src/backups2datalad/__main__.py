@@ -101,6 +101,7 @@ async def main(
         level=getattr(logging, log_level),
     )
     await ctx.obj.debug_logfile(quiet_debug)
+    log.info("COMMAND: %s", shlex.join(sys.argv))
 
 
 P = ParamSpec("P")
