@@ -32,7 +32,7 @@ dependencies = [
     "identify ~= 2.0",
     "linesep ~= 0.4",
     "packaging",
-    "pydantic ~= 1.8",
+    "pydantic ~= 2.6",
     "typing_extensions",
     "zarr_checksum ~= 0.4.0",
 ]
