@@ -55,7 +55,9 @@ class DandiDatasetter(AsyncResource):
             gh = GitHub(token)
         else:
             gh = None
-        self.manager = Manager(config=self.config, gh=gh, log=log)
+        self.manager = Manager(
+            config=self.config, gh=gh, log=log, token=self.dandi_client.token
+        )
 
     async def aclose(self) -> None:
         await self.dandi_client.aclose()

@@ -250,7 +250,7 @@ async def test_backup_committed_zarr(
         a0,
         a0.get_digest_value(),
         backup_root / "partial-zarrs" / a0.zarr,
-        Manager(config=cfg, gh=None, log=plog),
+        Manager(config=cfg, gh=None, log=plog, token=new_dandiset.client.token),
     )
 
     r = await CliRunner().invoke(

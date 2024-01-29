@@ -35,7 +35,10 @@ async def test_sync_zarr(new_dandiset: SampleDandiset, tmp_path: Path) -> None:
         s3bucket="dandi-api-staging-dandisets", zarrs=ResourceConfig(path="zarrs")
     )
     await sync_zarr(
-        asset, checksum, tmp_path, Manager(config=config, gh=None, log=plog)
+        asset,
+        checksum,
+        tmp_path,
+        Manager(config=config, gh=None, log=plog, token=new_dandiset.client.token),
     )
     local_checksum = await AsyncDataset(tmp_path).compute_zarr_checksum()
     new_dandiset.check_zarr_backup(

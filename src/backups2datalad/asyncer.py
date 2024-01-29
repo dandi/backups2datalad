@@ -390,6 +390,7 @@ class Downloader:
                     "--json-progress",
                     "--raw",
                     path=self.ds.pathobj,
+                    env={"DATALAD_dandi_token": self.manager.token},
                 )
                 self.nursery.start_soon(self.feed_addurl)
                 self.nursery.start_soon(self.read_addurl)
