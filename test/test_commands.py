@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime
 import json
 from pathlib import Path
+import random
 from traceback import format_exception
 
 from asyncclick.testing import CliRunner, Result
@@ -267,6 +269,13 @@ async def test_backup_committed_zarr(
 async def test_backup_embargoed(
     embargoed_dandiset: SampleDandiset, tmp_path: Path
 ) -> None:
+    embargoed_dandiset.add_text(
+        "file.txt",
+        "This is a brand new file that has never been uploaded before.\n"
+        f"Date: {datetime.now()}\n"
+        f"Random: {random.randrange(4294967296)}\n",
+    )
+
     embargoed_dandiset.add_blob("nulls.dat", b"\0\0\0\0\0")
     embargoed_dandiset.add_blob(
         "hi.txt.gz",
@@ -332,6 +341,11 @@ async def test_backup_embargoed(
         ]
         assert len(web_urls) == 1
         assert web_urls[0].startswith(known_instances["dandi-staging"].api)
+
+    for path, contents in embargoed_dandiset.text_assets.items():
+        p = ds.pathobj / path
+        assert p.is_file()
+        assert p.read_text() == contents
 
     await embargoed_dandiset.dandiset.unembargo()
 
