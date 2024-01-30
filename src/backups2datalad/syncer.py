@@ -62,6 +62,8 @@ class Syncer:
             ):
                 self.log.info("Registering S3 URLs ...")
                 await register_s3urls(self.manager, self.dandiset, self.ds)
+                self.log.info("Disabling datalad special remote ...")
+                await self.ds.disable_dandi_provider()
                 if self.config.gh_org is not None and await self.ds.has_github_remote():
                     self.log.info("Making GitHub repository public ...")
                     dandiset_id = self.dandiset.identifier

@@ -139,6 +139,8 @@ class DandiDatasetter(AsyncResource):
                 create_time=dandiset.version.created,
                 embargo_status=dandiset.embargo_status,
             )
+        if dandiset.embargo_status is EmbargoStatus.EMBARGOED:
+            await ds.ensure_dandi_provider(self.dandi_client.api_url)
         dmanager = self.manager.with_sublogger(f"Dandiset {dandiset.identifier}")
         state = ds.get_assets_state()
         if (
