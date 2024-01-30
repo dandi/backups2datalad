@@ -113,7 +113,7 @@ class AsyncDataset:
         provider_file = self.pathobj / prov_cfg
         if not provider_file.exists():
             url_re = re.escape(api_url)
-            url_re = re.sub(r"^https?:", "https?", api_url)
+            url_re = re.sub(r"^https?:", "https?:", url_re)
             if not url_re.endswith("/"):
                 url_re += "/"
             url_re += ".*"
