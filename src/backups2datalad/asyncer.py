@@ -389,7 +389,6 @@ class Downloader:
                     "--json",
                     "--json-error-messages",
                     "--json-progress",
-                    "--raw",
                     path=self.ds.pathobj,
                     env={**os.environ, "DATALAD_dandi_token": self.manager.token},
                 )
