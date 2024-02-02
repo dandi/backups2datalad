@@ -160,7 +160,6 @@ class AsyncDataset:
                 )
 
     async def disable_dandi_provider(self) -> None:
-        await self.call_git("remote", "remove", "datalad")
         # See <https://github.com/dandi/backups2datalad/pull/21#issuecomment-1919164777>
         # TODO: Once this is implemented, uncomment the commented-out portion
         # of `test_backup_embargoed` in `test_commands.py`.
@@ -168,6 +167,7 @@ class AsyncDataset:
             "Waiting on Joey's input; see https://git-annex.branchable.com/"
             "forum/how_to___34__move__34___URL_between_remotes__63__/"
         )
+        await self.call_git("remote", "remove", "datalad")  # type: ignore[unreachable]
 
     async def is_dirty(self) -> bool:
         return (
