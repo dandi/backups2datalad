@@ -92,6 +92,7 @@ async def open_git_annex(
     *args: str,
     path: Path | None = None,
     warn_on_fail: bool = True,
+    env: dict[str, str] | None = None,
 ) -> TextProcess:
     # This is strictly for spawning git-annex processes that data will be both
     # sent to and received from.  To open a process solely for receiving data,
@@ -107,6 +108,7 @@ async def open_git_annex(
         stdout=subprocess.PIPE,
         stderr=None,
         cwd=path,
+        env=env,
     )
     assert p.stdout is not None
     stdout = LineReceiveStream(TextReceiveStream(p.stdout))

@@ -9,6 +9,7 @@ from functools import partial
 import hashlib
 import json
 from operator import attrgetter
+import os
 import os.path
 from pathlib import Path, PurePosixPath
 import subprocess
@@ -388,8 +389,8 @@ class Downloader:
                     "--json",
                     "--json-error-messages",
                     "--json-progress",
-                    "--raw",
                     path=self.ds.pathobj,
+                    env={**os.environ, "DATALAD_dandi_token": self.manager.token},
                 )
                 self.nursery.start_soon(self.feed_addurl)
                 self.nursery.start_soon(self.read_addurl)
@@ -494,9 +495,11 @@ async def async_assets(
     async with aclosing(aiterassets(dandiset, done_flag)) as aia:
         while not done_flag.is_set():
             try:
-                async with AsyncAnnex(ds.pathobj) as annex, httpx.AsyncClient(
-                    headers={"User-Agent": USER_AGENT}
-                ) as s3client, anyio.create_task_group() as nursery:
+                async with (
+                    AsyncAnnex(ds.pathobj) as annex,
+                    httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as s3client,
+                    anyio.create_task_group() as nursery,
+                ):
                     dm = Downloader(
                         dandiset_id=dandiset.identifier,
                         embargoed=dandiset.embargo_status is EmbargoStatus.EMBARGOED,

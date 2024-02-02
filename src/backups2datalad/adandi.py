@@ -30,14 +30,14 @@ from .logging import log
 class AsyncDandiClient(AsyncResource):
     session: httpx.AsyncClient
     api_url: str
+    token: str
 
     @classmethod
-    def for_dandi_instance(
-        cls, instance: str, token: str | None = None
-    ) -> AsyncDandiClient:
-        headers = {"User-Agent": USER_AGENT}
-        if token is not None:
-            headers["Authorization"] = f"token {token}"
+    def for_dandi_instance(cls, instance: str, token: str) -> AsyncDandiClient:
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Authorization": f"token {token}",
+        }
         return cls(
             session=httpx.AsyncClient(
                 base_url=known_instances[instance].api,
@@ -45,6 +45,7 @@ class AsyncDandiClient(AsyncResource):
                 follow_redirects=True,
             ),
             api_url=known_instances[instance].api,
+            token=token,
         )
 
     async def aclose(self) -> None:

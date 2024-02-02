@@ -26,6 +26,7 @@ class Manager(AsyncResource):
     config: BackupConfig
     gh: GitHub | None
     log: PrefixedLogger
+    token: str
 
     async def aclose(self) -> None:
         if self.gh is not None:

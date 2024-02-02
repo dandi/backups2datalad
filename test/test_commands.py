@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime
 import json
 from pathlib import Path
+import random
 from traceback import format_exception
 
 from asyncclick.testing import CliRunner, Result
@@ -248,7 +250,7 @@ async def test_backup_committed_zarr(
         a0,
         a0.get_digest_value(),
         backup_root / "partial-zarrs" / a0.zarr,
-        Manager(config=cfg, gh=None, log=plog),
+        Manager(config=cfg, gh=None, log=plog, token=new_dandiset.client.token),
     )
 
     r = await CliRunner().invoke(
@@ -267,6 +269,13 @@ async def test_backup_committed_zarr(
 async def test_backup_embargoed(
     embargoed_dandiset: SampleDandiset, tmp_path: Path
 ) -> None:
+    embargoed_dandiset.add_text(
+        "file.txt",
+        "This is a brand new file that has never been uploaded before.\n"
+        f"Date: {datetime.now()}\n"
+        f"Random: {random.randrange(4294967296)}\n",
+    )
+
     embargoed_dandiset.add_blob("nulls.dat", b"\0\0\0\0\0")
     embargoed_dandiset.add_blob(
         "hi.txt.gz",
@@ -328,11 +337,20 @@ async def test_backup_embargoed(
             await areadcmd("git-annex", "whereis", "--json", "--", path, cwd=ds.path)
         )
         (web_urls,) = [
-            w["urls"] for w in whereis["whereis"] if w["description"] == "web"
+            w["urls"] for w in whereis["whereis"] if w["description"] == "[datalad]"
         ]
         assert len(web_urls) == 1
         assert web_urls[0].startswith(known_instances["dandi-staging"].api)
 
+    for path, contents in embargoed_dandiset.text_assets.items():
+        p = ds.pathobj / path
+        assert p.is_file()
+        assert p.read_text() == contents
+
+    # TODO: Awaiting resolution of
+    # https://github.com/dandi/backups2datalad/pull/21#issuecomment-1919164777;
+    # see `NotImplementedError` in `AsyncDataset.disable_dandi_provider()`
+    """
     await embargoed_dandiset.dandiset.unembargo()
 
     r = await CliRunner().invoke(
@@ -376,3 +394,4 @@ async def test_backup_embargoed(
             u.startswith("https://dandi-api-staging-dandisets.s3.amazonaws.com")
             for u in web_urls
         )
+    """

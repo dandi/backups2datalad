@@ -7,6 +7,7 @@ from dataclasses import InitVar, dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from functools import partial
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -28,6 +29,8 @@ from .logging import log
 from .util import custom_commit_env, exp_wait, is_meta_file, key2hash
 
 EMBARGO_STATUS_KEY = "dandi.dandiset.embargo-status"
+
+DATALAD_CREDS_REMOTE_UUID = "cf13d535-b47c-5df6-8590-0793cb08a90a"
 
 
 @dataclass
@@ -105,6 +108,67 @@ class AsyncDataset:
         log.debug("Dataset for %s created", desc)
         return True
 
+    async def ensure_dandi_provider(self, api_url: str) -> None:
+        prov_cfg = Path(".datalad", "providers", "dandi.cfg")
+        provider_file = self.pathobj / prov_cfg
+        if not provider_file.exists():
+            url_re = re.escape(api_url)
+            url_re = re.sub(r"^https?:", "https?:", url_re)
+            if not url_re.endswith("/"):
+                url_re += "/"
+            url_re += ".*"
+            provider_file.parent.mkdir(parents=True, exist_ok=True)
+            provider_file.write_text(
+                "[provider:dandi]\n"
+                f"url_re = {url_re}\n"
+                "authentication_type = http_token\n"
+                "credential = dandi\n"
+                "\n"
+                "[credential:dandi]\n"
+                "type = token\n"
+            )
+            await self.call_git("add", str(prov_cfg))
+            await self.commit(
+                message="[backups2datalad] Add dandi provider config",
+                paths=[prov_cfg],
+                check_dirty=False,
+            )
+        if "datalad" in (await self.read_git("remote")).splitlines():
+            annex_uuid = await self.get_repo_config("remote.datalad.annex-uuid")
+            if annex_uuid != DATALAD_CREDS_REMOTE_UUID:
+                raise RuntimeError(
+                    f"Dataset {self.path}: expected remote.datalad.annex-uuid"
+                    f" to be {DATALAD_CREDS_REMOTE_UUID!r} but got"
+                    f" {annex_uuid!r}"
+                )
+        else:
+            info = json.loads(await self.read_annex("info", "--json"))
+            if any(
+                sr["uuid"] == DATALAD_CREDS_REMOTE_UUID
+                for sr in info["semitrusted repositories"]
+            ):
+                await self.call_annex("enableremote", "datalad")
+            else:
+                await self.call_annex(
+                    "initremote",
+                    "datalad",
+                    "type=external",
+                    "externaltype=datalad",
+                    "encryption=none",
+                    "autoenable=true",
+                    f"uuid={DATALAD_CREDS_REMOTE_UUID}",
+                )
+
+    async def disable_dandi_provider(self) -> None:
+        # See <https://github.com/dandi/backups2datalad/pull/21#issuecomment-1919164777>
+        # TODO: Once this is implemented, uncomment the commented-out portion
+        # of `test_backup_embargoed` in `test_commands.py`.
+        raise NotImplementedError(
+            "Waiting on Joey's input; see https://git-annex.branchable.com/"
+            "forum/how_to___34__move__34___URL_between_remotes__63__/"
+        )
+        await self.call_git("remote", "remove", "datalad")  # type: ignore[unreachable]
+
     async def is_dirty(self) -> bool:
         return (
             await self.read_git(
@@ -179,6 +243,11 @@ class AsyncDataset:
 
     async def call_annex(self, *args: str | Path, **kwargs: Any) -> None:
         await aruncmd("git", *GIT_OPTIONS, "annex", *args, cwd=self.path, **kwargs)
+
+    async def read_annex(self, *args: str | Path, **kwargs: Any) -> str:
+        return await areadcmd(
+            "git", *GIT_OPTIONS, "annex", *args, cwd=self.path, **kwargs
+        )
 
     async def save(
         self,
@@ -418,9 +487,9 @@ class AsyncDataset:
                     name="github",
                     access_protocol="https",
                     github_organization=owner,
-                    publish_depends=backup_remote.name
-                    if backup_remote is not None
-                    else None,
+                    publish_depends=(
+                        backup_remote.name if backup_remote is not None else None
+                    ),
                     private=private,
                 )
             )
