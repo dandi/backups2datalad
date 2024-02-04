@@ -25,8 +25,7 @@ dependencies = [
     "asyncclick >= 8.0.1",
     "dandi >= 0.55.0",
     "dandischema",
-    # TODO: Switch back to PyPI datalad after datalad/datalad#7551 is released:
-    "datalad @ git+https://github.com/yarikoptic/datalad@enh-token",
+    "datalad >= 0.19.6",
     "ghrepo ~= 0.1",
     "httpx ~= 0.22",
     "humanize",
@@ -37,9 +36,6 @@ dependencies = [
     "typing_extensions",
     "zarr_checksum ~= 0.4.0",
 ]
-
-[tool.hatch.metadata]
-allow-direct-references = true
 
 [project.scripts]
 backups2datalad = "backups2datalad.__main__:main"
