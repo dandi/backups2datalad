@@ -4,6 +4,8 @@ from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
+from difflib import unified_diff
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -17,6 +19,7 @@ from dandi.consts import dandiset_metadata_file
 from dandi.dandiset import Dandiset
 from datalad.api import Dataset
 from datalad.support.json_py import dump
+from ruamel.yaml import YAML
 
 from .config import BackupConfig
 from .logging import PrefixedLogger
@@ -64,13 +67,22 @@ class AssetTracker:
             filepath=filepath, local_assets=local_assets, asset_metadata=asset_metadata
         )
 
-    def register_asset(self, asset: RemoteAsset, force: str | None) -> bool:
-        # Returns True if the asset's metadata has changed (or if we should act
-        # like it's changed) since the last sync
+    def register_asset(self, asset: RemoteAsset, force: str | None) -> str | None:
+        # If the asset's metadata has changed (or if we should act like it's
+        # changed) since the last sync, a diff is returned
         self.local_assets.discard(asset.path)
         adict = asset2dict(asset)
         self.in_progress[asset.path] = adict
-        return adict != self.asset_metadata.get(asset.path) or force == "assets-update"
+        old_metadata = self.asset_metadata.get(asset.path)
+        if old_metadata != adict:
+            return (
+                diff_metadata(old_metadata, adict)
+                or "<metadata unequal but no diff generated>"
+            )
+        elif force == "assets-update":
+            return "<Forced update via --force assets-update>"
+        else:
+            return None
 
     def register_asset_by_timestamp(
         self, asset: RemoteAsset, force: str | None
@@ -244,6 +256,27 @@ def is_meta_file(path: str, dandiset: bool = False) -> bool:
     if dandiset and root == dandiset_metadata_file:
         return True
     return root in (".dandi", ".datalad", ".git", ".gitattributes", ".gitmodules")
+
+
+def diff_metadata(old: Any, new: Any) -> str:
+    old_yaml = yaml_dump(old)
+    new_yaml = yaml_dump(new)
+    return "".join(
+        unified_diff(
+            old_yaml.splitlines(True),
+            new_yaml.splitlines(True),
+            fromfile="old-metadata",
+            tofile="new-metadata",
+        )
+    )
+
+
+def yaml_dump(data: Any) -> str:
+    yaml = YAML(typ="safe")
+    yaml.default_flow_style = False
+    out = StringIO()
+    yaml.dump(data, out)
+    return out.getvalue()
 
 
 class UnexpectedChangeError(Exception):

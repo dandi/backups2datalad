@@ -244,7 +244,8 @@ class Downloader:
         async with sender:
             self.last_timestamp = maxdatetime(self.last_timestamp, blob.asset.created)
             dest = self.repo / blob.path
-            if not self.tracker.register_asset(blob.asset, force=self.config.force):
+            md_diff = self.tracker.register_asset(blob.asset, force=self.config.force)
+            if md_diff is None:
                 blob.log.debug("metadata unchanged; not taking any further action")
                 self.tracker.finish_asset(blob.path)
                 return
@@ -256,7 +257,7 @@ class Downloader:
                 raise UnexpectedChangeError(
                     f"Dandiset {self.dandiset_id}: Metadata for asset"
                     f" {blob.path} was changed/added but draft timestamp was"
-                    " not updated on server"
+                    f" not updated on server:\n\nMetadata diff:\n\n{md_diff}\n"
                 )
             blob.log.info("Syncing")
             dest.parent.mkdir(parents=True, exist_ok=True)

@@ -33,6 +33,7 @@ dependencies = [
     "linesep ~= 0.4",
     "packaging",
     "pydantic ~= 1.8",
+    "ruamel.yaml",
     "typing_extensions",
     "zarr_checksum ~= 0.4.0",
 ]
