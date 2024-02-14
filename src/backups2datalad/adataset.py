@@ -182,9 +182,10 @@ class AsyncDataset:
             != ""
         )
 
-    async def get_repo_config(self, key: str) -> str | None:
+    async def get_repo_config(self, key: str, file: str | None = None) -> str | None:
+        args = ["--file", file] if file is not None else []
         try:
-            return await self.read_git("config", "--get", key)
+            return await self.read_git("config", *args, "--get", key, quiet_rcs=[1])
         except subprocess.CalledProcessError as e:
             if e.returncode == 1:
                 return None
@@ -192,24 +193,14 @@ class AsyncDataset:
                 raise
 
     async def get_datalad_id(self) -> str:
-        return await self.read_git(
-            "config", "--file", ".datalad/config", "--get", "datalad.dataset.id"
-        )
+        r = await self.get_repo_config("datalad.dataset.id", file=".datalad/config")
+        assert r is not None
+        return r
 
     async def get_embargo_status(self) -> EmbargoStatus:
-        try:
-            value = await self.read_git(
-                "config",
-                "--file",
-                ".datalad/config",
-                "--get",
-                EMBARGO_STATUS_KEY,
-            )
-        except subprocess.CalledProcessError as e:
-            if e.returncode == 1:
-                return EmbargoStatus.OPEN
-            else:
-                raise
+        value = await self.get_repo_config(EMBARGO_STATUS_KEY, file=".datalad/config")
+        if value is None:
+            return EmbargoStatus.OPEN
         else:
             return EmbargoStatus(value)
 

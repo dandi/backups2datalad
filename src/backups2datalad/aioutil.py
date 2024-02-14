@@ -5,6 +5,7 @@ from collections.abc import (
     AsyncIterator,
     Awaitable,
     Callable,
+    Collection,
     Container,
     Mapping,
 )
@@ -192,7 +193,7 @@ async def pool_amap(
 
 
 async def aruncmd(
-    *args: str | Path, **kwargs: Any
+    *args: str | Path, quiet_rcs: Collection[int] = (), **kwargs: Any
 ) -> subprocess.CompletedProcess[bytes]:
     argstrs = [str(a) for a in args]
     desc = shlex.join(argstrs)
@@ -204,19 +205,22 @@ async def aruncmd(
     try:
         r = await anyio.run_process(argstrs, **kwargs)
     except subprocess.CalledProcessError as e:
-        label = "Stdout" if e.stderr is not None else "Output"
-        stdout = e.stdout.decode("utf-8", "surrogateescape")
-        if stdout:
-            output = f"{label}:\n\n" + textwrap.indent(stdout, " " * 4)
-        else:
-            output = f"{label}: <empty>"
-        if e.stderr is not None:
-            stderr = e.stderr.decode("utf-8", "surrogateescape")
-            if stderr:
-                output += "\n\nStderr:\n\n" + textwrap.indent(stderr, " " * 4)
+        if e.returncode not in quiet_rcs:
+            label = "Stdout" if e.stderr is not None else "Output"
+            stdout = e.stdout.decode("utf-8", "surrogateescape")
+            if stdout:
+                output = f"{label}:\n\n" + textwrap.indent(stdout, " " * 4)
             else:
-                output += "\n\nStderr: <empty>"
-        log.warning("Failed [rc=%d]: %s\n\n%s", e.returncode, desc, output)
+                output = f"{label}: <empty>"
+            if e.stderr is not None:
+                stderr = e.stderr.decode("utf-8", "surrogateescape")
+                if stderr:
+                    output += "\n\nStderr:\n\n" + textwrap.indent(stderr, " " * 4)
+                else:
+                    output += "\n\nStderr: <empty>"
+            log.warning("Failed [rc=%d]: %s\n\n%s", e.returncode, desc, output)
+        else:
+            log.debug("Finished [rc=%d]: %s", e.returncode, desc)
         raise e
     else:
         log.debug("Finished [rc=%d]: %s", r.returncode, desc)
