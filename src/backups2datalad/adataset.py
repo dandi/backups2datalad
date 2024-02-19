@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Iterable, Sequence
 from contextlib import aclosing
 from dataclasses import InitVar, dataclass, field, replace
 from datetime import datetime
@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import textwrap
 from typing import Any, ClassVar
 
@@ -385,6 +386,28 @@ class AsyncDataset:
                             delay,
                         )
                         await anyio.sleep(delay)
+
+    async def remove_batch(self, paths: Iterable[str]) -> None:
+        pathlist = list(paths)
+        if not pathlist:
+            return
+        # `paths` must be relative to the root of the dataset
+        async with self.lock:
+            # to avoid problems with locking etc. Same is done in DataLad's
+            # invocation of rm
+            self.ds.repo.precommit()
+            with tempfile.NamedTemporaryFile(mode="w") as fp:
+                for p in pathlist:
+                    print(p, end="\0", file=fp)
+                fp.flush()
+                fp.seek(0)
+                await self.call_git(
+                    "rm",
+                    "-f",
+                    "--ignore-unmatch",
+                    f"--pathspec-from-file={fp.name}",
+                    "--pathspec-file-nul",
+                )
 
     async def update(self, how: str, sibling: str | None = None) -> None:
         await anyio.to_thread.run_sync(

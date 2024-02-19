@@ -140,7 +140,7 @@ class AsyncAnnex:
             )
             ### TODO: Raise an exception?
 
-    async def list_files(self) -> AsyncGenerator[str, None]:
+    async def list_files(self, path: Path | None = None) -> AsyncGenerator[str, None]:
         async with aclosing(
             stream_null_command(
                 "git",
@@ -150,8 +150,12 @@ class AsyncAnnex:
                 "--name-only",
                 "-z",
                 "HEAD",
+                *([str(path)] if path is not None else []),
                 cwd=self.repo,
             )
         ) as p:
             async for fname in p:
-                yield fname
+                if path is not None:
+                    yield (path / fname).as_posix()
+                else:
+                    yield fname
