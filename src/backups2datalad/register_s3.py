@@ -22,9 +22,11 @@ async def register_s3urls(
     paths2keys = {
         anxfile.file: anxfile.key async for anxfile in ds.aiter_annexed_files()
     }
-    async with AsyncAnnex(ds.pathobj) as annex, httpx.AsyncClient(
-        headers={"User-Agent": USER_AGENT}
-    ) as s3client, aclosing(dandiset.aget_assets()) as ait:
+    async with (
+        AsyncAnnex(ds.pathobj) as annex,
+        httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as s3client,
+        aclosing(dandiset.aget_assets()) as ait,
+    ):
         async for asset in ait:
             if isinstance(asset, RemoteBlobAsset):
                 try:
