@@ -379,6 +379,12 @@ class Downloader:
     async def ensure_addurl(self) -> None:
         async with self.addurl_lock:
             if self.addurl is None:
+                env = os.environ.copy()
+                if self.embargoed:
+                    env["DATALAD_dandi_token"] = self.manager.token
+                    opts = ["--raw-except=datalad"]
+                else:
+                    opts = ["--raw"]
                 self.addurl = await open_git_annex(
                     "addurl",
                     "-c",
@@ -390,8 +396,9 @@ class Downloader:
                     "--json",
                     "--json-error-messages",
                     "--json-progress",
+                    *opts,
                     path=self.ds.pathobj,
-                    env={**os.environ, "DATALAD_dandi_token": self.manager.token},
+                    env=env,
                 )
                 self.nursery.start_soon(self.feed_addurl)
                 self.nursery.start_soon(self.read_addurl)
