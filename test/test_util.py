@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 import subprocess
 from typing import Any
 
@@ -25,8 +26,10 @@ class GitRepo:
         return r.stdout.strip()
 
     def get_tag_date(self, tag: str) -> str:
-        return self.readcmd(
-            "for-each-ref", "--format=%(creatordate:iso-strict)", f"refs/tags/{tag}"
+        return unzulu(
+            self.readcmd(
+                "for-each-ref", "--format=%(creatordate:iso-strict)", f"refs/tags/{tag}"
+            )
         )
 
     def get_tag_creator(self, tag: str) -> str:
@@ -36,7 +39,9 @@ class GitRepo:
         )
 
     def get_commit_date(self, commitish: str) -> str:
-        return self.readcmd("show", "-s", "--format=%aI", f"{commitish}^{{commit}}")
+        return unzulu(
+            self.readcmd("show", "-s", "--format=%aI", f"{commitish}^{{commit}}")
+        )
 
     def get_commit_author(self, commitish: str) -> str:
         return self.readcmd(
@@ -115,3 +120,10 @@ def find_filepaths(dirpath: Path) -> Iterator[Path]:
             exclude_vcs=False,
         ),
     )
+
+
+def unzulu(ts: str) -> str:
+    # Git v2.45.0 changed its iso-strict date format to display the UTC offset
+    # as "Z" rather than "+00:00", which breaks comparisons against stringified
+    # Python datetimes.
+    return re.sub(r"Z$", "+00:00", ts)
