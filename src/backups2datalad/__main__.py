@@ -13,7 +13,7 @@ import sys
 from typing import Concatenate, ParamSpec
 
 import asyncclick as click
-from dandi.consts import DANDISET_ID_REGEX
+from dandi.consts import DANDISET_ID_REGEX, EmbargoStatus
 from datalad.api import Dataset
 
 from .adandi import AsyncDandiClient
@@ -522,6 +522,9 @@ async def populate(
 ) -> None:
     desc = f"{pathtype} {dirpath.name}"
     ds = AsyncDataset(dirpath)
+    if await ds.get_embargo_status() is EmbargoStatus.EMBARGOED:
+        log.info("%s: embargoed Dandiset; not populating")
+        return
     if not force and await ds.populate_up_to_date():
         log.info("%s: no need to populate", desc)
         return
