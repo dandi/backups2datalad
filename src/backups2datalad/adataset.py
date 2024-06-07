@@ -183,6 +183,25 @@ class AsyncDataset:
             != ""
         )
 
+    async def has_changes(
+        self, paths: Sequence[str | Path] = (), cached: bool = False
+    ) -> bool:
+        args: list[str | Path] = ["diff", "--quiet"]
+        if cached:
+            args.append("--cached")
+        if paths:
+            args.append("--")
+            args.extend(paths)
+        try:
+            await self.call_git(*args, quiet_rcs=[1])
+        except subprocess.CalledProcessError as e:
+            if e.returncode == 1:
+                return True
+            else:
+                raise
+        else:
+            return False
+
     async def get_repo_config(self, key: str, file: str | None = None) -> str | None:
         args = ["--file", file] if file is not None else []
         try:
@@ -192,6 +211,18 @@ class AsyncDataset:
                 return None
             else:
                 raise
+
+    async def set_repo_config(
+        self, key: str, value: str, file: str | None = None
+    ) -> None:
+        args = ["--file", file] if file is not None else ["--local"]
+        await self.call_git(
+            "config",
+            *args,
+            "--replace-all",
+            key,
+            value,
+        )
 
     async def get_datalad_id(self) -> str:
         r = await self.get_repo_config("datalad.dataset.id", file=".datalad/config")
@@ -206,13 +237,8 @@ class AsyncDataset:
             return EmbargoStatus(value)
 
     async def set_embargo_status(self, status: EmbargoStatus) -> None:
-        await self.call_git(
-            "config",
-            "--file",
-            ".datalad/config",
-            "--replace-all",
-            EMBARGO_STATUS_KEY,
-            status.value,
+        await self.set_repo_config(
+            EMBARGO_STATUS_KEY, status.value, file=".datalad/config"
         )
 
     async def call_git(self, *args: str | Path, **kwargs: Any) -> None:
@@ -287,6 +313,22 @@ class AsyncDataset:
             raise RuntimeError(
                 f"{self.path} is still dirty after committing."
                 "  Please check if all changes were staged."
+            )
+
+    async def commit_if_changed(
+        self,
+        message: str,
+        commit_date: datetime | None = None,
+        paths: Sequence[str | Path] = (),
+        check_dirty: bool = True,
+    ) -> None:
+        await self.call_git("add", "-A", *paths)
+        if await self.has_changes(paths=paths, cached=True):
+            await self.commit(
+                message,
+                commit_date=commit_date,
+                paths=paths,
+                check_dirty=check_dirty,
             )
 
     async def push(self, to: str, jobs: int, data: str | None = None) -> None:
@@ -512,7 +554,7 @@ class AsyncDataset:
                 (f"branch.{DEFAULT_BRANCH}.remote", "github"),
                 (f"branch.{DEFAULT_BRANCH}.merge", f"refs/heads/{DEFAULT_BRANCH}"),
             ]:
-                await self.call_git("config", "--local", "--replace-all", key, value)
+                await self.set_repo_config(key, value)
             return True
         else:
             log.debug("GitHub remote already exists for %s", name)
@@ -658,13 +700,10 @@ class AsyncDataset:
 
     async def add_submodule(self, path: str, url: str, datalad_id: str) -> None:
         await self.call_git("submodule", "add", "--", url, path)
-        await self.call_git(
-            "config",
-            "--file",
-            ".gitmodules",
-            "--replace-all",
+        await self.set_repo_config(
             f"submodule.{path}.datalad-id",
             datalad_id,
+            file=".gitmodules",
         )
         await self.add(".gitmodules")
 
@@ -684,9 +723,7 @@ class AsyncDataset:
 
     async def update_populate_status(self) -> None:
         head = await self.get_commit_hash()
-        await self.call_git(
-            "config", "--local", "--replace-all", "dandi.populated", head
-        )
+        await self.set_repo_config("dandi.populated", head)
 
 
 class ObjectType(Enum):

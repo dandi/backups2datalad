@@ -80,14 +80,33 @@ class DandiDatasetter(AsyncResource):
             workers=self.config.workers,
         )
         to_save: list[str] = []
+        access_status: dict[str, str] = {}
         for d, changed in report.results:
             if changed:
                 to_save.append(d.identifier)
+                if self.config.gh_org is not None:
+                    access_status[d.identifier] = (
+                        "public"
+                        if d.embargo_status is EmbargoStatus.OPEN
+                        else "private"
+                    )
         if to_save:
             log.debug("Committing superdataset")
             superds.assert_no_duplicates_in_gitmodules()
             msg = await self.get_superds_commit_message(superds, to_save)
             await superds.save(message=msg, path=to_save)
+            if access_status:
+                for did, access in access_status.items():
+                    await superds.set_repo_config(
+                        f"submodule.{did}.github-access-status",
+                        access,
+                        file=".gitmodules",
+                    )
+                await superds.commit_if_changed(
+                    "[backups2datalad] Update github-access-status keys in .gitmodules",
+                    paths=[".gitmodules"],
+                    check_dirty=False,
+                )
             superds.assert_no_duplicates_in_gitmodules()
             log.debug("Superdataset committed")
         if report.failed:
