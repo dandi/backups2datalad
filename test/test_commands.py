@@ -349,10 +349,6 @@ async def test_backup_embargoed(
         assert p.is_file()
         assert p.read_text() == contents
 
-    # TODO: Awaiting resolution of
-    # https://github.com/dandi/backups2datalad/pull/21#issuecomment-1919164777;
-    # see `NotImplementedError` in `AsyncDataset.disable_dandi_provider()`
-    """
     await embargoed_dandiset.dandiset.unembargo()
 
     r = await CliRunner().invoke(
@@ -396,4 +392,3 @@ async def test_backup_embargoed(
             u.startswith("https://dandi-api-staging-dandisets.s3.amazonaws.com")
             for u in web_urls
         )
-    """
