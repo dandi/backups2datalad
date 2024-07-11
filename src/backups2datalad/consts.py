@@ -10,6 +10,8 @@ DEFAULT_GIT_ANNEX_JOBS = 10
 
 DEFAULT_WORKERS = 5
 
+MINIMUM_GIT_ANNEX_VERSION = "10.20240227"
+
 # Maximum number of Zarrs to process at once
 ZARR_LIMIT = 10
 
