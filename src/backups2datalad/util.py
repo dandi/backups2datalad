@@ -22,6 +22,7 @@ from datalad.support.json_py import dump
 from ruamel.yaml import YAML
 
 from .config import BackupConfig
+from .consts import MINIMUM_GIT_ANNEX_VERSION
 from .logging import PrefixedLogger
 
 if TYPE_CHECKING:
@@ -281,3 +282,19 @@ def yaml_dump(data: Any) -> str:
 
 class UnexpectedChangeError(Exception):
     pass
+
+
+def check_git_annex_version() -> None:
+    # Call this function at the start of subcommand functions rather than in
+    # `main()` so that it doesn't run if a user does `backups2datalad
+    # subcommand --help`
+    from datalad.support.external_versions import external_versions
+
+    gaversion = external_versions["cmd:annex"]
+    if gaversion is None:
+        raise RuntimeError("git-annex not installed")
+    elif gaversion < MINIMUM_GIT_ANNEX_VERSION:
+        raise RuntimeError(
+            f"git-annex {MINIMUM_GIT_ANNEX_VERSION} or later required, but"
+            f" version {gaversion} found"
+        )

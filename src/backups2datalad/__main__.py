@@ -24,7 +24,7 @@ from .consts import GIT_OPTIONS
 from .datasetter import DandiDatasetter
 from .logging import log
 from .register_s3 import register_s3urls
-from .util import format_errors, pdb_excepthook, quantify
+from .util import check_git_annex_version, format_errors, pdb_excepthook, quantify
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -210,6 +210,7 @@ async def update_from_backup(
     instance, but it can be restricted to only operate on specific Dandisets by
     giving the IDs of the desired Dandisets as command-line arguments.
     """
+    check_git_annex_version()
     async with datasetter:
         if asset_filter is not None:
             datasetter.config.asset_filter = asset_filter
@@ -251,6 +252,7 @@ async def backup_zarrs(
     """
     Create (but do not update) local mirrors of Zarrs for a single Dandiset
     """
+    check_git_annex_version()
     async with datasetter:
         if datasetter.config.zarrs is None:
             raise click.UsageError("Zarr backups not configured in config file")
@@ -285,6 +287,7 @@ async def update_github_metadata(
 
     This is a maintenance command that should rarely be necessary to run.
     """
+    check_git_annex_version()
     async with datasetter:
         await datasetter.update_github_metadata(dandisets, exclude=exclude)
 
@@ -331,6 +334,7 @@ async def release(
     If the mirror is configured to be pushed to GitHub, a GitHub release will
     be created for the tag as well.
     """
+    check_git_annex_version()
     async with datasetter:
         if asset_filter is not None:
             datasetter.config.asset_filter = asset_filter
@@ -381,6 +385,7 @@ async def populate_cmd(
     mirrors by giving the IDs of the desired Dandisets as command-line
     arguments.
     """
+    check_git_annex_version()
     async with datasetter:
         if (r := datasetter.config.dandisets.remote) is not None:
             backup_remote = r.name
@@ -440,6 +445,7 @@ async def populate_zarrs(
     directory, but it can be restricted to only operate on specific mirrors by
     giving the asset IDs of the desired Zarrs as command-line arguments.
     """
+    check_git_annex_version()
     async with datasetter:
         zcfg = datasetter.config.zarrs
         if zcfg is None:
@@ -487,6 +493,7 @@ async def zarr_checksum(dirpath: Path) -> None:
     Compute the Zarr checksum for the git-annex dataset at `dirpath` using the
     hashes stored in the annexed files' keys
     """
+    check_git_annex_version()
     ds = AsyncDataset(dirpath)
     print(await ds.compute_zarr_checksum())
 
@@ -503,6 +510,7 @@ async def register_s3urls_cmd(datasetter: DandiDatasetter, dandiset_id: str) -> 
     This command should only be necessary if something went wrong when
     processing the unembargoing of a Dandiset.
     """
+    check_git_annex_version()
     async with datasetter:
         p = datasetter.config.dandiset_root / dandiset_id
         ds = AsyncDataset(p)
