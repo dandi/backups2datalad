@@ -230,6 +230,7 @@ async def new_dandiset(
                 {
                     "schemaKey": "Person",
                     "name": "Wodder, John",
+                    "email": "nemo@example.com",
                     "roleName": ["dcite:Author", "dcite:ContactPerson"],
                 }
             ],
@@ -267,6 +268,7 @@ async def embargoed_dandiset(
                 {
                     "schemaKey": "Person",
                     "name": "Wodder, John",
+                    "email": "nemo@example.com",
                     "roleName": ["dcite:Author", "dcite:ContactPerson"],
                 }
             ],
