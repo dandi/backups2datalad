@@ -1,23 +1,27 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from contextlib import aclosing
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from functools import partial
 import json
 import logging
 import os
 from pathlib import Path
+import re
 from shutil import rmtree
+import subprocess
+from time import sleep
 from typing import Any
 
 import anyio
-from dandi.consts import dandiset_metadata_file
+from dandi.consts import DandiInstance, dandiset_metadata_file, known_instances
 from dandi.exceptions import NotFoundError
 from dandi.upload import upload
+from dandischema.consts import DANDI_SCHEMA_VERSION
 from datalad.api import Dataset
 from datalad.tests.utils_pytest import assert_repo_status
 import pytest
+import requests
 from test_util import find_filepaths
 import zarr
 
@@ -25,6 +29,11 @@ from backups2datalad.adandi import AsyncDandiClient, RemoteDandiset, RemoteZarrA
 from backups2datalad.adataset import AsyncDataset
 from backups2datalad.util import is_meta_file
 from backups2datalad.zarr import CHECKSUM_FILE
+
+LOCAL_DOCKER_DIR = Path(__file__).with_name("data") / "dandiarchive-docker"
+LOCAL_DOCKER_ENV = LOCAL_DOCKER_DIR.name
+
+TEST_INSTANCE = "dandi-api-local-docker-tests"
 
 
 @pytest.fixture
@@ -38,12 +47,191 @@ def capture_all_logs(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.DEBUG, logger="test_backups2datalad")
 
 
+@pytest.fixture(autouse=True)
+def tmp_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> Path:
+    home = tmp_path_factory.mktemp("tmp_home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_DIRS", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_DIRS", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("LOCALAPPDATA", str(home))
+    subprocess.run(
+        [
+            "git",
+            "config",
+            "--global",
+            "annex.security.allowed-ip-addresses",
+            "127.0.0.1 ::1",
+        ],
+        check=True,
+    )
+    return home
+
+
+@dataclass
+class Archive:
+    instance: DandiInstance
+    api_token: str
+    s3endpoint: str
+    s3bucket: str
+
+    @property
+    def instance_id(self) -> str:
+        iid = self.instance.name
+        assert isinstance(iid, str)
+        return iid
+
+    @property
+    def api_url(self) -> str:
+        url = self.instance.api
+        assert isinstance(url, str)
+        return url
+
+
+@pytest.fixture(scope="session")
+def docker_archive() -> Iterator[Archive]:
+    # Check that we're running on a Unix-based system (Linux or macOS), as the
+    # Docker images don't work on Windows.
+    if os.name != "posix":
+        pytest.fail("Docker images require Unix host")
+    persist = os.environ.get("BACKUPS2DATALAD_TESTS_PERSIST_DOCKER_COMPOSE")
+    create = (
+        persist is None
+        or subprocess.run(
+            ["docker", "inspect", f"{LOCAL_DOCKER_ENV}_django_1"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        != 0
+    )
+
+    env = {**os.environ, "DJANGO_DANDI_SCHEMA_VERSION": DANDI_SCHEMA_VERSION}
+    try:
+        if create:
+            if os.environ.get("DANDI_TESTS_PULL_DOCKER_COMPOSE", "1") not in ("", "0"):
+                subprocess.run(
+                    ["docker", "compose", "pull"], cwd=LOCAL_DOCKER_DIR, check=True
+                )
+            subprocess.run(
+                ["docker", "compose", "run", "--rm", "createbuckets"],
+                cwd=LOCAL_DOCKER_DIR,
+                env=env,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "docker",
+                    "compose",
+                    "run",
+                    "--rm",
+                    "django",
+                    "./manage.py",
+                    "migrate",
+                ],
+                cwd=LOCAL_DOCKER_DIR,
+                env=env,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "docker",
+                    "compose",
+                    "run",
+                    "--rm",
+                    "django",
+                    "./manage.py",
+                    "createcachetable",
+                ],
+                cwd=LOCAL_DOCKER_DIR,
+                env=env,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "docker",
+                    "compose",
+                    "run",
+                    "--rm",
+                    "-e",
+                    "DJANGO_SUPERUSER_PASSWORD=nsNc48DBiS",
+                    "django",
+                    "./manage.py",
+                    "createsuperuser",
+                    "--no-input",
+                    "--email",
+                    "admin@nil.nil",
+                ],
+                cwd=LOCAL_DOCKER_DIR,
+                env=env,
+                check=True,
+            )
+
+        r = subprocess.check_output(
+            [
+                "docker",
+                "compose",
+                "run",
+                "--rm",
+                "-T",
+                "django",
+                "./manage.py",
+                "drf_create_token",
+                "admin@nil.nil",
+            ],
+            cwd=LOCAL_DOCKER_DIR,
+            env=env,
+            text=True,
+        )
+        m = re.search(r"^Generated token (\w+) for user admin@nil.nil$", r, flags=re.M)
+        if not m:
+            raise RuntimeError(
+                "Could not extract Django auth token from drf_create_token"
+                f" output: {r!r}"
+            )
+        django_api_key = m[1]
+        instance = known_instances[TEST_INSTANCE]
+
+        if create:
+            subprocess.run(
+                ["docker", "compose", "up", "-d", "django", "celery"],
+                cwd=str(LOCAL_DOCKER_DIR),
+                env=env,
+                check=True,
+            )
+            for _ in range(25):
+                try:
+                    requests.get(f"{instance.api}/dandisets/")
+                except requests.ConnectionError:
+                    sleep(1)
+                else:
+                    break
+            else:
+                raise RuntimeError("Django container did not start up in time")
+        os.environ["DANDI_API_KEY"] = django_api_key  # For uploading
+        yield Archive(
+            instance=instance,
+            api_token=django_api_key,
+            s3endpoint="http://localhost:9000",
+            s3bucket="dandi-dandisets",
+        )
+    finally:
+        if persist in (None, "0"):
+            subprocess.run(
+                ["docker", "compose", "down", "-v"], cwd=LOCAL_DOCKER_DIR, check=True
+            )
+
+
 @pytest.fixture
-async def dandi_client() -> AsyncIterator[AsyncDandiClient]:
-    api_token = os.environ["DANDI_API_KEY"].strip()
-    assert api_token != "", "DANDI_API_KEY not set"
+async def dandi_client(docker_archive: Archive) -> AsyncIterator[AsyncDandiClient]:
     async with AsyncDandiClient.for_dandi_instance(
-        "dandi-staging", token=api_token
+        docker_archive.instance_id, token=docker_archive.api_token
     ) as client:
         yield client
 
@@ -111,7 +299,7 @@ class SampleDandiset:
             partial(
                 upload,
                 paths=paths or [self.dspath],
-                dandi_instance="dandi-staging",
+                dandi_instance=TEST_INSTANCE,
                 devel_debug=True,
                 allow_any_path=True,
                 validation="skip",
@@ -220,7 +408,7 @@ class SampleDandiset:
 @pytest.fixture()
 async def new_dandiset(
     dandi_client: AsyncDandiClient, tmp_path_factory: pytest.TempPathFactory
-) -> AsyncIterator[SampleDandiset]:
+) -> SampleDandiset:
     d = await dandi_client.create_dandiset(
         "Dandiset for testing backups2datalad",
         {
@@ -246,19 +434,13 @@ async def new_dandiset(
         dandiset=d,
         dandiset_id=d.identifier,
     )
-    try:
-        yield ds
-    finally:
-        async with aclosing(d.aget_versions(include_draft=False)) as vit:
-            async for v in vit:
-                await dandi_client.delete(f"{d.api_path}versions/{v.identifier}/")
-        await d.adelete()
+    return ds
 
 
 @pytest.fixture()
 async def embargoed_dandiset(
     dandi_client: AsyncDandiClient, tmp_path_factory: pytest.TempPathFactory
-) -> AsyncIterator[SampleDandiset]:
+) -> SampleDandiset:
     d = await dandi_client.create_dandiset(
         "Embargoed Dandiset for testing backups2datalad",
         {
@@ -285,13 +467,7 @@ async def embargoed_dandiset(
         dandiset=d,
         dandiset_id=d.identifier,
     )
-    try:
-        yield ds
-    finally:
-        async with aclosing(d.aget_versions(include_draft=False)) as vit:
-            async for v in vit:
-                await dandi_client.delete(f"{d.api_path}versions/{v.identifier}/")
-        await d.adelete()
+    return ds
 
 
 @dataclass

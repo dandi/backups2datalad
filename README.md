@@ -40,6 +40,12 @@ Before running `backups2datalad`, the following setup must be performed:
         - When `dandi_instance` is `"dandi-staging"`, this should be
           `"dandi-api-staging-dandisets"`.
 
+    - `s3endpoint` — The base endpoint URL of the S3 instance on which the
+      bucket is located.  If this is set, the base bucket URL will be
+      calculated as `{s3endpoint}/{s3bucket}`; otherwise, it will be
+      `https://{s3bucket}.s3.amazonaws.com`.  This option is intended primarily
+      for use in testing.
+
     - `content_url_regex` — A regular expression used to identify which of an
       asset's `contentUrl`s is its S3 URL.  Defaults to
       `"amazonaws.com/.*blobs/"`.

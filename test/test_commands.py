@@ -7,8 +7,7 @@ import random
 from traceback import format_exception
 
 from asyncclick.testing import CliRunner, Result
-from conftest import SampleDandiset
-from dandi.consts import known_instances
+from conftest import Archive, SampleDandiset
 from datalad.api import Dataset
 from datalad.tests.utils_pytest import assert_repo_status
 import numpy as np
@@ -34,11 +33,15 @@ def show_result(r: Result) -> str:
         return r.output
 
 
-async def test_backup_command(text_dandiset: SampleDandiset, tmp_path: Path) -> None:
+async def test_backup_command(
+    docker_archive: Archive, text_dandiset: SampleDandiset, tmp_path: Path
+) -> None:
     cfgfile = tmp_path / "config.yaml"
     cfgfile.write_text(
-        "dandi_instance: dandi-staging\n"
-        "s3bucket: dandi-api-staging-dandisets\n"
+        f"dandi_instance: {docker_archive.instance_id}\n"
+        f"s3bucket: {docker_archive.s3bucket}\n"
+        f"s3endpoint: {docker_archive.s3endpoint}\n"
+        f"content_url_regex: '{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/'\n"
         "dandisets:\n"
         "  path: ds\n"
     )
@@ -95,7 +98,9 @@ async def test_backup_command(text_dandiset: SampleDandiset, tmp_path: Path) -> 
         assert repo.get_commitish_hash("HEAD") == last_commit
 
 
-async def test_populate(new_dandiset: SampleDandiset, tmp_path: Path) -> None:
+async def test_populate(
+    docker_archive: Archive, new_dandiset: SampleDandiset, tmp_path: Path
+) -> None:
     new_dandiset.add_text("file.txt", "This is test text.\n")
     new_dandiset.add_text("fruit/apple.txt", "Apple\n")
     new_dandiset.add_text("fruit/banana.txt", "Banana\n")
@@ -128,8 +133,10 @@ async def test_populate(new_dandiset: SampleDandiset, tmp_path: Path) -> None:
 
     cfgfile = tmp_path / "config.yaml"
     cfg = BackupConfig(
-        dandi_instance="dandi-staging",
-        s3bucket="dandi-api-staging-dandisets",
+        dandi_instance=docker_archive.instance_id,
+        s3bucket=docker_archive.s3bucket,
+        s3endpoint=docker_archive.s3endpoint,
+        content_url_regex=f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/",
         backup_root=backup_root,
         dandisets=ResourceConfig(
             path="ds",
@@ -179,7 +186,9 @@ async def test_populate(new_dandiset: SampleDandiset, tmp_path: Path) -> None:
     zarr_manifest.check(remote_root / "zarr")
 
 
-async def test_backup_zarrs(new_dandiset: SampleDandiset, tmp_path: Path) -> None:
+async def test_backup_zarrs(
+    docker_archive: Archive, new_dandiset: SampleDandiset, tmp_path: Path
+) -> None:
     new_dandiset.add_zarr("sample.zarr", np.arange(1000), np.arange(1000, 0, -1))
     new_dandiset.add_zarr("z/eye.zarr", np.eye(5))
     await new_dandiset.upload()
@@ -191,8 +200,10 @@ async def test_backup_zarrs(new_dandiset: SampleDandiset, tmp_path: Path) -> Non
 
     cfgfile = tmp_path / "config.yaml"
     cfg = BackupConfig(
-        dandi_instance="dandi-staging",
-        s3bucket="dandi-api-staging-dandisets",
+        dandi_instance=docker_archive.instance_id,
+        s3bucket=docker_archive.s3bucket,
+        s3endpoint=docker_archive.s3endpoint,
+        content_url_regex=f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/",
         backup_root=backup_root,
         dandisets=ResourceConfig(path="ds"),
         zarrs=ResourceConfig(path="zarr"),
@@ -219,7 +230,7 @@ async def test_backup_zarrs(new_dandiset: SampleDandiset, tmp_path: Path) -> Non
 
 
 async def test_backup_committed_zarr(
-    new_dandiset: SampleDandiset, tmp_path: Path
+    docker_archive: Archive, new_dandiset: SampleDandiset, tmp_path: Path
 ) -> None:
     new_dandiset.add_zarr("sample.zarr", np.arange(1000), np.arange(1000, 0, -1))
     new_dandiset.add_zarr("z/eye.zarr", np.eye(5))
@@ -232,8 +243,10 @@ async def test_backup_committed_zarr(
 
     cfgfile = tmp_path / "config.yaml"
     cfg = BackupConfig(
-        dandi_instance="dandi-staging",
-        s3bucket="dandi-api-staging-dandisets",
+        dandi_instance=docker_archive.instance_id,
+        s3bucket=docker_archive.s3bucket,
+        s3endpoint=docker_archive.s3endpoint,
+        content_url_regex=f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/",
         backup_root=backup_root,
         dandisets=ResourceConfig(path="ds"),
         zarrs=ResourceConfig(path="zarr"),
@@ -269,7 +282,7 @@ async def test_backup_committed_zarr(
 
 
 async def test_backup_embargoed(
-    embargoed_dandiset: SampleDandiset, tmp_path: Path
+    docker_archive: Archive, embargoed_dandiset: SampleDandiset, tmp_path: Path
 ) -> None:
     embargoed_dandiset.add_text(
         "file.txt",
@@ -300,8 +313,10 @@ async def test_backup_embargoed(
 
     cfgfile = tmp_path / "config.yaml"
     cfgfile.write_text(
-        "dandi_instance: dandi-staging\n"
-        "s3bucket: dandi-api-staging-dandisets\n"
+        f"dandi_instance: {docker_archive.instance_id}\n"
+        f"s3bucket: {docker_archive.s3bucket}\n"
+        f"s3endpoint: {docker_archive.s3endpoint}\n"
+        f"content_url_regex: '{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/'\n"
         "dandisets:\n"
         "  path: ds\n"
     )
@@ -342,7 +357,7 @@ async def test_backup_embargoed(
             w["urls"] for w in whereis["whereis"] if w["description"] == "[datalad]"
         ]
         assert len(web_urls) == 1
-        assert web_urls[0].startswith(known_instances["dandi-staging"].api)
+        assert web_urls[0].startswith(docker_archive.api_url)
 
     for path, contents in embargoed_dandiset.text_assets.items():
         p = ds.pathobj / path
@@ -391,9 +406,9 @@ async def test_backup_embargoed(
             w["urls"] for w in whereis["whereis"] if w["description"] == "web"
         ]
         assert len(web_urls) == 2
-        assert any(u.startswith(known_instances["dandi-staging"].api) for u in web_urls)
+        assert any(u.startswith(docker_archive.api_url) for u in web_urls)
         assert any(
-            u.startswith("https://dandi-api-staging-dandisets.s3.amazonaws.com")
+            u.startswith(f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/")
             for u in web_urls
         )
     """

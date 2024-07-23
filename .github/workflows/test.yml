@@ -64,8 +64,6 @@ jobs:
       - name: Run tests with coverage
         if: matrix.toxenv == 'py'
         run: tox -e py -- -vv --cov-report=xml
-        env:
-          DANDI_API_KEY: ${{ secrets.DANDI_API_KEY }}
 
       - name: Run generic tests
         if: matrix.toxenv != 'py'

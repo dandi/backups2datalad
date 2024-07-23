@@ -39,14 +39,12 @@ class BlobBackup:
         self.log.debug("Fetching bucket URL")
         aws_url = self.asset.get_content_url(self.config.content_url_regex)
         urlbits = urlparse(aws_url)
-        key = urlbits.path.lstrip("/")
         self.log.debug("About to query S3")
         r = await arequest(
             s3client,
             "HEAD",
-            f"https://{self.config.s3bucket}.s3.amazonaws.com/{key}",
+            urlunparse(urlbits._replace(params="", query="", fragment="")),
         )
-        r.raise_for_status()
         version_id = r.headers["x-amz-version-id"]
         self.log.debug("Got bucket URL")
         return urlunparse(urlbits._replace(query=f"versionId={version_id}"))
