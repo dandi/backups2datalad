@@ -62,16 +62,12 @@ def tmp_home(
     monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("LOCALAPPDATA", str(home))
-    subprocess.run(
-        [
-            "git",
-            "config",
-            "--global",
-            "annex.security.allowed-ip-addresses",
-            "127.0.0.1 ::1",
-        ],
-        check=True,
-    )
+    for key, value in [
+        ("annex.security.allowed-ip-addresses", "127.0.0.1 ::1"),
+        ("user.email", "git@test.nil"),
+        ("user.name", "Test Gitter"),
+    ]:
+        subprocess.run(["git", "config", "--global", key, value], check=True)
     return home
 
 
