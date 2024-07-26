@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 
 import anyio
-from conftest import SampleDandiset
+from conftest import Archive, SampleDandiset
 from dandi.consts import dandiset_metadata_file
 from dandi.dandiapi import Version
 from dandi.utils import yaml_load
@@ -24,14 +24,18 @@ log = logging.getLogger("test_backups2datalad.test_core")
 pytestmark = pytest.mark.anyio
 
 
-async def test_1(text_dandiset: SampleDandiset, tmp_path: Path) -> None:
+async def test_1(
+    docker_archive: Archive, text_dandiset: SampleDandiset, tmp_path: Path
+) -> None:
     # TODO: move pre-setup into a fixture, e.g. local_setup1 or make code work without?
     di = DandiDatasetter(
         dandi_client=text_dandiset.client,
         config=BackupConfig(
             backup_root=tmp_path,
-            dandi_instance="dandi-staging",
-            s3bucket="dandi-api-staging-dandisets",
+            dandi_instance=docker_archive.instance_id,
+            s3bucket=docker_archive.s3bucket,
+            s3endpoint=docker_archive.s3endpoint,
+            content_url_regex=f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/",
         ),
     )
 
@@ -141,7 +145,9 @@ async def test_1(text_dandiset: SampleDandiset, tmp_path: Path) -> None:
         }
 
 
-async def test_2(text_dandiset: SampleDandiset, tmp_path: Path) -> None:
+async def test_2(
+    docker_archive: Archive, text_dandiset: SampleDandiset, tmp_path: Path
+) -> None:
     """
     Test of adding in version-tagging after backups have already been taken.
 
@@ -152,8 +158,10 @@ async def test_2(text_dandiset: SampleDandiset, tmp_path: Path) -> None:
         dandi_client=text_dandiset.client,
         config=BackupConfig(
             backup_root=tmp_path,
-            dandi_instance="dandi-staging",
-            s3bucket="dandi-api-staging-dandisets",
+            dandi_instance=docker_archive.instance_id,
+            s3bucket=docker_archive.s3bucket,
+            s3endpoint=docker_archive.s3endpoint,
+            content_url_regex=f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/",
             enable_tags=False,
         ),
     )
@@ -237,7 +245,9 @@ async def test_2(text_dandiset: SampleDandiset, tmp_path: Path) -> None:
     )
 
 
-async def test_3(text_dandiset: SampleDandiset, tmp_path: Path) -> None:
+async def test_3(
+    docker_archive: Archive, text_dandiset: SampleDandiset, tmp_path: Path
+) -> None:
     """
     Test of "debouncing" (GH-89, GH-97).
 
@@ -247,8 +257,10 @@ async def test_3(text_dandiset: SampleDandiset, tmp_path: Path) -> None:
         dandi_client=text_dandiset.client,
         config=BackupConfig(
             backup_root=tmp_path,
-            dandi_instance="dandi-staging",
-            s3bucket="dandi-api-staging-dandisets",
+            dandi_instance=docker_archive.instance_id,
+            s3bucket=docker_archive.s3bucket,
+            s3endpoint=docker_archive.s3endpoint,
+            content_url_regex=f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/",
             enable_tags=True,
         ),
     )
@@ -325,7 +337,9 @@ async def test_3(text_dandiset: SampleDandiset, tmp_path: Path) -> None:
         }
 
 
-async def test_4(text_dandiset: SampleDandiset, tmp_path: Path) -> None:
+async def test_4(
+    docker_archive: Archive, text_dandiset: SampleDandiset, tmp_path: Path
+) -> None:
     """
     This test creates several versions and takes a backup after each one.
     """
@@ -333,8 +347,10 @@ async def test_4(text_dandiset: SampleDandiset, tmp_path: Path) -> None:
         dandi_client=text_dandiset.client,
         config=BackupConfig(
             backup_root=tmp_path,
-            dandi_instance="dandi-staging",
-            s3bucket="dandi-api-staging-dandisets",
+            dandi_instance=docker_archive.instance_id,
+            s3bucket=docker_archive.s3bucket,
+            s3endpoint=docker_archive.s3endpoint,
+            content_url_regex=f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/",
             enable_tags=True,
         ),
     )
@@ -375,13 +391,17 @@ async def test_4(text_dandiset: SampleDandiset, tmp_path: Path) -> None:
         }
 
 
-async def test_binary(new_dandiset: SampleDandiset, tmp_path: Path) -> None:
+async def test_binary(
+    docker_archive: Archive, new_dandiset: SampleDandiset, tmp_path: Path
+) -> None:
     di = DandiDatasetter(
         dandi_client=new_dandiset.client,
         config=BackupConfig(
             backup_root=tmp_path,
-            dandi_instance="dandi-staging",
-            s3bucket="dandi-api-staging-dandisets",
+            dandi_instance=docker_archive.instance_id,
+            s3bucket=docker_archive.s3bucket,
+            s3endpoint=docker_archive.s3endpoint,
+            content_url_regex=f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/",
             enable_tags=True,
         ),
     )

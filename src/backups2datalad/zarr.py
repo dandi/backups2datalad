@@ -19,7 +19,7 @@ from zarr_checksum.tree import ZarrChecksumTree
 from .adandi import RemoteZarrAsset
 from .adataset import AsyncDataset
 from .annex import AsyncAnnex
-from .config import ZarrMode
+from .config import BackupConfig, ZarrMode
 from .consts import MAX_ZARR_SYNCS
 from .logging import PrefixedLogger
 from .manager import Manager
@@ -105,34 +105,49 @@ class ZarrReport:
 @dataclass
 class ZarrSyncer:
     asset: RemoteZarrAsset
-    api_url: str = field(init=False)
-    zarr_id: str = field(init=False)
     ds: AsyncDataset
-    repo: Path = field(init=False)
     annex: AsyncAnnex
-    s3bucket: str
-    s3prefix: str = field(init=False)
+    config: BackupConfig
     backup_remote: str | None
     checksum: str | None
     log: PrefixedLogger
-    mode: ZarrMode
     last_timestamp: datetime | None = None
     error_on_change: bool = False
     report: ZarrReport = field(default_factory=ZarrReport)
     _local_checksum: str | None = None
 
-    def __post_init__(self) -> None:
-        self.api_url = self.asset.aclient.api_url
-        self.zarr_id = self.asset.zarr
-        self.repo = self.ds.pathobj
-        self.s3prefix = f"zarr/{self.zarr_id}/"
+    @property
+    def api_url(self) -> str:
+        return self.asset.aclient.api_url
+
+    @property
+    def zarr_id(self) -> str:
+        return self.asset.zarr
+
+    @property
+    def repo(self) -> Path:
+        return self.ds.pathobj
+
+    @property
+    def s3bucket(self) -> str:
+        return self.config.s3bucket
+
+    @property
+    def s3prefix(self) -> str:
+        return f"zarr/{self.zarr_id}/"
+
+    @property
+    def mode(self) -> ZarrMode:
+        return self.config.zarr_mode
 
     async def run(self) -> None:
         last_sync = self.read_sync_file()
         async with aclosing(self.annex.list_files()) as fileiter:
             to_delete = {f async for f in fileiter if not is_meta_file(f)}
         async with get_session().create_client(
-            "s3", config=AioConfig(signature_version=UNSIGNED)
+            "s3",
+            config=AioConfig(signature_version=UNSIGNED),
+            endpoint_url=self.config.s3endpoint,
         ) as client:
             if not await self.needs_sync(client, last_sync, to_delete):
                 self.log.info("backup up to date")
@@ -443,7 +458,7 @@ class ZarrSyncer:
                         size=v["Size"],
                         md5_digest=v["ETag"].strip('"'),
                         last_modified=v["LastModified"],
-                        bucket_url=f"https://{self.s3bucket}.s3.amazonaws.com/{quote(v['Key'])}?versionId={v['VersionId']}",
+                        bucket_url=f"{self.config.bucket_url}/{quote(v['Key'])}?versionId={v['VersionId']}",
                     )
             for dm in page.get("DeleteMarkers", []):
                 if dm["IsLatest"]:
@@ -543,12 +558,11 @@ async def sync_zarr(
                 asset=asset,
                 ds=ds,
                 annex=annex,
-                s3bucket=manager.config.s3bucket,
+                config=manager.config,
                 backup_remote=backup_remote,
                 checksum=checksum,
                 log=manager.log,
                 error_on_change=error_on_change,
-                mode=manager.config.zarr_mode,
             )
             await zsync.run()
         report = zsync.report

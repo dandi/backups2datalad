@@ -5,7 +5,7 @@ from pathlib import Path
 from shutil import rmtree
 from time import sleep
 
-from conftest import SampleDandiset
+from conftest import Archive, SampleDandiset
 from datalad.api import Dataset
 import numpy as np
 import pytest
@@ -25,14 +25,19 @@ log = logging.getLogger("test_backups2datalad.test_zarr")
 pytestmark = pytest.mark.anyio
 
 
-async def test_sync_zarr(new_dandiset: SampleDandiset, tmp_path: Path) -> None:
+async def test_sync_zarr(
+    docker_archive: Archive, new_dandiset: SampleDandiset, tmp_path: Path
+) -> None:
     new_dandiset.add_zarr("sample.zarr", np.arange(1000), np.arange(1000, 0, -1))
     await new_dandiset.upload()
     asset = await new_dandiset.dandiset.aget_asset_by_path("sample.zarr")
     assert isinstance(asset, RemoteZarrAsset)
     checksum = asset.get_digest_value()
     config = BackupConfig(
-        s3bucket="dandi-api-staging-dandisets", zarrs=ResourceConfig(path="zarrs")
+        s3bucket=docker_archive.s3bucket,
+        s3endpoint=docker_archive.s3endpoint,
+        content_url_regex=f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/",
+        zarrs=ResourceConfig(path="zarrs"),
     )
     await sync_zarr(
         asset,
@@ -49,7 +54,9 @@ async def test_sync_zarr(new_dandiset: SampleDandiset, tmp_path: Path) -> None:
     )
 
 
-async def test_backup_zarr(new_dandiset: SampleDandiset, tmp_path: Path) -> None:
+async def test_backup_zarr(
+    docker_archive: Archive, new_dandiset: SampleDandiset, tmp_path: Path
+) -> None:
     new_dandiset.add_zarr("sample.zarr", np.arange(1000), np.arange(1000, 0, -1))
     new_dandiset.add_text("file.txt", "This is test text.\n")
     await new_dandiset.upload()
@@ -60,8 +67,10 @@ async def test_backup_zarr(new_dandiset: SampleDandiset, tmp_path: Path) -> None
         dandi_client=new_dandiset.client,
         config=BackupConfig(
             backup_root=tmp_path,
-            dandi_instance="dandi-staging",
-            s3bucket="dandi-api-staging-dandisets",
+            dandi_instance=docker_archive.instance_id,
+            s3bucket=docker_archive.s3bucket,
+            s3endpoint=docker_archive.s3endpoint,
+            content_url_regex=f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/",
             dandisets=ResourceConfig(path="ds"),
             zarrs=ResourceConfig(path="zarrs"),
         ),
@@ -114,8 +123,14 @@ async def test_backup_zarr(new_dandiset: SampleDandiset, tmp_path: Path) -> None
     assert zarrgit.get_commit_count() == 4
 
 
+@pytest.mark.skip(
+    reason=(
+        "Checksum mismatch caused by https://github.com/minio/minio/issues/20167"
+        " results in infinite upload loop"
+    )
+)
 async def test_backup_zarr_entry_conflicts(
-    new_dandiset: SampleDandiset, tmp_path: Path
+    docker_archive: Archive, new_dandiset: SampleDandiset, tmp_path: Path
 ) -> None:
     zarr_path = new_dandiset.dspath / "sample.zarr"
     zarr_path.mkdir()
@@ -132,8 +147,10 @@ async def test_backup_zarr_entry_conflicts(
         dandi_client=new_dandiset.client,
         config=BackupConfig(
             backup_root=tmp_path,
-            dandi_instance="dandi-staging",
-            s3bucket="dandi-api-staging-dandisets",
+            dandi_instance=docker_archive.instance_id,
+            s3bucket=docker_archive.s3bucket,
+            s3endpoint=docker_archive.s3endpoint,
+            content_url_regex=f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/",
             dandisets=ResourceConfig(path="ds"),
             zarrs=ResourceConfig(path="zarrs"),
         ),
@@ -166,7 +183,7 @@ async def test_backup_zarr_entry_conflicts(
 
 
 async def test_backup_zarr_delete_zarr(
-    new_dandiset: SampleDandiset, tmp_path: Path
+    docker_archive: Archive, new_dandiset: SampleDandiset, tmp_path: Path
 ) -> None:
     new_dandiset.add_zarr("sample.zarr", np.arange(1000), np.arange(1000, 0, -1))
     await new_dandiset.upload()
@@ -175,8 +192,10 @@ async def test_backup_zarr_delete_zarr(
         dandi_client=new_dandiset.client,
         config=BackupConfig(
             backup_root=tmp_path,
-            dandi_instance="dandi-staging",
-            s3bucket="dandi-api-staging-dandisets",
+            dandi_instance=docker_archive.instance_id,
+            s3bucket=docker_archive.s3bucket,
+            s3endpoint=docker_archive.s3endpoint,
+            content_url_regex=f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/",
             dandisets=ResourceConfig(path="ds"),
             zarrs=ResourceConfig(path="zarrs"),
         ),
@@ -199,7 +218,7 @@ async def test_backup_zarr_delete_zarr(
 
 
 async def test_backup_zarr_pathological(
-    new_dandiset: SampleDandiset, tmp_path: Path
+    docker_archive: Archive, new_dandiset: SampleDandiset, tmp_path: Path
 ) -> None:
     new_dandiset.add_zarr("sample.zarr", np.arange(1000), np.arange(1000, 0, -1))
     await new_dandiset.upload()
@@ -236,8 +255,10 @@ async def test_backup_zarr_pathological(
         dandi_client=new_dandiset.client,
         config=BackupConfig(
             backup_root=tmp_path,
-            dandi_instance="dandi-staging",
-            s3bucket="dandi-api-staging-dandisets",
+            dandi_instance=docker_archive.instance_id,
+            s3bucket=docker_archive.s3bucket,
+            s3endpoint=docker_archive.s3endpoint,
+            content_url_regex=f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/",
             dandisets=ResourceConfig(path="ds"),
             zarrs=ResourceConfig(path="zarrs"),
         ),

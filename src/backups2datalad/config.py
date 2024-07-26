@@ -48,6 +48,7 @@ class BackupConfig(BaseModel):
     # config file is given
     dandi_instance: str = "dandi"
     s3bucket: str = "dandiarchive"
+    s3endpoint: str | None = None
     content_url_regex: str = r"amazonaws.com/.*blobs/"
     dandisets: ResourceConfig = Field(
         default_factory=lambda: ResourceConfig(path="dandisets")
@@ -87,6 +88,13 @@ class BackupConfig(BaseModel):
 
     def dump_yaml(self, filepath: Path) -> None:
         filepath.write_text(yaml_dump(self.model_dump(mode="json", exclude_unset=True)))
+
+    @property
+    def bucket_url(self) -> str:
+        if self.s3endpoint is not None:
+            return f"{self.s3endpoint}/{self.s3bucket}"
+        else:
+            return f"https://{self.s3bucket}.s3.amazonaws.com"
 
     @property
     def dandiset_root(self) -> Path:
