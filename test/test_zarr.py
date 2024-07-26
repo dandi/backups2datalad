@@ -123,6 +123,12 @@ async def test_backup_zarr(
     assert zarrgit.get_commit_count() == 4
 
 
+@pytest.mark.skip(
+    reason=(
+        "Checksum mismatch caused by https://github.com/minio/minio/issues/20167"
+        " results in infinite upload loop"
+    )
+)
 async def test_backup_zarr_entry_conflicts(
     docker_archive: Archive, new_dandiset: SampleDandiset, tmp_path: Path
 ) -> None:
