@@ -17,7 +17,7 @@ Before running `backups2datalad`, the following setup must be performed:
   required.
 
 - [git-annex](https://git-annex.branchable.com) must be installed.  At least
-  version 10.20240227 is required, though you should endeavor to obtain the
+  version 10.20240430 is required, though you should endeavor to obtain the
   latest version.
 
 - An API token needs to be obtained for the DANDI instance that is being

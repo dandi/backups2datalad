@@ -16,6 +16,7 @@ import textwrap
 from typing import Any, ClassVar
 
 import anyio
+from anyio.to_thread import run_sync
 from dandi.consts import EmbargoStatus
 from datalad.api import Dataset
 from datalad.runner.exception import CommandError
@@ -161,14 +162,41 @@ class AsyncDataset:
                 )
 
     async def disable_dandi_provider(self) -> None:
-        # See <https://github.com/dandi/backups2datalad/pull/21#issuecomment-1919164777>
-        # TODO: Once this is implemented, uncomment the commented-out portion
-        # of `test_backup_embargoed` in `test_commands.py`.
-        raise NotImplementedError(
-            "Waiting on Joey's input; see https://git-annex.branchable.com/"
-            "forum/how_to___34__move__34___URL_between_remotes__63__/"
-        )
-        await self.call_git("remote", "remove", "datalad")  # type: ignore[unreachable]
+        # `anyio.run_process()` doesn't support files or streams as stdin to
+        # subprocesses, so we have to do this the synchronous way.
+
+        def reregister_keys() -> None:
+            with subprocess.Popen(
+                [
+                    "git",
+                    *GIT_OPTIONS,
+                    "annex",
+                    "find",
+                    "--include=*",
+                    "--format=${key}\\n",
+                ],
+                cwd=self.pathobj,
+                stdout=subprocess.PIPE,
+            ) as p:
+                try:
+                    subprocess.run(
+                        [
+                            "git",
+                            *GIT_OPTIONS,
+                            "annex",
+                            "reregisterurl",
+                            "--batch",
+                            "--move-from=datalad",
+                        ],
+                        cwd=self.pathobj,
+                        stdin=p.stdout,
+                        check=True,
+                    )
+                finally:
+                    p.terminate()
+
+        await run_sync(reregister_keys)
+        await self.call_git("remote", "remove", "datalad")
 
     async def is_dirty(self) -> bool:
         return (
