@@ -93,8 +93,8 @@ class DandiDatasetter(AsyncResource):
         if not dandiset_ids and self.config.gh_org is not None:
             extant = {d.identifier for d, _ in report.results}
             extant.update(d.identifier for d in report.failed)
-            for sub_info in await superds.get_subdatasets(result_xfm="relpaths"):
-                d = sub_info["path"]
+            for sub_info in await superds.get_subdatasets():
+                d = sub_info["gitmodule_path"]
                 if (
                     re.fullmatch(DANDISET_ID_REGEX, d)
                     and d not in extant
