@@ -17,7 +17,7 @@ import subprocess
 
 import anyio
 from anyio.abc import AsyncResource
-from dandi.consts import EmbargoStatus, dandiset_metadata_file
+from dandi.consts import DANDISET_ID_REGEX, EmbargoStatus, dandiset_metadata_file
 from dandi.exceptions import NotFoundError
 from datalad.api import clone
 from ghrepo import GHRepo
@@ -90,25 +90,47 @@ class DandiDatasetter(AsyncResource):
                         if d.embargo_status is EmbargoStatus.OPEN
                         else "private"
                     )
+        if not dandiset_ids and self.config.gh_org is not None:
+            extant = {d.identifier for d, _ in report.results}
+            extant.update(d.identifier for d in report.failed)
+            for sub_info in await superds.get_subdatasets(result_xfm="relpaths"):
+                d = sub_info["path"]
+                if (
+                    re.fullmatch(DANDISET_ID_REGEX, d)
+                    and d not in extant
+                    and (exclude is None or not exclude.search(d))
+                    and sub_info.get("gitmodule_github-access-status", "public")
+                    == "public"
+                ):
+                    log.info(
+                        "Dandiset %s has been deleted; making GitHub backup private",
+                        d,
+                    )
+                    await self.manager.edit_github_repo(
+                        GHRepo(self.config.gh_org, d),
+                        private=True,
+                    )
+                    access_status[d] = "private"
         if to_save:
             log.debug("Committing superdataset")
             superds.assert_no_duplicates_in_gitmodules()
             msg = await self.get_superds_commit_message(superds, to_save)
             await superds.save(message=msg, path=to_save)
-            if access_status:
-                for did, access in access_status.items():
-                    await superds.set_repo_config(
-                        f"submodule.{did}.github-access-status",
-                        access,
-                        file=".gitmodules",
-                    )
-                await superds.commit_if_changed(
-                    "[backups2datalad] Update github-access-status keys in .gitmodules",
-                    paths=[".gitmodules"],
-                    check_dirty=False,
-                )
             superds.assert_no_duplicates_in_gitmodules()
             log.debug("Superdataset committed")
+        if access_status:
+            log.debug("Ensuring github-access-status in .gitmodules is up-to-date")
+            for did, access in access_status.items():
+                await superds.set_repo_config(
+                    f"submodule.{did}.github-access-status",
+                    access,
+                    file=".gitmodules",
+                )
+            await superds.commit_if_changed(
+                "[backups2datalad] Update github-access-status keys in .gitmodules",
+                paths=[".gitmodules"],
+                check_dirty=False,
+            )
         if report.failed:
             raise RuntimeError(
                 f"Backups for {quantify(len(report.failed), 'Dandiset')} failed"
