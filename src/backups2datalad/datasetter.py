@@ -600,9 +600,16 @@ class DandiDatasetter(AsyncResource):
                 h.setLevel(screen_level)
         # Superdataset must exist before creating anything in the directory:
         await self.ensure_superdataset()
-        logdir = self.config.dandiset_root / ".git" / "dandi" / "backups2datalad"
-        logdir.mkdir(exist_ok=True, parents=True)
         ts = datetime.now(timezone.utc)
+        logdir = (
+            self.config.dandiset_root
+            / ".git"
+            / "dandi"
+            / "backups2datalad"
+            / f"{ts:%Y}"
+            / f"{ts:%m}"
+        )
+        logdir.mkdir(exist_ok=True, parents=True)
         filename = f"{ts:%Y.%m.%d.%H.%M.%SZ}.log"
         self.logfile = logdir / filename
         handler = logging.FileHandler(self.logfile, encoding="utf-8")
