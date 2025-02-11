@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass, field
@@ -35,6 +36,13 @@ from .manager import GitHub, Manager
 from .syncer import Syncer
 from .util import AssetTracker, assets_eq, quantify, update_dandiset_metadata
 from .zarr import ZarrLink, sync_zarr
+
+
+@dataclass
+class UpdateReport:
+    last_modified: datetime
+    # List is in sorted order
+    tagged_releases: list[str] | None
 
 
 @dataclass
@@ -80,12 +88,19 @@ class DandiDatasetter(AsyncResource):
             workers=self.config.workers,
         )
         to_save: list[str] = []
-        access_status: dict[str, str] = {}
-        for d, changed in report.results:
-            if changed:
+        gitmodule_attrs: dict[str, dict[str, str]] = defaultdict(dict)
+        for d, r in report.results:
+            if r is not None:
                 to_save.append(d.identifier)
+                gitmodule_attrs[d.identifier]["dandiset-last-modified"] = str(
+                    r.last_modified
+                )
+                if r.tagged_releases is not None:
+                    gitmodule_attrs[d.identifier]["dandiset-tagged-releases"] = (
+                        ",".join(r.tagged_releases)
+                    )
                 if self.config.gh_org is not None:
-                    access_status[d.identifier] = (
+                    gitmodule_attrs[d.identifier]["github-access-status"] = (
                         "public"
                         if d.embargo_status is EmbargoStatus.OPEN
                         else "private"
@@ -110,24 +125,23 @@ class DandiDatasetter(AsyncResource):
                         GHRepo(self.config.gh_org, d),
                         private=True,
                     )
-                    access_status[d] = "private"
+                    gitmodule_attrs[d]["github-access-status"] = "private"
         if to_save:
             log.debug("Committing superdataset")
             superds.assert_no_duplicates_in_gitmodules()
             msg = await self.get_superds_commit_message(superds, to_save)
-            await superds.save(message=msg, path=to_save)
+            await superds.save(message=msg, path=to_save + [".gitmodules"])
             superds.assert_no_duplicates_in_gitmodules()
             log.debug("Superdataset committed")
-        if access_status:
-            log.debug("Ensuring github-access-status in .gitmodules is up-to-date")
-            for did, access in access_status.items():
-                await superds.set_repo_config(
-                    f"submodule.{did}.github-access-status",
-                    access,
-                    file=".gitmodules",
-                )
+        if gitmodule_attrs:
+            log.debug("Updating submodule properties in .gitmodules")
+            for did, attrs in gitmodule_attrs.items():
+                for k, v in attrs.items():
+                    await superds.set_repo_config(
+                        f"submodule.{did}.{k}", v, file=".gitmodules"
+                    )
             await superds.commit_if_changed(
-                "[backups2datalad] Update github-access-status keys in .gitmodules",
+                "[backups2datalad] Update .gitmodules",
                 paths=[".gitmodules"],
                 check_dirty=False,
             )
@@ -168,11 +182,11 @@ class DandiDatasetter(AsyncResource):
 
     async def update_dandiset(
         self, dandiset: RemoteDandiset, ds: AsyncDataset | None = None
-    ) -> bool:
-        # Returns true iff any changes were committed to the repository
+    ) -> UpdateReport | None:
+        # Returns non-None iff any changes were committed to the repository
         if dandiset.embargo_status is EmbargoStatus.UNEMBARGOING:
             log.info("Dandiset %s is unembargoing; not syncing", dandiset.identifier)
-            return False
+            return None
         if ds is None:
             ds = await self.init_dataset(
                 self.config.dandiset_root / dandiset.identifier,
@@ -206,7 +220,7 @@ class DandiDatasetter(AsyncResource):
             )
             changed = False
         await self.ensure_github_remote(ds, dandiset.identifier)
-        await self.tag_releases(
+        tagged_releases = await self.tag_releases(
             dandiset, ds, push=self.config.gh_org is not None, log=dmanager.log
         )
         # Call `get_stats()` even if gh_org is None so that out-of-date stats
@@ -217,7 +231,12 @@ class DandiDatasetter(AsyncResource):
                 dmanager.log.info("Pushing to sibling")
                 await ds.push(to="github", jobs=self.config.jobs, data="nothing")
             await self.manager.set_dandiset_description(dandiset, stats, ds)
-        return changed
+        newstate = ds.get_assets_state()
+        assert newstate is not None
+        return UpdateReport(
+            last_modified=newstate.timestamp,
+            tagged_releases=tagged_releases,
+        )
 
     async def sync_dataset(
         self,
@@ -323,12 +342,14 @@ class DandiDatasetter(AsyncResource):
         ds: AsyncDataset,
         push: bool,
         log: PrefixedLogger,
-    ) -> None:
+    ) -> list[str] | None:
+        # Returns a sorted list of all tagged releases
         if not self.config.enable_tags:
-            return
+            return None
         log.info("Tagging releases for Dandiset")
         versions = [v async for v in dandiset.aget_versions(include_draft=False)]
         changed = False
+        tagged_releases = []
         for v in versions:
             if await ds.read_git("tag", "-l", v.identifier):
                 log.debug("Version %s already tagged", v.identifier)
@@ -336,6 +357,7 @@ class DandiDatasetter(AsyncResource):
                 log.info("Tagging version %s", v.identifier)
                 await self.mkrelease(dandiset.for_version(v), ds, push=push, log=log)
                 changed = True
+            tagged_releases.append(v.identifier)
         if versions:
             latest = max(map(attrgetter("identifier"), versions), key=PkgVersion)
             description = await ds.read_git("describe", "--tags", "--long", "--always")
@@ -361,6 +383,7 @@ class DandiDatasetter(AsyncResource):
                 )
             if push and (changed or merge):
                 await ds.push(to="github", jobs=self.config.jobs, data="nothing")
+        return sorted(tagged_releases)
 
     async def mkrelease(
         self,
