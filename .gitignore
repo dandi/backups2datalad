@@ -1,7 +1,7 @@
 .coverage*
+.idea
 .mypy_cache/
 .nox/
 .tox/
-__pycache__/
 dist/
 src/backups2datalad/_version.py
