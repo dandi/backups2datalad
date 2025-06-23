@@ -44,6 +44,8 @@ pytest test/test_core.py
 pytest test/test_core.py::test_1
 ```
 
+Before committing code, make sure that typing check passes.
+
 ### Linting and Type Checking
 
 ```bash
@@ -76,7 +78,7 @@ backups2datalad is structured around these key components:
 
 The system supports working with both public and embargoed Dandisets:
 
-1. **Embargoed Dandisets**: 
+1. **Embargoed Dandisets**:
    - Stored in git-annex with embargo status tracked in `.datalad/config`
    - When pushed to GitHub, they are created as private repositories
    - Special handling for authentication when accessing embargoed Dandisets
