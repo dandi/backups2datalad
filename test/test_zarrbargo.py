@@ -261,7 +261,7 @@ async def test_datasetter_zarr_embargo_propagation(tmp_path: Path) -> None:
             "test-digest",
             zarr_dspath,
             manager,
-            link=None,
+            _link=None,
             embargo_status=dandiset_embargo_status,
         )
 
