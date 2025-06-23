@@ -515,12 +515,15 @@ class DandiDatasetter(AsyncResource):
                 timestamp=None,
                 asset_paths=[asset.path],
             )
+            # Get embargo status from parent Dandiset
+            dandiset_embargo_status = await ds.get_embargo_status()
             await sync_zarr(
                 asset,
                 zarr_digest,
                 zarr_dspath,
                 self.manager.with_sublogger(f"Zarr {asset.zarr}"),
                 link=zl,
+                embargo_status=dandiset_embargo_status,
             )
             log.info("Zarr %s: Moving dataset", asset.zarr)
             shutil.move(str(zarr_dspath), str(ultimate_dspath))
@@ -570,6 +573,30 @@ class DandiDatasetter(AsyncResource):
                     path=[asset.path],
                     commit_date=ts,
                 )
+                # Add github-access-status for the Zarr submodule based on parent
+                # Dandiset's embargo status
+                if self.config.zarr_gh_org is not None:
+                    embargo = await ds.get_embargo_status()
+                    access_status = (
+                        "private" if embargo is EmbargoStatus.EMBARGOED else "public"
+                    )
+                    log.debug(
+                        "Setting github-access-status to %s for Zarr submodule %s",
+                        access_status,
+                        asset.path,
+                    )
+                    await ds.set_repo_config(
+                        f"submodule.{asset.path}.github-access-status",
+                        access_status,
+                        file=".gitmodules",
+                    )
+                    await ds.commit_if_changed(
+                        f"[backups2datalad] Update github-access-status for "
+                        f"Zarr {asset.zarr}",
+                        paths=[".gitmodules"],
+                        check_dirty=False,
+                        commit_date=ts,
+                    )
                 ds.assert_no_duplicates_in_gitmodules()
                 log.debug("Zarr %s: Changes saved", asset.zarr)
                 # now that we have as a subdataset and know that it is all good,

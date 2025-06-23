@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from dandi.consts import EmbargoStatus
 from ghrepo import GHRepo
@@ -72,6 +73,10 @@ class Syncer:
                         private=False,
                     )
 
+                    # Update GitHub access status for all Zarr repositories
+                    if self.config.zarr_gh_org is not None:
+                        await self.update_zarr_repos_privacy()
+
     async def sync_assets(self) -> None:
         self.log.info("Syncing assets...")
         report = await async_assets(
@@ -135,3 +140,69 @@ class Syncer:
         if not msgparts:
             msgparts.append("Only some metadata updates")
         return f"[backups2datalad] {', '.join(msgparts)}"
+
+    async def update_zarr_repos_privacy(self) -> None:
+        """
+        Update all Zarr GitHub repositories to public when the parent Dandiset
+        is unembargoed. Also updates the github-access-status in .gitmodules
+        for all Zarr submodules.
+        """
+        # Only proceed if we have GitHub org configured for both
+        # Dandisets and Zarrs
+        if not (self.config.gh_org and self.config.zarr_gh_org):
+            return
+
+        self.log.info("Updating privacy for Zarr repositories...")
+
+        # Get all submodules from the dataset
+        submodules = await self.ds.get_subdatasets()
+
+        # Track which submodules we've updated for .gitmodules
+        updated_submodules = {}
+
+        for submodule in submodules:
+            path = submodule["path"]
+            basename = Path(path).name
+
+            # Check if this is a Zarr submodule (typical zarr files end
+            # with .zarr or .ngff)
+            if basename.endswith((".zarr", ".ngff")):
+                submodule_path = submodule["gitmodule_path"]
+                zarr_id = Path(submodule["gitmodule_url"]).name
+
+                # Update the GitHub repository privacy to public
+                try:
+                    self.log.info("Making Zarr repository %s public", zarr_id)
+                    await self.manager.edit_github_repo(
+                        GHRepo(self.config.zarr_gh_org, zarr_id),
+                        private=False,
+                    )
+
+                    # Track for updating .gitmodules
+                    updated_submodules[submodule_path] = "public"
+                except Exception as e:
+                    self.log.error(
+                        "Failed to update Zarr repository %s privacy: %s",
+                        zarr_id,
+                        str(e),
+                    )
+
+        # Update github-access-status in .gitmodules for all Zarr submodules
+        if updated_submodules:
+            self.log.info(
+                "Updating github-access-status in .gitmodules for %d Zarr "
+                "submodules",
+                len(updated_submodules),
+            )
+
+            for path, status in updated_submodules.items():
+                await self.ds.set_repo_config(
+                    f"submodule.{path}.github-access-status", status, file=".gitmodules"
+                )
+
+            # Commit the changes to .gitmodules
+            await self.ds.commit_if_changed(
+                "[backups2datalad] Update github-access-status for Zarr " "submodules",
+                paths=[".gitmodules"],
+                check_dirty=False,
+            )
