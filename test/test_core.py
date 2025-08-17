@@ -228,14 +228,18 @@ async def test_2(
         }
 
     commits = superrepo.readcmd("rev-list", "HEAD").splitlines()
-    assert superrepo.get_commit_message(commits[0]) == (
+    assert (
+        superrepo.get_commit_message(commits[0])
+        == "[backups2datalad] Update .gitmodules"
+    )
+    assert superrepo.get_commit_message(commits[3]) == (
         f"1 updated ({dandiset_id})\n"
         "\n"
         f"{dandiset_id}:\n"
         " - [backups2datalad] 1 file deleted\n"
         " - [backups2datalad] 2 files added, 1 file updated"
     )
-    assert superrepo.get_commit_message(commits[-3]) == (
+    assert superrepo.get_commit_message(commits[9]) == (
         f"1 added ({dandiset_id})\n"
         "\n"
         f"{dandiset_id}:\n"
