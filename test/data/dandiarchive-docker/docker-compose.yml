@@ -17,12 +17,8 @@ services:
       DJANGO_SETTINGS_MODULE: dandiapi.settings.development
       DJANGO_DATABASE_URL: postgres://postgres:postgres@postgres:5432/django
       DJANGO_CELERY_BROKER_URL: amqp://rabbitmq:5672/
-      # The Minio URL needs to use 127.0.0.1 instead of localhost so that blob
-      # assets' "S3 URLs" will use 127.0.0.1, and thus tests that try to open
-      # these URLs via fsspec will not fail on systems where localhost is both
-      # 127.0.0.1 and ::1.
       DJANGO_MINIO_STORAGE_URL: http://minioAccessKey:minioSecretKey@minio:9000/dandi-dandisets
-      DJANGO_MINIO_STORAGE_MEDIA_URL: http://127.0.0.1:9000/dandi-dandisets
+      DJANGO_MINIO_STORAGE_MEDIA_URL: http://localhost:9000/dandi-dandisets
       # When in Docker, the bridge network sends requests from the host machine exclusively via a
       # dedicated IP address. Since there's no way to determine the real origin address,
       # consider any IP address (though actually this will only be the single dedicated address) to
