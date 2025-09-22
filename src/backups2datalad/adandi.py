@@ -398,12 +398,15 @@ class RemoteAsset(BaseModel, populate_by_name=True, arbitrary_types_allowed=True
         ``regex``.  Raises `NotFoundError` if the metadata does not contain a
         matching URL.
         """
-        for url in self.metadata.get("contentUrl", []):
+        contentUrl = self.metadata.get("contentUrl", [])
+        for url in contentUrl:
             assert isinstance(url, str)
             if re.search(regex, url):
                 return url
         raise NotFoundError(
-            "No matching URL found in asset's contentUrl metadata field"
+            f"No matching URL found in asset's contentUrl metadata field. "
+            f"Regex: {regex!r} "
+            f"ContentUrl={contentUrl!r} "
         )
 
     async def refetch(self) -> RemoteAsset:
