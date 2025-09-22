@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 from enum import Enum
 from functools import cached_property
 from pathlib import Path
@@ -24,23 +25,17 @@ class ResourceConfig(BaseModel):
     remote: Remote | None = None
 
 
-class Mode(str, Enum):
-    TIMESTAMP = "timestamp"
-    VERIFY = "verify"
-    FORCE = "force"
-
-    def __str__(self) -> str:
-        return self.value
+class Mode(Enum):
+    TIMESTAMP = enum.auto()
+    VERIFY = enum.auto()
+    FORCE = enum.auto()
 
 
-class ZarrMode(str, Enum):
-    TIMESTAMP = "timestamp"
-    CHECKSUM = "checksum"
-    FORCE = "force"
-    ASSET_CHECKSUM = "asset-checksum"
-
-    def __str__(self) -> str:
-        return self.value
+class ZarrMode(Enum):
+    TIMESTAMP = enum.auto()
+    CHECKSUM = enum.auto()
+    FORCE = enum.auto()
+    ASSET_CHECKSUM = enum.auto()
 
 
 class BackupConfig(BaseModel):

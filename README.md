@@ -164,7 +164,7 @@ Before running `backups2datalad`, the following setup must be performed:
         - `"checksum"` — only back up if the Zarr checksum is out of date or
           doesn't match the expected value
 
-        - `"asset-checksum"` — only back up if the Zarr asset's "modified"
+        - `"asset_checksum"` — only back up if the Zarr asset's "modified"
           timestamp is later than that in `assets.json` and the checksum is out
           of date or doesn't match the expected value
 
