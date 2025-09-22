@@ -158,7 +158,7 @@ def print_logfile(
 )
 @click.option(
     "--mode",
-    type=click.Choice(list(Mode)),
+    type=click.Choice(list(Mode), case_sensitive=False),
     default=None,
     help=(
         "How to decide whether to back up a Dandiset.  'timestamp' — only if"
@@ -176,7 +176,7 @@ def print_logfile(
 @click.option("-w", "--workers", type=int, help="Number of workers to run concurrently")
 @click.option(
     "--zarr-mode",
-    type=click.Choice(list(ZarrMode)),
+    type=click.Choice(list(ZarrMode), case_sensitive=False),
     default=None,
     help=(
         "How to decide whether to back up a Zarr.  'timestamp' — only if"
