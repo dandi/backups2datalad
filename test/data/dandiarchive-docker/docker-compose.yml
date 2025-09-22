@@ -39,6 +39,8 @@ services:
   celery:
     image: dandiarchive/dandiarchive-api
     command: [
+      "uv",
+      "run",
       "celery",
       "--app", "dandiapi.celery",
       "worker",
