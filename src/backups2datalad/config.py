@@ -25,13 +25,18 @@ class ResourceConfig(BaseModel):
     remote: Remote | None = None
 
 
-class Mode(Enum):
+class StrEnum(str, Enum):
+    def __str__(self) -> str:
+        return self.name.lower()
+
+
+class Mode(StrEnum):
     TIMESTAMP = enum.auto()
     VERIFY = enum.auto()
     FORCE = enum.auto()
 
 
-class ZarrMode(Enum):
+class ZarrMode(StrEnum):
     TIMESTAMP = enum.auto()
     CHECKSUM = enum.auto()
     FORCE = enum.auto()
