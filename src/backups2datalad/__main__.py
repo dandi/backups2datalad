@@ -158,7 +158,7 @@ def print_logfile(
 )
 @click.option(
     "--mode",
-    type=click.Choice(list(Mode)),
+    type=click.Choice(list(Mode), case_sensitive=False),
     default=None,
     help=(
         "How to decide whether to back up a Dandiset.  'timestamp' — only if"
@@ -176,13 +176,13 @@ def print_logfile(
 @click.option("-w", "--workers", type=int, help="Number of workers to run concurrently")
 @click.option(
     "--zarr-mode",
-    type=click.Choice(list(ZarrMode)),
+    type=click.Choice(list(ZarrMode), case_sensitive=False),
     default=None,
     help=(
         "How to decide whether to back up a Zarr.  'timestamp' — only if"
         " timestamp of last backup is older than some Zarr entry in S3;"
         " 'checksum' — only if Zarr checksum is out of date or doesn't match"
-        " expected value; 'asset-checksum' — only if Zarr asset's 'modified'"
+        " expected value; 'asset_checksum' — only if Zarr asset's 'modified'"
         " timestamp is later than that in assets.json and checksum is out of"
         " date or doesn't match expected value; 'force' — always.  [default:"
         " timestamp, unless different value set via config file]"

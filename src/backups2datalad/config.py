@@ -24,23 +24,22 @@ class ResourceConfig(BaseModel):
     remote: Remote | None = None
 
 
-class Mode(str, Enum):
+class StrEnum(str, Enum):
+    def __str__(self) -> str:
+        return self.name.lower()
+
+
+class Mode(StrEnum):
     TIMESTAMP = "timestamp"
     VERIFY = "verify"
     FORCE = "force"
 
-    def __str__(self) -> str:
-        return self.value
 
-
-class ZarrMode(str, Enum):
+class ZarrMode(StrEnum):
     TIMESTAMP = "timestamp"
     CHECKSUM = "checksum"
     FORCE = "force"
-    ASSET_CHECKSUM = "asset-checksum"
-
-    def __str__(self) -> str:
-        return self.value
+    ASSET_CHECKSUM = "asset_checksum"
 
 
 class BackupConfig(BaseModel):
