@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import enum
 from enum import Enum
 from functools import cached_property
 from pathlib import Path
@@ -31,16 +30,16 @@ class StrEnum(str, Enum):
 
 
 class Mode(StrEnum):
-    TIMESTAMP = enum.auto()
-    VERIFY = enum.auto()
-    FORCE = enum.auto()
+    TIMESTAMP = "timestamp"
+    VERIFY = "verify"
+    FORCE = "force"
 
 
 class ZarrMode(StrEnum):
-    TIMESTAMP = enum.auto()
-    CHECKSUM = enum.auto()
-    FORCE = enum.auto()
-    ASSET_CHECKSUM = enum.auto()
+    TIMESTAMP = "timestamp"
+    CHECKSUM = "checksum"
+    FORCE = "force"
+    ASSET_CHECKSUM = "asset_checksum"
 
 
 class BackupConfig(BaseModel):
