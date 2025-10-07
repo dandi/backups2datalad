@@ -213,6 +213,19 @@ async def update_dandiset_metadata(
     await ds.add(dandiset_metadata_file)
 
 
+def fromisoformat(date_string: str) -> datetime:
+    """
+    Parse an ISO 8601 date string, handling the 'Z' suffix for UTC.
+
+    Python 3.10's datetime.fromisoformat() doesn't support 'Z' suffix,
+    but Python 3.11+ does. This function provides compatibility.
+    """
+    # Replace 'Z' with '+00:00' for Python 3.10 compatibility
+    if date_string.endswith("Z"):
+        date_string = date_string[:-1] + "+00:00"
+    return datetime.fromisoformat(date_string)
+
+
 def quantify(qty: int, singular: str, plural: str | None = None) -> str:
     if qty == 1:
         return f"{qty} {singular}"
