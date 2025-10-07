@@ -33,7 +33,13 @@ from .consts import DEFAULT_BRANCH, GIT_OPTIONS
 from .logging import PrefixedLogger, log, quiet_filter
 from .manager import GitHub, Manager
 from .syncer import Syncer
-from .util import AssetTracker, assets_eq, quantify, update_dandiset_metadata
+from .util import (
+    AssetTracker,
+    assets_eq,
+    fromisoformat,
+    quantify,
+    update_dandiset_metadata,
+)
 from .zarr import ZarrLink, sync_zarr
 
 
@@ -396,7 +402,7 @@ class DandiDatasetter(AsyncResource):
             ).splitlines()
             for cmt in commits:
                 chash, _, cdate = cmt.partition(" ")
-                ts = datetime.fromisoformat(cdate)
+                ts = fromisoformat(cdate)
                 if ts <= dandiset.version.created:
                     candidates.append(chash)
                     break
@@ -527,7 +533,7 @@ class DandiDatasetter(AsyncResource):
             if ts is None:
                 # Zarr was already up to date; get timestamp from its latest
                 # commit
-                ts = datetime.fromisoformat(
+                ts = fromisoformat(
                     await zds.read_git("show", "-s", "--format=%aI", "HEAD")
                 )
             assert not (ds.pathobj / asset.path).exists()

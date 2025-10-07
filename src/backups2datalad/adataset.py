@@ -28,7 +28,7 @@ from .aioutil import areadcmd, aruncmd, stream_lines_command, stream_null_comman
 from .config import BackupConfig, Remote
 from .consts import DEFAULT_BRANCH, GIT_OPTIONS
 from .logging import log
-from .util import custom_commit_env, exp_wait, is_meta_file, key2hash
+from .util import custom_commit_env, exp_wait, fromisoformat, is_meta_file, key2hash
 
 EMBARGO_STATUS_KEY = "dandi.dandiset.embargo-status"
 
@@ -670,7 +670,7 @@ class AsyncDataset:
 
     async def get_last_commit_date(self) -> datetime:
         ts = await self.read_git("show", "-s", "--format=%aI")
-        return datetime.fromisoformat(ts)
+        return fromisoformat(ts)
 
     def assert_no_duplicates_in_gitmodules(self) -> None:
         filepath = self.pathobj / ".gitmodules"
