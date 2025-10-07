@@ -68,6 +68,12 @@ class Manager(AsyncResource):
         repo_info = await self.gh.get_repo(repo)
         current_private = repo_info.get("private", False)
         if current_private != expected_private:
+            log.warning(
+                "Found mismatched GitHub repo visibility for %s, "
+                "fixing up with private=%s",
+                repo,
+                expected_private,
+            )
             await self.edit_github_repo(repo, private=expected_private)
 
         await self._set_github_description(
