@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "backups2datalad"
-version = "0.0.0"
+dynamic = ["version"]
 description = "Mirror Dandisets as git-annex repositories"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -47,6 +47,12 @@ backups2datalad = "backups2datalad.__main__:main"
 
 [tool.hatch.envs.default]
 python = "3"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/backups2datalad/_version.py"
 
 [tool.mypy]
 allow_incomplete_defs = false
