@@ -5,7 +5,6 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from difflib import unified_diff
-from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -17,10 +16,9 @@ from typing import TYPE_CHECKING, Any
 
 from dandi.consts import dandiset_metadata_file
 from dandi.dandiset import Dandiset
-from dandi.utils import yaml_load
+from dandi.utils import yaml_dump, yaml_load
 from datalad.api import Dataset
 from datalad.support.json_py import dump
-from ruamel.yaml import YAML
 
 from .config import BackupConfig
 from .consts import MINIMUM_GIT_ANNEX_VERSION
@@ -286,14 +284,6 @@ def diff_metadata(old: Any, new: Any) -> str:
             tofile="new-metadata",
         )
     )
-
-
-def yaml_dump(data: Any) -> str:
-    yaml = YAML(typ="safe")
-    yaml.default_flow_style = False
-    out = StringIO()
-    yaml.dump(data, out)
-    return out.getvalue()
 
 
 class UnexpectedChangeError(Exception):
