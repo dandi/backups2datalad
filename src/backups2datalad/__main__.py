@@ -13,9 +13,12 @@ import sys
 from typing import Concatenate, ParamSpec
 
 import asyncclick as click
+import dandi
 from dandi.consts import DANDISET_ID_REGEX, EmbargoStatus
+import dandischema
 from datalad.api import Dataset
 
+from . import __version__
 from .adandi import AsyncDandiClient
 from .adataset import AsyncDataset
 from .aioutil import pool_amap, stream_lines_command
@@ -58,6 +61,7 @@ from .util import check_git_annex_version, format_errors, pdb_excepthook, quanti
     is_flag=True,
     help="Log backups2datalad at DEBUG and all other loggers at INFO",
 )
+@click.version_option(__version__, "-V", "--version", message="%(version)s")
 @click.pass_context
 async def main(
     ctx: click.Context,
@@ -101,6 +105,9 @@ async def main(
         level=getattr(logging, log_level),
     )
     await ctx.obj.debug_logfile(quiet_debug)
+    log.info("backups2datalad version: %s", __version__)
+    log.info("dandi version: %s", dandi.__version__)
+    log.info("dandischema version: %s", dandischema.__version__)
     log.info("COMMAND: %s", shlex.join(sys.argv))
 
 
