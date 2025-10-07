@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import InitVar, dataclass, field, replace
-from typing import Any
+from typing import Any, cast
 
 from anyio.abc import AsyncResource
+from dandi.consts import EmbargoStatus
 from ghrepo import GHRepo
 import httpx
 from humanize import naturalsize
@@ -60,8 +61,23 @@ class Manager(AsyncResource):
     ) -> None:
         assert self.config.gh_org is not None
         assert self.gh is not None
+        repo = GHRepo(self.config.gh_org, dandiset.identifier)
+
+        # Ensure GitHub repo visibility matches dandiset embargo status
+        expected_private = dandiset.embargo_status is not EmbargoStatus.OPEN
+        repo_info = await self.gh.get_repo(repo)
+        current_private = repo_info.get("private", False)
+        if current_private != expected_private:
+            log.warning(
+                "Found mismatched GitHub repo visibility for %s, "
+                "fixing up with private=%s",
+                repo,
+                expected_private,
+            )
+            await self.edit_github_repo(repo, private=expected_private)
+
         await self._set_github_description(
-            GHRepo(self.config.gh_org, dandiset.identifier),
+            repo,
             ds,
             description=await self.describe_dandiset(dandiset, stats),
             homepage=f"https://identifiers.org/DANDI:{dandiset.identifier}",
@@ -112,6 +128,16 @@ class GitHub(AsyncResource):
 
     async def aclose(self) -> None:
         await self.client.aclose()
+
+    async def get_repo(self, repo: GHRepo) -> dict[str, Any]:
+        log.debug("Getting repository info for %s", repo)
+        r = await arequest(self.client, "GET", repo.api_url)
+        data = r.json()
+        assert isinstance(data, dict), f"Expected dict, got {type(data)}"
+        assert all(
+            isinstance(k, str) for k in data.keys()
+        ), "Expected all keys to be strings"
+        return cast(dict[str, Any], data)
 
     async def edit_repo(self, repo: GHRepo, **kwargs: Any) -> None:
         log.debug("Editing repository %s", repo)
