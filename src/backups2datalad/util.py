@@ -5,7 +5,6 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from difflib import unified_diff
-from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -17,9 +16,9 @@ from typing import TYPE_CHECKING, Any
 
 from dandi.consts import dandiset_metadata_file
 from dandi.dandiset import Dandiset
+from dandi.utils import yaml_dump, yaml_load
 from datalad.api import Dataset
 from datalad.support.json_py import dump
-from ruamel.yaml import YAML
 
 from .config import BackupConfig
 from .consts import MINIMUM_GIT_ANNEX_VERSION
@@ -193,9 +192,24 @@ async def update_dandiset_metadata(
     dandiset: RemoteDandiset, ds: AsyncDataset, log: PrefixedLogger
 ) -> None:
     log.info("Updating metadata file")
-    (ds.pathobj / dandiset_metadata_file).unlink(missing_ok=True)
-    metadata = await dandiset.aget_raw_metadata()
-    Dandiset(ds.pathobj, allow_empty=True).update_metadata(metadata)
+    metadata_path = ds.pathobj / dandiset_metadata_file
+
+    # Get the new metadata from API
+    new_metadata = await dandiset.aget_raw_metadata()
+
+    # Check if metadata semantically changed
+    if metadata_path.exists():
+        with metadata_path.open() as f:
+            old_metadata = yaml_load(f, typ="safe")
+
+        # Compare the actual data dictionaries, not the formatting
+        if old_metadata == new_metadata:
+            log.debug("Metadata unchanged; skipping update of %r", str(metadata_path))
+            return
+
+    # Only update if metadata differs or file doesn't exist
+    metadata_path.unlink(missing_ok=True)
+    Dandiset(ds.pathobj, allow_empty=True).update_metadata(new_metadata)
     await ds.add(dandiset_metadata_file)
 
 
@@ -270,14 +284,6 @@ def diff_metadata(old: Any, new: Any) -> str:
             tofile="new-metadata",
         )
     )
-
-
-def yaml_dump(data: Any) -> str:
-    yaml = YAML(typ="safe")
-    yaml.default_flow_style = False
-    out = StringIO()
-    yaml.dump(data, out)
-    return out.getvalue()
 
 
 class UnexpectedChangeError(Exception):
