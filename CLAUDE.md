@@ -92,6 +92,53 @@ The system supports working with both public and embargoed Dandisets:
    - The embargo status of a Dandiset is tracked and synchronized between the remote server and local backup
    - GitHub repository access status (private/public) is stored in the superdataset's `.gitmodules` file
 
+### Zarr Embargo Handling ("Zarrbargo")
+
+Zarr files within embargoed Dandisets receive special handling to maintain privacy:
+
+1. **Embargo Propagation**:
+   - When a Zarr file is backed up from an embargoed Dandiset, the parent Dandiset's embargo status is propagated to the Zarr repository
+   - Implementation: `DandiDatasetter.backup_zarr()` in `datasetter.py` fetches parent embargo status and passes it to `sync_zarr()`
+   - The Zarr dataset's embargo status is set in `.datalad/config` via `AsyncDataset.set_embargo_status()`
+
+2. **GitHub Privacy Settings**:
+   - If `zarr_gh_org` is configured, Zarr repositories are created on GitHub with privacy matching their embargo status
+   - Embargoed Zarrs → private GitHub repositories
+   - Public Zarrs → public GitHub repositories
+   - Implementation: `sync_zarr()` in `zarr.py` creates GitHub siblings with appropriate privacy
+
+3. **Metadata in `.gitmodules`**:
+   - The superdataset's `.gitmodules` file tracks the privacy status of each Zarr submodule
+   - Custom attribute: `submodule.<path>.github-access-status` set to either "private" or "public"
+   - This metadata is set when the Zarr is added as a submodule in `DandiDatasetter.backup_zarr()`
+   - Purpose: Provides a declarative record of expected GitHub repository privacy state
+
+4. **Unembargo Transition**:
+   - When a Dandiset transitions from embargoed to open, all associated Zarr repositories are updated
+   - Implementation: `Syncer.update_embargo_status()` in `syncer.py` triggers `update_zarr_repos_privacy()` after making the main Dandiset public
+   - Process:
+     1. Identifies Zarr submodules by scanning `.gitmodules` for paths ending in `.zarr` or `.ngff`
+     2. Updates each Zarr's GitHub repository to public via GitHub API
+     3. Updates `.gitmodules` to set `github-access-status=public` for all Zarr submodules
+     4. Commits the `.gitmodules` changes
+   - Error handling: Individual GitHub API failures are logged but don't block other Zarrs from being updated
+
+5. **Identification of Zarr Submodules**:
+   - Current approach: Path-based detection using file extensions (`.zarr`, `.ngff`)
+   - Implementation: `Syncer.update_zarr_repos_privacy()` in `syncer.py`
+   - Limitation: May not catch Zarr files with non-standard naming conventions
+
+6. **Configuration Requirements**:
+   - Both `gh_org` (for Dandisets) and `zarr_gh_org` (for Zarrs) must be configured for privacy updates to occur
+   - If either is missing, Zarr privacy updates are skipped gracefully
+
+### Key Implementation Components
+
+- `DandiDatasetter.backup_zarr()` in `datasetter.py` - Embargo status propagation to Zarr sync and setting `github-access-status` in `.gitmodules`
+- `Syncer.update_embargo_status()` in `syncer.py` - Triggering Zarr updates during unembargo
+- `Syncer.update_zarr_repos_privacy()` in `syncer.py` - Batch updating Zarr repository privacy
+- `sync_zarr()` in `zarr.py` - Creating Zarr repos with embargo-aware privacy
+
 ## Main Workflow
 
 1. Configuration is loaded from a YAML file
