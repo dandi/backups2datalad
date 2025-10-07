@@ -101,7 +101,7 @@ def docker_archive() -> Iterator[Archive]:
     create = (
         persist is None
         or subprocess.run(
-            ["docker", "inspect", f"{LOCAL_DOCKER_ENV}_django_1"],
+            ["docker", "inspect", f"{LOCAL_DOCKER_ENV}-django-1"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         ).returncode
