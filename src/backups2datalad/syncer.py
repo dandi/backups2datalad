@@ -146,6 +146,9 @@ class Syncer:
         Update all Zarr GitHub repositories to public when the parent Dandiset
         is unembargoed. Also updates the github-access-status in .gitmodules
         for all Zarr submodules.
+
+        Raises an exception if any Zarr repository fails to update, ensuring
+        problems are noticed and addressed rather than silently ignored.
         """
         # Only proceed if we have GitHub org configured for both
         # Dandisets and Zarrs
@@ -157,9 +160,8 @@ class Syncer:
         # Get all submodules from the dataset
         submodules = await self.ds.get_subdatasets()
 
-        # Track which submodules we've updated for .gitmodules
-        updated_submodules = {}
-
+        # Track Zarr submodules to update
+        zarr_submodules = []
         for submodule in submodules:
             path = submodule["path"]
             basename = Path(path).name
@@ -167,42 +169,42 @@ class Syncer:
             # Check if this is a Zarr submodule (typical zarr files end
             # with .zarr or .ngff)
             if basename.endswith((".zarr", ".ngff")):
-                submodule_path = submodule["gitmodule_path"]
-                zarr_id = Path(submodule["gitmodule_url"]).name
+                zarr_submodules.append(submodule)
 
-                # Update the GitHub repository privacy to public
-                try:
-                    self.log.info("Making Zarr repository %s public", zarr_id)
-                    await self.manager.edit_github_repo(
-                        GHRepo(self.config.zarr_gh_org, zarr_id),
-                        private=False,
-                    )
+        if not zarr_submodules:
+            self.log.info("No Zarr repositories found to update")
+            return
 
-                    # Track for updating .gitmodules
-                    updated_submodules[submodule_path] = "public"
-                except Exception as e:
-                    self.log.error(
-                        "Failed to update Zarr repository %s privacy: %s",
-                        zarr_id,
-                        str(e),
-                    )
+        # Update all Zarr repositories - fail fast if any update fails
+        updated_submodules = {}
+        for submodule in zarr_submodules:
+            submodule_path = submodule["gitmodule_path"]
+            zarr_id = Path(submodule["gitmodule_url"]).name
+
+            self.log.info("Making Zarr repository %s public", zarr_id)
+            # Let exceptions propagate - we want to know if this fails
+            await self.manager.edit_github_repo(
+                GHRepo(self.config.zarr_gh_org, zarr_id),
+                private=False,
+            )
+
+            # Track for updating .gitmodules
+            updated_submodules[submodule_path] = "public"
 
         # Update github-access-status in .gitmodules for all Zarr submodules
-        if updated_submodules:
-            self.log.info(
-                "Updating github-access-status in .gitmodules for %d Zarr "
-                "submodules",
-                len(updated_submodules),
+        self.log.info(
+            "Updating github-access-status in .gitmodules for %d Zarr " "submodules",
+            len(updated_submodules),
+        )
+
+        for path, status in updated_submodules.items():
+            await self.ds.set_repo_config(
+                f"submodule.{path}.github-access-status", status, file=".gitmodules"
             )
 
-            for path, status in updated_submodules.items():
-                await self.ds.set_repo_config(
-                    f"submodule.{path}.github-access-status", status, file=".gitmodules"
-                )
-
-            # Commit the changes to .gitmodules
-            await self.ds.commit_if_changed(
-                "[backups2datalad] Update github-access-status for Zarr " "submodules",
-                paths=[".gitmodules"],
-                check_dirty=False,
-            )
+        # Commit the changes to .gitmodules
+        await self.ds.commit_if_changed(
+            "[backups2datalad] Update github-access-status for Zarr " "submodules",
+            paths=[".gitmodules"],
+            check_dirty=False,
+        )

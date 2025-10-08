@@ -675,3 +675,73 @@ async def test_embargo_to_unembargo_transition_e2e(
 
     # Verify Zarr content is still intact
     await embargoed_dandiset.check_all_zarrs(dandiset_ds, zarr_root)
+
+
+async def test_zarr_unembargo_with_github_failure() -> None:
+    """
+    Unit test: Test that GitHub API failures during Zarr unembargo cause operation to fail.
+    This ensures problems are noticed and addressed rather than silently ignored.
+    """
+    # Create mock dataset with multiple Zarr submodules
+    ds = AsyncMock()
+    ds.get_subdatasets = AsyncMock(
+        return_value=[
+            {
+                "path": "/path/zarr1.zarr",
+                "gitmodule_path": "zarr1.zarr",
+                "gitmodule_url": "https://github.com/test-zarr-org/uuid1",
+            },
+            {
+                "path": "/path/zarr2.zarr",
+                "gitmodule_path": "zarr2.zarr",
+                "gitmodule_url": "https://github.com/test-zarr-org/uuid2",
+            },
+            {
+                "path": "/path/zarr3.ngff",
+                "gitmodule_path": "zarr3.ngff",
+                "gitmodule_url": "https://github.com/test-zarr-org/uuid3",
+            },
+        ]
+    )
+    ds.set_repo_config = AsyncMock()
+    ds.commit_if_changed = AsyncMock()
+
+    # Create manager that fails for one repo
+    manager = MagicMock()
+    manager.config = BackupConfig(
+        dandisets=ResourceConfig(path="ds", github_org="test-org"),
+        zarrs=ResourceConfig(path="zarr", github_org="test-zarr-org"),
+    )
+    manager.log = MagicMock()
+
+    edit_calls = []
+
+    async def mock_edit_github_repo(repo: Any, **kwargs: Any) -> None:
+        edit_calls.append((repo.name, kwargs))
+        # Fail for uuid2
+        if repo.name == "uuid2":
+            raise Exception("GitHub API error for uuid2")
+
+    manager.edit_github_repo = mock_edit_github_repo
+
+    # Create syncer
+    syncer = Syncer(
+        manager=manager,
+        dandiset=MagicMock(identifier="000001"),
+        ds=ds,
+        tracker=MagicMock(),
+        error_on_change=False,
+    )
+
+    # Run the update - should raise exception on first failure
+    with pytest.raises(Exception, match="GitHub API error for uuid2"):
+        await syncer.update_zarr_repos_privacy()
+
+    # Verify only repos before the failure were attempted (uuid1 succeeded, uuid2 failed)
+    assert len(edit_calls) == 2
+    assert edit_calls[0][0] == "uuid1"
+    assert edit_calls[1][0] == "uuid2"
+
+    # Verify .gitmodules was NOT updated because the operation failed
+    ds.set_repo_config.assert_not_called()
+    ds.commit_if_changed.assert_not_called()
