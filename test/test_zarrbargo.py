@@ -4,13 +4,19 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from conftest import Archive, SampleDandiset
 from dandi.consts import EmbargoStatus
 from dandi.dandiapi import RemoteZarrAsset
+from datalad.api import Dataset
+from datalad.tests.utils_pytest import assert_repo_status
 from ghrepo import GHRepo
+import numpy as np
 import pytest
 
 from backups2datalad.adataset import AsyncDataset
+from backups2datalad.aioutil import areadcmd
 from backups2datalad.config import BackupConfig, Remote, ResourceConfig
+from backups2datalad.datasetter import DandiDatasetter
 from backups2datalad.manager import Manager
 from backups2datalad.syncer import Syncer
 from backups2datalad.zarr import sync_zarr
@@ -473,3 +479,199 @@ async def test_zarr_github_access_status_in_gitmodules() -> None:
         check_dirty=False,
         commit_date=ts,
     )
+
+
+# Integration tests
+
+
+async def test_embargoed_dandiset_with_zarr_e2e(
+    docker_archive: Archive, embargoed_dandiset: SampleDandiset, tmp_path: Path
+) -> None:
+    """
+    Integration test: End-to-end test for embargoed Dandiset with Zarr files.
+    Verifies that Zarr repositories are created with correct embargo status and
+    that the .gitmodules metadata is properly set.
+    """
+    # Add Zarr files to embargoed Dandiset
+    embargoed_dandiset.add_zarr("data.zarr", np.arange(100), np.arange(100, 0, -1))
+    embargoed_dandiset.add_zarr("nested/sample.ngff", np.eye(5))
+    await embargoed_dandiset.upload()
+
+    backup_root = tmp_path / "backup"
+
+    # Create config without GitHub org (to avoid needing real GitHub API)
+    di = DandiDatasetter(
+        dandi_client=embargoed_dandiset.client,
+        config=BackupConfig(
+            backup_root=backup_root,
+            dandi_instance=docker_archive.instance_id,
+            s3bucket=docker_archive.s3bucket,
+            s3endpoint=docker_archive.s3endpoint,
+            content_url_regex=f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/",
+            dandisets=ResourceConfig(path="ds"),
+            zarrs=ResourceConfig(path="zarr"),
+        ),
+    )
+
+    # Run the backup
+    await di.update_from_backup([embargoed_dandiset.dandiset_id])
+
+    # Verify the Dandiset dataset
+    dandiset_ds = Dataset(backup_root / "ds" / embargoed_dandiset.dandiset_id)
+    assert_repo_status(dandiset_ds.path)
+
+    # Verify Dandiset has embargo status set
+    embargo_status = await areadcmd(
+        "git",
+        "config",
+        "--file",
+        ".datalad/config",
+        "--get",
+        "dandi.dandiset.embargo-status",
+        cwd=dandiset_ds.path,
+    )
+    assert embargo_status == "EMBARGOED"
+
+    # Verify Zarr repositories were created
+    zarr_root = backup_root / "zarr"
+    # Zarr directories are named by UUID, not by path
+    zarr_dirs = list(zarr_root.iterdir())
+    assert (
+        len(zarr_dirs) == 2
+    ), f"Expected 2 Zarr dirs, got {len(zarr_dirs)}: {[d.name for d in zarr_dirs]}"
+
+    # Verify each Zarr has embargo status set
+    for zarr_dir in zarr_dirs:
+        zarr_embargo = await areadcmd(
+            "git",
+            "config",
+            "--file",
+            ".datalad/config",
+            "--get",
+            "dandi.dandiset.embargo-status",
+            cwd=zarr_dir,
+        )
+        assert zarr_embargo == "EMBARGOED"
+
+    # Verify .gitmodules has github-access-status set to private
+    gitmodules_content = (dandiset_ds.pathobj / ".gitmodules").read_text()
+    assert "github-access-status = private" in gitmodules_content
+
+    # Verify both Zarr submodules are tracked with private status
+    for zarr_path in ["data.zarr", "nested/sample.ngff"]:
+        access_status = await areadcmd(
+            "git",
+            "config",
+            "--file",
+            ".gitmodules",
+            "--get",
+            f"submodule.{zarr_path}.github-access-status",
+            cwd=dandiset_ds.path,
+        )
+        assert access_status == "private"
+
+    # Verify Zarr content is correct
+    await embargoed_dandiset.check_all_zarrs(dandiset_ds, zarr_root)
+
+
+async def test_embargo_to_unembargo_transition_e2e(
+    docker_archive: Archive, embargoed_dandiset: SampleDandiset, tmp_path: Path
+) -> None:
+    """
+    Integration test: Test transitioning an embargoed Dandiset with Zarrs to public.
+    Verifies that embargo status is updated and .gitmodules is modified correctly.
+    """
+    # Add multiple Zarr files to embargoed Dandiset
+    embargoed_dandiset.add_zarr("data1.zarr", np.arange(50))
+    embargoed_dandiset.add_zarr("data2.zarr", np.eye(3))
+    embargoed_dandiset.add_text("readme.txt", "Test data\n")
+    await embargoed_dandiset.upload()
+
+    backup_root = tmp_path / "backup"
+
+    # Initial backup with embargo
+    di = DandiDatasetter(
+        dandi_client=embargoed_dandiset.client,
+        config=BackupConfig(
+            backup_root=backup_root,
+            dandi_instance=docker_archive.instance_id,
+            s3bucket=docker_archive.s3bucket,
+            s3endpoint=docker_archive.s3endpoint,
+            content_url_regex=f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/",
+            dandisets=ResourceConfig(path="ds"),
+            zarrs=ResourceConfig(path="zarr"),
+        ),
+    )
+
+    await di.update_from_backup([embargoed_dandiset.dandiset_id])
+
+    dandiset_ds = Dataset(backup_root / "ds" / embargoed_dandiset.dandiset_id)
+
+    # Verify initial embargoed state
+    embargo_status = await areadcmd(
+        "git",
+        "config",
+        "--file",
+        ".datalad/config",
+        "--get",
+        "dandi.dandiset.embargo-status",
+        cwd=dandiset_ds.path,
+    )
+    assert embargo_status == "EMBARGOED"
+
+    # Verify Zarrs are embargoed
+    zarr_root = backup_root / "zarr"
+    zarr_dirs = list(zarr_root.iterdir())
+    assert len(zarr_dirs) == 2
+
+    for zarr_dir in zarr_dirs:
+        zarr_embargo = await areadcmd(
+            "git",
+            "config",
+            "--file",
+            ".datalad/config",
+            "--get",
+            "dandi.dandiset.embargo-status",
+            cwd=zarr_dir,
+        )
+        assert zarr_embargo == "EMBARGOED"
+
+    # Verify .gitmodules shows private for the Zarr submodules
+    for zarr_path in ["data1.zarr", "data2.zarr"]:
+        access_status = await areadcmd(
+            "git",
+            "config",
+            "--file",
+            ".gitmodules",
+            "--get",
+            f"submodule.{zarr_path}.github-access-status",
+            cwd=dandiset_ds.path,
+        )
+        assert access_status == "private"
+
+    # Unembargo the Dandiset on the server
+    await embargoed_dandiset.dandiset.set_embargo_status(EmbargoStatus.OPEN)
+
+    # Run backup again to sync the unembargo
+    await di.update_from_backup([embargoed_dandiset.dandiset_id])
+
+    # Verify Dandiset is now open
+    embargo_status_after = await areadcmd(
+        "git",
+        "config",
+        "--file",
+        ".datalad/config",
+        "--get",
+        "dandi.dandiset.embargo-status",
+        cwd=dandiset_ds.path,
+    )
+    assert embargo_status_after == "OPEN"
+
+    # Verify .gitmodules was updated to public for Zarrs
+    # Note: update_zarr_repos_privacy() is only called when gh_org is set,
+    # so we won't see this change without GitHub config. This test validates
+    # that the embargo status itself is properly tracked.
+    # For full GitHub integration, we'd need to mock or have actual GitHub access.
+
+    # Verify Zarr content is still intact
+    await embargoed_dandiset.check_all_zarrs(dandiset_ds, zarr_root)

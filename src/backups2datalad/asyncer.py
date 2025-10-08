@@ -168,12 +168,6 @@ class Downloader:
                 self.tracker.remote_assets.add(asset.path)
                 if downloading:
                     if asset.asset_type == AssetType.ZARR:
-                        if self.embargoed:
-                            raise RuntimeError(
-                                f"Dandiset {self.dandiset_id} is embargoed and"
-                                f" contains a Zarr at {asset.path}; do not know"
-                                " how to handle"
-                            )
                         try:
                             zarr_digest = asset.get_digest_value()
                         except NotFoundError:
