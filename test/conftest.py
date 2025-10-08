@@ -422,7 +422,7 @@ async def new_dandiset(
         },
     )
     dandiset_id = d.identifier
-    dspath = tmp_path_factory.mktemp("new_dandiset")
+    dspath = tmp_path_factory.mktemp(f"new_dandiset_{dandiset_id}")
     (dspath / dandiset_metadata_file).write_text(f"identifier: '{dandiset_id}'\n")
     ds = SampleDandiset(
         client=dandi_client,
@@ -455,7 +455,7 @@ async def embargoed_dandiset(
         embargo=True,
     )
     dandiset_id = d.identifier
-    dspath = tmp_path_factory.mktemp("embargoed_dandiset")
+    dspath = tmp_path_factory.mktemp(f"embargoed_dandiset_{dandiset_id}")
     (dspath / dandiset_metadata_file).write_text(f"identifier: '{dandiset_id}'\n")
     ds = SampleDandiset(
         client=dandi_client,
