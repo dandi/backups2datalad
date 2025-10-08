@@ -106,6 +106,7 @@ class Report:
 class Downloader:
     dandiset_id: str
     embargoed: bool
+    embargo_status: EmbargoStatus
     ds: AsyncDataset
     manager: Manager
     tracker: AssetTracker
@@ -348,7 +349,12 @@ class Downloader:
                 asset_paths=[asset.path],
             )
             self.nursery.start_soon(
-                partial(sync_zarr, link=zl, error_on_change=self.error_on_change),
+                partial(
+                    sync_zarr,
+                    link=zl,
+                    error_on_change=self.error_on_change,
+                    embargo_status=self.embargo_status,
+                ),
                 asset,
                 zarr_digest,
                 zarr_dspath,
@@ -505,6 +511,7 @@ async def async_assets(
                     dm = Downloader(
                         dandiset_id=dandiset.identifier,
                         embargoed=dandiset.embargo_status is EmbargoStatus.EMBARGOED,
+                        embargo_status=dandiset.embargo_status,
                         ds=ds,
                         manager=manager,
                         tracker=tracker,
