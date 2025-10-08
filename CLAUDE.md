@@ -15,7 +15,9 @@ The tool handles both public and embargoed Dandisets. Embargoed Dandisets are mi
 - Python 3.10+
 - git-annex version 10.20240430 or newer
 - DANDI API token (set as environment variable `DANDI_API_KEY`)
-- For pushing to GitHub, a GitHub access token stored in the `hub.oauthtoken` key in `~/.gitconfig`
+- For pushing to GitHub, a GitHub access token via one of:
+  - `GITHUB_TOKEN` environment variable (preferred)
+  - `hub.oauthtoken` key in `~/.gitconfig` (fallback)
 
 ### Installation
 
@@ -181,3 +183,4 @@ This allows filtering or identifying AI-generated tests separately if needed.
 ## Important Environment Variables
 
 - `DANDI_API_KEY`: Required API token for the DANDI instance being mirrored
+- `GITHUB_TOKEN`: Optional GitHub access token for pushing to GitHub (preferred over git config)

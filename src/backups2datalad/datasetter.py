@@ -54,13 +54,23 @@ class DandiDatasetter(AsyncResource):
         if self.config.gh_org is not None:
             # Prefer GITHUB_TOKEN environment variable, fall back to git config
             token = os.environ.get("GITHUB_TOKEN")
-            if not token:
+            # Note: log.'s below are not in effect ATM since this happens too early
+            #       in the process and no log backends are set yet
+            if token:
+                log.info("Loaded GitHub token from env var")
+            else:
                 token = subprocess.run(
                     ["git", "config", "hub.oauthtoken"],
                     check=True,
                     stdout=subprocess.PIPE,
                     text=True,
                 ).stdout.strip()
+                if token:
+                    log.info("Loaded GitHub token from git config")
+            if not token:
+                log.warning(
+                    "No GitHub token was loaded, operations most likely to fail"
+                )
             gh = GitHub(token)
         else:
             gh = None
