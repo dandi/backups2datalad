@@ -561,7 +561,7 @@ class AsyncDataset:
     ) -> bool:
         # Returns True iff sibling was created
         if not await self.has_github_remote():
-            log.info("Creating GitHub sibling for %s", name)
+            log.info("Creating GitHub sibling for %s under %s", name, owner)
             private = await self.get_embargo_status() is EmbargoStatus.EMBARGOED
             await anyio.to_thread.run_sync(
                 partial(

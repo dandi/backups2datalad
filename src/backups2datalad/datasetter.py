@@ -52,12 +52,15 @@ class DandiDatasetter(AsyncResource):
 
     def __post_init__(self) -> None:
         if self.config.gh_org is not None:
-            token = subprocess.run(
-                ["git", "config", "hub.oauthtoken"],
-                check=True,
-                stdout=subprocess.PIPE,
-                text=True,
-            ).stdout.strip()
+            # Prefer GITHUB_TOKEN environment variable, fall back to git config
+            token = os.environ.get("GITHUB_TOKEN")
+            if not token:
+                token = subprocess.run(
+                    ["git", "config", "hub.oauthtoken"],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    text=True,
+                ).stdout.strip()
             gh = GitHub(token)
         else:
             gh = None
