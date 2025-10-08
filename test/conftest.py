@@ -404,7 +404,7 @@ class SampleDandiset:
 @pytest.fixture()
 async def new_dandiset(
     dandi_client: AsyncDandiClient, tmp_path_factory: pytest.TempPathFactory
-) -> SampleDandiset:
+) -> AsyncIterator[SampleDandiset]:
     d = await dandi_client.create_dandiset(
         "Dandiset for testing backups2datalad",
         {
@@ -430,13 +430,20 @@ async def new_dandiset(
         dandiset=d,
         dandiset_id=d.identifier,
     )
-    return ds
+    yield ds
+    # Cleanup: delete the dandiset from the server after the test
+    try:
+        await dandi_client.delete(f"/dandisets/{dandiset_id}/")
+    except Exception:
+        # If deletion fails (e.g., dandiset doesn't exist or already deleted),
+        # we can ignore it as the test has completed
+        pass
 
 
 @pytest.fixture()
 async def embargoed_dandiset(
     dandi_client: AsyncDandiClient, tmp_path_factory: pytest.TempPathFactory
-) -> SampleDandiset:
+) -> AsyncIterator[SampleDandiset]:
     d = await dandi_client.create_dandiset(
         "Embargoed Dandiset for testing backups2datalad",
         {
@@ -463,7 +470,14 @@ async def embargoed_dandiset(
         dandiset=d,
         dandiset_id=d.identifier,
     )
-    return ds
+    yield ds
+    # Cleanup: delete the dandiset from the server after the test
+    try:
+        await dandi_client.delete(f"/dandisets/{dandiset_id}/")
+    except Exception:
+        # If deletion fails (e.g., dandiset doesn't exist or already deleted),
+        # we can ignore it as the test has completed
+        pass
 
 
 @dataclass
@@ -476,7 +490,7 @@ class PopulateManifest:
 
 
 @pytest.fixture()
-async def text_dandiset(new_dandiset: SampleDandiset) -> SampleDandiset:
+async def text_dandiset(new_dandiset: SampleDandiset) -> AsyncIterator[SampleDandiset]:
     for path, contents in [
         ("file.txt", "This is test text.\n"),
         ("v0.txt", "Version 0\n"),
@@ -486,4 +500,5 @@ async def text_dandiset(new_dandiset: SampleDandiset) -> SampleDandiset:
     ]:
         new_dandiset.add_text(path, contents)
     await new_dandiset.upload()
-    return new_dandiset
+    yield new_dandiset
+    # Cleanup is handled by the new_dandiset fixture
