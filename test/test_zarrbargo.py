@@ -484,6 +484,7 @@ async def test_zarr_github_access_status_in_gitmodules() -> None:
 # Integration tests
 
 
+@pytest.mark.ai_generated
 async def test_embargoed_dandiset_with_zarr_e2e(
     docker_archive: Archive, embargoed_dandiset: SampleDandiset, tmp_path: Path
 ) -> None:
@@ -574,6 +575,7 @@ async def test_embargoed_dandiset_with_zarr_e2e(
     await embargoed_dandiset.check_all_zarrs(dandiset_ds, zarr_root)
 
 
+@pytest.mark.ai_generated
 async def test_embargo_to_unembargo_transition_e2e(
     docker_archive: Archive, embargoed_dandiset: SampleDandiset, tmp_path: Path
 ) -> None:
@@ -677,6 +679,7 @@ async def test_embargo_to_unembargo_transition_e2e(
     await embargoed_dandiset.check_all_zarrs(dandiset_ds, zarr_root)
 
 
+@pytest.mark.ai_generated
 async def test_zarr_unembargo_with_github_failure() -> None:
     """
     Unit test: Test that GitHub API failures during Zarr unembargo cause operation to fail.
