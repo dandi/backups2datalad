@@ -306,7 +306,7 @@ async def test_syncer_skip_zarr_update_without_github_org() -> None:
 
 
 async def test_update_zarr_repos_privacy_handles_errors() -> None:
-    """Test that update_zarr_repos_privacy handles errors gracefully."""
+    """Test that update_zarr_repos_privacy fails fast on errors."""
     ds = AsyncMock()
     ds.get_subdatasets = AsyncMock(
         return_value=[
@@ -337,11 +337,9 @@ async def test_update_zarr_repos_privacy_handles_errors() -> None:
         error_on_change=False,
     )
 
-    # This should not raise an exception
-    await syncer.update_zarr_repos_privacy()
-
-    # Verify the error was logged
-    manager.log.error.assert_called_once()
+    # This should raise an exception (fail-fast behavior)
+    with pytest.raises(Exception, match="GitHub API error"):
+        await syncer.update_zarr_repos_privacy()
 
     # Verify .gitmodules was not updated due to the error
     ds.set_repo_config.assert_not_called()
