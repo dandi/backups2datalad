@@ -46,41 +46,44 @@ from .zarr import ZarrLink, sync_zarr
 @dataclass
 class DandiDatasetter(AsyncResource):
     dandi_client: AsyncDandiClient
-    manager: Manager = field(init=False)
     config: BackupConfig
     logfile: Path | None = None
+    _manager: Manager | None = field(init=False, default=None)
 
-    def __post_init__(self) -> None:
-        if self.config.gh_org is not None:
-            # Prefer GITHUB_TOKEN environment variable, fall back to git config
-            token = os.environ.get("GITHUB_TOKEN")
-            # Note: log.'s below are not in effect ATM since this happens too early
-            #       in the process and no log backends are set yet
-            if token:
-                log.info("Loaded GitHub token from env var")
-            else:
-                token = subprocess.run(
-                    ["git", "config", "hub.oauthtoken"],
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    text=True,
-                ).stdout.strip()
+    @property
+    def manager(self) -> Manager:
+        """Lazy initialization of Manager with GitHub token."""
+        if self._manager is None:
+            if self.config.gh_org is not None:
+                # Prefer GITHUB_TOKEN environment variable, fall back to git config
+                token = os.environ.get("GITHUB_TOKEN")
                 if token:
-                    log.info("Loaded GitHub token from git config")
-            if not token:
-                log.warning(
-                    "No GitHub token was loaded, operations most likely to fail"
-                )
-            gh = GitHub(token)
-        else:
-            gh = None
-        self.manager = Manager(
-            config=self.config, gh=gh, log=log, token=self.dandi_client.token
-        )
+                    log.info("Loaded GitHub token from GITHUB_TOKEN env var")
+                else:
+                    token = subprocess.run(
+                        ["git", "config", "hub.oauthtoken"],
+                        check=True,
+                        stdout=subprocess.PIPE,
+                        text=True,
+                    ).stdout.strip()
+                    if token:
+                        log.info("Loaded GitHub token from git config hub.oauthtoken")
+                if not token:
+                    log.warning(
+                        "No GitHub token was loaded, GitHub operations will likely fail"
+                    )
+                gh = GitHub(token)
+            else:
+                gh = None
+            self._manager = Manager(
+                config=self.config, gh=gh, log=log, token=self.dandi_client.token
+            )
+        return self._manager
 
     async def aclose(self) -> None:
         await self.dandi_client.aclose()
-        await self.manager.aclose()
+        if self._manager is not None:
+            await self._manager.aclose()
 
     async def ensure_superdataset(self) -> AsyncDataset:
         superds = AsyncDataset(self.config.dandiset_root)
