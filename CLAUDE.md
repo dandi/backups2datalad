@@ -180,6 +180,32 @@ async def test_my_new_feature() -> None:
 
 This allows filtering or identifying AI-generated tests separately if needed.
 
+## Force-Push Feature
+
+When repositories need to be rebuilt from scratch (e.g., after history rewrites), the `--force-push` option allows overwriting remote Git history on GitHub:
+
+```bash
+# Force-push Dandisets only
+backups2datalad update-from-backup --force-push dandisets 000874
+
+# Force-push Zarrs only
+backups2datalad update-from-backup --force-push zarrs 000874
+
+# Force-push both Dandisets and Zarrs
+backups2datalad update-from-backup --force-push all 000874
+
+# Can specify multiple times
+backups2datalad update-from-backup --force-push dandisets --force-push zarrs
+```
+
+**Warning**: Force-pushing overwrites remote Git history! Use with caution.
+
+Implementation:
+- `AsyncDataset.push()` accepts `force` parameter in `adataset.py:362`
+- `BackupConfig.force_push` stores which repositories to force-push
+- Helper methods `should_force_push_dandisets()` and `should_force_push_zarrs()` in `config.py`
+- Push call sites in `datasetter.py:240`, `datasetter.py:396`, and `zarr.py:597` check config
+
 ## Important Environment Variables
 
 - `DANDI_API_KEY`: Required API token for the DANDI instance being mirrored
