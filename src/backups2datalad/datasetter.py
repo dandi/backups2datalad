@@ -412,9 +412,18 @@ class DandiDatasetter(AsyncResource):
         remote_assets = [asset async for asset in dandiset.aget_assets()]
 
         async def commit_has_assets(commit_hash: str) -> bool:
-            repo_assets = json.loads(
-                await ds.read_git("show", f"{commit_hash}:.dandi/assets.json")
-            )
+            try:
+                content_bytes = await ds.read_file_from_commit(
+                    commit_hash, ".dandi/assets.json"
+                )
+                repo_assets = json.loads(content_bytes.decode("utf-8"))
+            except (json.JSONDecodeError, RuntimeError, UnicodeDecodeError) as e:
+                log.warning(
+                    "Failed to read or parse .dandi/assets.json from commit %s: %s",
+                    commit_hash,
+                    e,
+                )
+                return False
             return (not remote_assets and not repo_assets) or (
                 repo_assets
                 and isinstance(repo_assets[0], dict)

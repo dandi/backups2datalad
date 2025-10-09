@@ -295,6 +295,71 @@ class AsyncDataset:
             "git", *GIT_OPTIONS, "annex", *args, cwd=self.path, **kwargs
         )
 
+    async def read_file_from_commit(self, commit: str, file_path: str) -> bytes:
+        """
+        Read a file from a git commit, handling annexed files.
+
+        If the file is annexed (symlink to annex object), attempts to get the
+        content via git-annex.
+
+        :param commit: Commit hash or reference
+        :param file_path: Path to file relative to repository root
+        :raises RuntimeError: If file is annexed but content cannot be retrieved
+        :return: File contents as bytes
+        """
+        try:
+            # First try to read directly via git show
+            symlink_target = await self.read_git("show", f"{commit}:{file_path}")
+            # Check if this looks like an annex symlink path
+            if ".git/annex/objects/" in symlink_target:
+                # File is annexed - extract the key from the symlink target
+                # Symlink format: ../../.git/annex/objects/XX/YY/KEY/KEY
+                # The key is the last path component
+                annex_key = Path(symlink_target).name
+                log.debug(
+                    "File %s in commit %s is annexed (key: %s),"
+                    " attempting to retrieve content",
+                    file_path,
+                    commit,
+                    annex_key,
+                )
+                # The symlink_target is relative to file_path location
+                file_dir = Path(file_path).parent
+                annex_object_path = (self.pathobj / file_dir / symlink_target).resolve()
+
+                # Check if content is already available
+                if not annex_object_path.exists():
+                    # Content not available, try to get it by key
+                    log.info(
+                        "Content for annexed file %s (key: %s) in commit %s"
+                        " not available locally, attempting to fetch",
+                        file_path,
+                        annex_key,
+                        commit,
+                    )
+                    try:
+                        await self.call_annex("get", "--key", annex_key)
+                    except subprocess.CalledProcessError as e:
+                        raise RuntimeError(
+                            f"File {file_path} in commit {commit} is annexed"
+                            f" (key: {annex_key}) but content is not available"
+                            f" and could not be fetched"
+                        ) from e
+
+                # Read the content from the annex object
+                if annex_object_path.exists():
+                    return annex_object_path.read_bytes()
+                else:
+                    raise RuntimeError(f"Annex object not found at {annex_object_path}")
+            else:
+                # Not annexed, return the content directly
+                return symlink_target.encode("utf-8")
+        except subprocess.CalledProcessError as e:
+            # Re-raise with more context
+            raise RuntimeError(
+                f"Failed to read {file_path} from commit {commit}: {e}"
+            ) from e
+
     async def save(
         self,
         message: str,
