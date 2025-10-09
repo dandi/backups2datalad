@@ -324,6 +324,12 @@ class DandiDatasetter(AsyncResource):
 
     async def set_superds_description(self, superds: AsyncDataset) -> None:
         log.info("Setting repository description for superdataset")
+        if not await superds.has_github_remote():
+            log.debug(
+                "Superdataset does not have a GitHub remote;"
+                " skipping description update"
+            )
+            return
         repo = await superds.get_ghrepo()
         qty = 0
         size = 0
