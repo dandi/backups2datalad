@@ -438,11 +438,8 @@ class AsyncDataset:
         while True:
             try:
                 # TODO: Improve
-                push_opts = ["--force"] if force else None
                 await anyio.to_thread.run_sync(
-                    partial(
-                        self.ds.push, to=to, jobs=jobs, data=data, options=push_opts
-                    )
+                    partial(self.ds.push, to=to, jobs=jobs, data=data, force=force)
                 )
             except CommandError as e:
                 if "unexpected disconnect" in str(e):
