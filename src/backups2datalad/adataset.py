@@ -397,6 +397,63 @@ class AsyncDataset:
             else:
                 break
 
+    async def _retry_on_git_lock(
+        self,
+        operation_desc: str,
+        git_command_func: Any,
+    ) -> None:
+        """
+        Retry a git operation with exponential backoff when git index lock
+        contention is detected.
+
+        :param operation_desc: Description of the operation for logging
+        :param git_command_func: Async callable that performs the git operation
+        """
+        delays = iter([1, 2, 6, 15, 36])
+        while True:
+            try:
+                await git_command_func()
+                return
+            except subprocess.CalledProcessError as e:
+                lockfile = self.pathobj / ".git" / "index.lock"
+                output = e.stdout.decode("utf-8") if e.stdout else ""
+                if lockfile.exists() and str(lockfile) in output:
+                    r = await aruncmd(
+                        "fuser",
+                        "-v",
+                        lockfile,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        check=False,
+                    )
+                    log.error(
+                        "%s: Unable to %s due to lockfile; `fuser -v`"
+                        " output on lockfile (return code %d):\n%s",
+                        self.pathobj,
+                        operation_desc,
+                        r.returncode,
+                        textwrap.indent(r.stdout.decode("utf-8"), "> "),
+                    )
+                else:
+                    log.error(
+                        "%s: %s failed with output:\n%s",
+                        self.pathobj,
+                        operation_desc,
+                        textwrap.indent(output, "> "),
+                    )
+                try:
+                    delay = next(delays)
+                except StopIteration:
+                    raise e
+                else:
+                    log.info(
+                        "Retrying %s under %s in %d seconds",
+                        operation_desc,
+                        self.pathobj,
+                        delay,
+                    )
+                    await anyio.sleep(delay)
+
     async def gc(self) -> None:
         try:
             await self.call_git("gc")
@@ -416,58 +473,19 @@ class AsyncDataset:
             # to avoid problems with locking etc. Same is done in DataLad's
             # invocation of rm
             self.ds.repo.precommit()
-            delays = iter([1, 2, 6, 15, 36])
-            while True:
-                try:
-                    await self.call_git(
-                        "rm",
-                        "-f",
-                        "--ignore-unmatch",
-                        "--",
-                        path,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                    )
-                    return
-                except subprocess.CalledProcessError as e:
-                    lockfile = self.pathobj / ".git" / "index.lock"
-                    output = e.stdout.decode("utf-8")
-                    if lockfile.exists() and str(lockfile) in output:
-                        r = await aruncmd(
-                            "fuser",
-                            "-v",
-                            lockfile,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            check=False,
-                        )
-                        log.error(
-                            "%s: Unable to remove %s due to lockfile; `fuser -v`"
-                            " output on lockfile (return code %d):\n%s",
-                            self.pathobj,
-                            path,
-                            r.returncode,
-                            textwrap.indent(r.stdout.decode("utf-8"), "> "),
-                        )
-                    else:
-                        log.error(
-                            "%s: `git rm` on %s failed with output:\n%s",
-                            self.pathobj,
-                            path,
-                            textwrap.indent(output, "> "),
-                        )
-                    try:
-                        delay = next(delays)
-                    except StopIteration:
-                        raise e
-                    else:
-                        log.info(
-                            "Retrying deletion of %s under %s in %d seconds",
-                            path,
-                            self.pathobj,
-                            delay,
-                        )
-                        await anyio.sleep(delay)
+
+            async def _do_remove() -> None:
+                await self.call_git(
+                    "rm",
+                    "-f",
+                    "--ignore-unmatch",
+                    "--",
+                    path,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                )
+
+            await self._retry_on_git_lock(f"remove {path}", _do_remove)
 
     async def remove_batch(self, paths: Iterable[str]) -> None:
         pathlist = list(paths)
@@ -478,18 +496,26 @@ class AsyncDataset:
             # to avoid problems with locking etc. Same is done in DataLad's
             # invocation of rm
             self.ds.repo.precommit()
-            with tempfile.NamedTemporaryFile(mode="w") as fp:
-                for p in pathlist:
-                    print(p, end="\0", file=fp)
-                fp.flush()
-                fp.seek(0)
-                await self.call_git(
-                    "rm",
-                    "-f",
-                    "--ignore-unmatch",
-                    f"--pathspec-from-file={fp.name}",
-                    "--pathspec-file-nul",
-                )
+
+            async def _do_remove_batch() -> None:
+                with tempfile.NamedTemporaryFile(mode="w") as fp:
+                    for p in pathlist:
+                        print(p, end="\0", file=fp)
+                    fp.flush()
+                    fp.seek(0)
+                    await self.call_git(
+                        "rm",
+                        "-f",
+                        "--ignore-unmatch",
+                        f"--pathspec-from-file={fp.name}",
+                        "--pathspec-file-nul",
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                    )
+
+            await self._retry_on_git_lock(
+                f"batch remove {len(pathlist)} files", _do_remove_batch
+            )
 
     async def update(self, how: str, sibling: str | None = None) -> None:
         await anyio.to_thread.run_sync(
