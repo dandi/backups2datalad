@@ -359,13 +359,25 @@ class AsyncDataset:
                 check_dirty=check_dirty,
             )
 
-    async def push(self, to: str, jobs: int, data: str | None = None) -> None:
+    async def push(
+        self, to: str, jobs: int, data: str | None = None, force: bool = False
+    ) -> None:
+        if force:
+            log.warning(
+                "Force-pushing dataset at %s to %s - this will overwrite"
+                " remote history!",
+                self.path,
+                to,
+            )
         waits = exp_wait(attempts=6, base=2.1)
         while True:
             try:
                 # TODO: Improve
+                push_opts = ["--force"] if force else None
                 await anyio.to_thread.run_sync(
-                    partial(self.ds.push, to=to, jobs=jobs, data=data)
+                    partial(
+                        self.ds.push, to=to, jobs=jobs, data=data, options=push_opts
+                    )
                 )
             except CommandError as e:
                 if "unexpected disconnect" in str(e):

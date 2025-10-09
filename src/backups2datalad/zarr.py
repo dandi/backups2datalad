@@ -594,7 +594,12 @@ async def sync_zarr(
             manager.log.debug("Finished running `git gc`")
             if manager.config.zarr_gh_org is not None:
                 manager.log.debug("Pushing to GitHub")
-                await ds.push(to="github", jobs=manager.config.jobs, data="nothing")
+                await ds.push(
+                    to="github",
+                    jobs=manager.config.jobs,
+                    data="nothing",
+                    force=manager.config.should_force_push_zarrs(),
+                )
                 manager.log.debug("Finished pushing to GitHub")
             if link is not None:
                 link.timestamp = commit_ts

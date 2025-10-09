@@ -64,6 +64,7 @@ class BackupConfig(BaseModel):
     gc_assets: bool = False
     mode: Mode = Mode.TIMESTAMP
     zarr_mode: ZarrMode = ZarrMode.TIMESTAMP
+    force_push: set[str] = Field(default_factory=set)  # "dandisets", "zarrs", "all"
 
     @model_validator(mode="after")
     def _validate(self) -> BackupConfig:
@@ -123,3 +124,11 @@ class BackupConfig(BaseModel):
 
     def match_asset(self, asset_path: str) -> bool:
         return self.asset_filter is None or bool(self.asset_filter.search(asset_path))
+
+    def should_force_push_dandisets(self) -> bool:
+        """Check if dandisets should be force-pushed to GitHub."""
+        return "all" in self.force_push or "dandisets" in self.force_push
+
+    def should_force_push_zarrs(self) -> bool:
+        """Check if zarrs should be force-pushed to GitHub."""
+        return "all" in self.force_push or "zarrs" in self.force_push

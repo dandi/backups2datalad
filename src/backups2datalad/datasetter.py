@@ -237,7 +237,12 @@ class DandiDatasetter(AsyncResource):
         if self.config.gh_org is not None:
             if changed:
                 dmanager.log.info("Pushing to sibling")
-                await ds.push(to="github", jobs=self.config.jobs, data="nothing")
+                await ds.push(
+                    to="github",
+                    jobs=self.config.jobs,
+                    data="nothing",
+                    force=self.config.should_force_push_dandisets(),
+                )
             await self.manager.set_dandiset_description(dandiset, stats, ds)
         return changed
 
@@ -388,7 +393,12 @@ class DandiDatasetter(AsyncResource):
                     latest,
                 )
             if push and (changed or merge):
-                await ds.push(to="github", jobs=self.config.jobs, data="nothing")
+                await ds.push(
+                    to="github",
+                    jobs=self.config.jobs,
+                    data="nothing",
+                    force=self.config.should_force_push_dandisets(),
+                )
 
     async def mkrelease(
         self,
