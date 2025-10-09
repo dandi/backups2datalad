@@ -295,6 +295,71 @@ class AsyncDataset:
             "git", *GIT_OPTIONS, "annex", *args, cwd=self.path, **kwargs
         )
 
+    async def read_file_from_commit(self, commit: str, file_path: str) -> bytes:
+        """
+        Read a file from a git commit, handling annexed files.
+
+        If the file is annexed (symlink to annex object), attempts to get the
+        content via git-annex.
+
+        :param commit: Commit hash or reference
+        :param file_path: Path to file relative to repository root
+        :raises RuntimeError: If file is annexed but content cannot be retrieved
+        :return: File contents as bytes
+        """
+        try:
+            # First try to read directly via git show
+            symlink_target = await self.read_git("show", f"{commit}:{file_path}")
+            # Check if this looks like an annex symlink path
+            if ".git/annex/objects/" in symlink_target:
+                # File is annexed - extract the key from the symlink target
+                # Symlink format: ../../.git/annex/objects/XX/YY/KEY/KEY
+                # The key is the last path component
+                annex_key = Path(symlink_target).name
+                log.debug(
+                    "File %s in commit %s is annexed (key: %s),"
+                    " attempting to retrieve content",
+                    file_path,
+                    commit,
+                    annex_key,
+                )
+                # The symlink_target is relative to file_path location
+                file_dir = Path(file_path).parent
+                annex_object_path = (self.pathobj / file_dir / symlink_target).resolve()
+
+                # Check if content is already available
+                if not annex_object_path.exists():
+                    # Content not available, try to get it by key
+                    log.info(
+                        "Content for annexed file %s (key: %s) in commit %s"
+                        " not available locally, attempting to fetch",
+                        file_path,
+                        annex_key,
+                        commit,
+                    )
+                    try:
+                        await self.call_annex("get", "--key", annex_key)
+                    except subprocess.CalledProcessError as e:
+                        raise RuntimeError(
+                            f"File {file_path} in commit {commit} is annexed"
+                            f" (key: {annex_key}) but content is not available"
+                            f" and could not be fetched"
+                        ) from e
+
+                # Read the content from the annex object
+                if annex_object_path.exists():
+                    return annex_object_path.read_bytes()
+                else:
+                    raise RuntimeError(f"Annex object not found at {annex_object_path}")
+            else:
+                # Not annexed, return the content directly
+                return symlink_target.encode("utf-8")
+        except subprocess.CalledProcessError as e:
+            # Re-raise with more context
+            raise RuntimeError(
+                f"Failed to read {file_path} from commit {commit}: {e}"
+            ) from e
+
     async def save(
         self,
         message: str,
@@ -359,13 +424,22 @@ class AsyncDataset:
                 check_dirty=check_dirty,
             )
 
-    async def push(self, to: str, jobs: int, data: str | None = None) -> None:
+    async def push(
+        self, to: str, jobs: int, data: str | None = None, force: bool = False
+    ) -> None:
+        if force:
+            log.warning(
+                "Force-pushing dataset at %s to %s - this will overwrite"
+                " remote history!",
+                self.path,
+                to,
+            )
         waits = exp_wait(attempts=6, base=2.1)
         while True:
             try:
                 # TODO: Improve
                 await anyio.to_thread.run_sync(
-                    partial(self.ds.push, to=to, jobs=jobs, data=data)
+                    partial(self.ds.push, to=to, jobs=jobs, data=data, force=force)
                 )
             except CommandError as e:
                 if "unexpected disconnect" in str(e):
@@ -384,6 +458,63 @@ class AsyncDataset:
                     raise
             else:
                 break
+
+    async def _retry_on_git_lock(
+        self,
+        operation_desc: str,
+        git_command_func: Any,
+    ) -> None:
+        """
+        Retry a git operation with exponential backoff when git index lock
+        contention is detected.
+
+        :param operation_desc: Description of the operation for logging
+        :param git_command_func: Async callable that performs the git operation
+        """
+        delays = iter([1, 2, 6, 15, 36])
+        while True:
+            try:
+                await git_command_func()
+                return
+            except subprocess.CalledProcessError as e:
+                lockfile = self.pathobj / ".git" / "index.lock"
+                output = e.stdout.decode("utf-8") if e.stdout else ""
+                if lockfile.exists() and str(lockfile) in output:
+                    r = await aruncmd(
+                        "fuser",
+                        "-v",
+                        lockfile,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        check=False,
+                    )
+                    log.error(
+                        "%s: Unable to %s due to lockfile; `fuser -v`"
+                        " output on lockfile (return code %d):\n%s",
+                        self.pathobj,
+                        operation_desc,
+                        r.returncode,
+                        textwrap.indent(r.stdout.decode("utf-8"), "> "),
+                    )
+                else:
+                    log.error(
+                        "%s: %s failed with output:\n%s",
+                        self.pathobj,
+                        operation_desc,
+                        textwrap.indent(output, "> "),
+                    )
+                try:
+                    delay = next(delays)
+                except StopIteration:
+                    raise e
+                else:
+                    log.info(
+                        "Retrying %s under %s in %d seconds",
+                        operation_desc,
+                        self.pathobj,
+                        delay,
+                    )
+                    await anyio.sleep(delay)
 
     async def gc(self) -> None:
         try:
@@ -404,58 +535,19 @@ class AsyncDataset:
             # to avoid problems with locking etc. Same is done in DataLad's
             # invocation of rm
             self.ds.repo.precommit()
-            delays = iter([1, 2, 6, 15, 36])
-            while True:
-                try:
-                    await self.call_git(
-                        "rm",
-                        "-f",
-                        "--ignore-unmatch",
-                        "--",
-                        path,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                    )
-                    return
-                except subprocess.CalledProcessError as e:
-                    lockfile = self.pathobj / ".git" / "index.lock"
-                    output = e.stdout.decode("utf-8")
-                    if lockfile.exists() and str(lockfile) in output:
-                        r = await aruncmd(
-                            "fuser",
-                            "-v",
-                            lockfile,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            check=False,
-                        )
-                        log.error(
-                            "%s: Unable to remove %s due to lockfile; `fuser -v`"
-                            " output on lockfile (return code %d):\n%s",
-                            self.pathobj,
-                            path,
-                            r.returncode,
-                            textwrap.indent(r.stdout.decode("utf-8"), "> "),
-                        )
-                    else:
-                        log.error(
-                            "%s: `git rm` on %s failed with output:\n%s",
-                            self.pathobj,
-                            path,
-                            textwrap.indent(output, "> "),
-                        )
-                    try:
-                        delay = next(delays)
-                    except StopIteration:
-                        raise e
-                    else:
-                        log.info(
-                            "Retrying deletion of %s under %s in %d seconds",
-                            path,
-                            self.pathobj,
-                            delay,
-                        )
-                        await anyio.sleep(delay)
+
+            async def _do_remove() -> None:
+                await self.call_git(
+                    "rm",
+                    "-f",
+                    "--ignore-unmatch",
+                    "--",
+                    path,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                )
+
+            await self._retry_on_git_lock(f"remove {path}", _do_remove)
 
     async def remove_batch(self, paths: Iterable[str]) -> None:
         pathlist = list(paths)
@@ -466,18 +558,26 @@ class AsyncDataset:
             # to avoid problems with locking etc. Same is done in DataLad's
             # invocation of rm
             self.ds.repo.precommit()
-            with tempfile.NamedTemporaryFile(mode="w") as fp:
-                for p in pathlist:
-                    print(p, end="\0", file=fp)
-                fp.flush()
-                fp.seek(0)
-                await self.call_git(
-                    "rm",
-                    "-f",
-                    "--ignore-unmatch",
-                    f"--pathspec-from-file={fp.name}",
-                    "--pathspec-file-nul",
-                )
+
+            async def _do_remove_batch() -> None:
+                with tempfile.NamedTemporaryFile(mode="w") as fp:
+                    for p in pathlist:
+                        print(p, end="\0", file=fp)
+                    fp.flush()
+                    fp.seek(0)
+                    await self.call_git(
+                        "rm",
+                        "-f",
+                        "--ignore-unmatch",
+                        f"--pathspec-from-file={fp.name}",
+                        "--pathspec-file-nul",
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                    )
+
+            await self._retry_on_git_lock(
+                f"batch remove {len(pathlist)} files", _do_remove_batch
+            )
 
     async def update(self, how: str, sibling: str | None = None) -> None:
         await anyio.to_thread.run_sync(
@@ -561,7 +661,7 @@ class AsyncDataset:
     ) -> bool:
         # Returns True iff sibling was created
         if not await self.has_github_remote():
-            log.info("Creating GitHub sibling for %s", name)
+            log.info("Creating GitHub sibling for %s under %s", name, owner)
             private = await self.get_embargo_status() is EmbargoStatus.EMBARGOED
             await anyio.to_thread.run_sync(
                 partial(

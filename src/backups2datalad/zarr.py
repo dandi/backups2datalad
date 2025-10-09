@@ -13,6 +13,7 @@ from urllib.parse import quote, quote_plus
 from aiobotocore.config import AioConfig
 from aiobotocore.session import get_session
 from botocore import UNSIGNED
+from dandi.consts import EmbargoStatus
 from pydantic import BaseModel
 from zarr_checksum.tree import ZarrChecksumTree
 
@@ -508,6 +509,7 @@ async def sync_zarr(
     manager: Manager,
     link: ZarrLink | None = None,
     error_on_change: bool = False,
+    embargo_status: EmbargoStatus = EmbargoStatus.OPEN,
 ) -> None:
     async with manager.config.zarr_limit:
         assert manager.config.zarrs is not None
@@ -524,6 +526,7 @@ async def sync_zarr(
             backup_remote=manager.config.zarrs.remote,
             backend="MD5E",
             cfg_proc=None,
+            embargo_status=embargo_status,
         )
         if not (ds.pathobj / ".dandi" / ".gitattributes").exists():
             manager.log.debug("Excluding .dandi/ from git-annex")
@@ -540,10 +543,16 @@ async def sync_zarr(
             )
         if (zgh := manager.config.zarrs.github_org) is not None:
             manager.log.debug("Creating GitHub sibling")
+            # Override default embargo status (from dataset) with parent
+            # dandiset's status
+            await ds.set_embargo_status(embargo_status)
             await ds.create_github_sibling(
                 owner=zgh, name=asset.zarr, backup_remote=manager.config.zarrs.remote
             )
-            manager.log.debug("Created GitHub sibling")
+            manager.log.debug(
+                "Created GitHub sibling with privacy %s",
+                "private" if embargo_status is EmbargoStatus.EMBARGOED else "public",
+            )
         if await ds.is_dirty():
             raise RuntimeError(
                 f"Zarr {asset.zarr} in Dandiset {asset.dandiset_id} is dirty;"
@@ -585,7 +594,12 @@ async def sync_zarr(
             manager.log.debug("Finished running `git gc`")
             if manager.config.zarr_gh_org is not None:
                 manager.log.debug("Pushing to GitHub")
-                await ds.push(to="github", jobs=manager.config.jobs, data="nothing")
+                await ds.push(
+                    to="github",
+                    jobs=manager.config.jobs,
+                    data="nothing",
+                    force=manager.config.should_force_push_zarrs(),
+                )
                 manager.log.debug("Finished pushing to GitHub")
             if link is not None:
                 link.timestamp = commit_ts

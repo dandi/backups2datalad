@@ -46,28 +46,44 @@ from .zarr import ZarrLink, sync_zarr
 @dataclass
 class DandiDatasetter(AsyncResource):
     dandi_client: AsyncDandiClient
-    manager: Manager = field(init=False)
     config: BackupConfig
     logfile: Path | None = None
+    _manager: Manager | None = field(init=False, default=None)
 
-    def __post_init__(self) -> None:
-        if self.config.gh_org is not None:
-            token = subprocess.run(
-                ["git", "config", "hub.oauthtoken"],
-                check=True,
-                stdout=subprocess.PIPE,
-                text=True,
-            ).stdout.strip()
-            gh = GitHub(token)
-        else:
-            gh = None
-        self.manager = Manager(
-            config=self.config, gh=gh, log=log, token=self.dandi_client.token
-        )
+    @property
+    def manager(self) -> Manager:
+        """Lazy initialization of Manager with GitHub token."""
+        if self._manager is None:
+            if self.config.gh_org is not None:
+                # Prefer GITHUB_TOKEN environment variable, fall back to git config
+                token = os.environ.get("GITHUB_TOKEN")
+                if token:
+                    log.info("Loaded GitHub token from GITHUB_TOKEN env var")
+                else:
+                    token = subprocess.run(
+                        ["git", "config", "hub.oauthtoken"],
+                        check=True,
+                        stdout=subprocess.PIPE,
+                        text=True,
+                    ).stdout.strip()
+                    if token:
+                        log.info("Loaded GitHub token from git config hub.oauthtoken")
+                if not token:
+                    log.warning(
+                        "No GitHub token was loaded, GitHub operations will likely fail"
+                    )
+                gh = GitHub(token)
+            else:
+                gh = None
+            self._manager = Manager(
+                config=self.config, gh=gh, log=log, token=self.dandi_client.token
+            )
+        return self._manager
 
     async def aclose(self) -> None:
         await self.dandi_client.aclose()
-        await self.manager.aclose()
+        if self._manager is not None:
+            await self._manager.aclose()
 
     async def ensure_superdataset(self) -> AsyncDataset:
         superds = AsyncDataset(self.config.dandiset_root)
@@ -221,7 +237,12 @@ class DandiDatasetter(AsyncResource):
         if self.config.gh_org is not None:
             if changed:
                 dmanager.log.info("Pushing to sibling")
-                await ds.push(to="github", jobs=self.config.jobs, data="nothing")
+                await ds.push(
+                    to="github",
+                    jobs=self.config.jobs,
+                    data="nothing",
+                    force=self.config.should_force_push_dandisets(),
+                )
             await self.manager.set_dandiset_description(dandiset, stats, ds)
         return changed
 
@@ -308,6 +329,12 @@ class DandiDatasetter(AsyncResource):
 
     async def set_superds_description(self, superds: AsyncDataset) -> None:
         log.info("Setting repository description for superdataset")
+        if not await superds.has_github_remote():
+            log.debug(
+                "Superdataset does not have a GitHub remote;"
+                " skipping description update"
+            )
+            return
         repo = await superds.get_ghrepo()
         qty = 0
         size = 0
@@ -366,7 +393,12 @@ class DandiDatasetter(AsyncResource):
                     latest,
                 )
             if push and (changed or merge):
-                await ds.push(to="github", jobs=self.config.jobs, data="nothing")
+                await ds.push(
+                    to="github",
+                    jobs=self.config.jobs,
+                    data="nothing",
+                    force=self.config.should_force_push_dandisets(),
+                )
 
     async def mkrelease(
         self,
@@ -380,9 +412,18 @@ class DandiDatasetter(AsyncResource):
         remote_assets = [asset async for asset in dandiset.aget_assets()]
 
         async def commit_has_assets(commit_hash: str) -> bool:
-            repo_assets = json.loads(
-                await ds.read_git("show", f"{commit_hash}:.dandi/assets.json")
-            )
+            try:
+                content_bytes = await ds.read_file_from_commit(
+                    commit_hash, ".dandi/assets.json"
+                )
+                repo_assets = json.loads(content_bytes.decode("utf-8"))
+            except (json.JSONDecodeError, RuntimeError, UnicodeDecodeError) as e:
+                log.warning(
+                    "Failed to read or parse .dandi/assets.json from commit %s: %s",
+                    commit_hash,
+                    e,
+                )
+                return False
             return (not remote_assets and not repo_assets) or (
                 repo_assets
                 and isinstance(repo_assets[0], dict)
@@ -515,12 +556,15 @@ class DandiDatasetter(AsyncResource):
                 timestamp=None,
                 asset_paths=[asset.path],
             )
+            # Get embargo status from parent Dandiset
+            dandiset_embargo_status = await ds.get_embargo_status()
             await sync_zarr(
                 asset,
                 zarr_digest,
                 zarr_dspath,
                 self.manager.with_sublogger(f"Zarr {asset.zarr}"),
                 link=zl,
+                embargo_status=dandiset_embargo_status,
             )
             log.info("Zarr %s: Moving dataset", asset.zarr)
             shutil.move(str(zarr_dspath), str(ultimate_dspath))
@@ -570,6 +614,30 @@ class DandiDatasetter(AsyncResource):
                     path=[asset.path],
                     commit_date=ts,
                 )
+                # Add github-access-status for the Zarr submodule based on parent
+                # Dandiset's embargo status
+                if self.config.zarr_gh_org is not None:
+                    embargo = await ds.get_embargo_status()
+                    access_status = (
+                        "private" if embargo is EmbargoStatus.EMBARGOED else "public"
+                    )
+                    log.debug(
+                        "Setting github-access-status to %s for Zarr submodule %s",
+                        access_status,
+                        asset.path,
+                    )
+                    await ds.set_repo_config(
+                        f"submodule.{asset.path}.github-access-status",
+                        access_status,
+                        file=".gitmodules",
+                    )
+                    await ds.commit_if_changed(
+                        f"[backups2datalad] Update github-access-status for "
+                        f"Zarr {asset.zarr}",
+                        paths=[".gitmodules"],
+                        check_dirty=False,
+                        commit_date=ts,
+                    )
                 ds.assert_no_duplicates_in_gitmodules()
                 log.debug("Zarr %s: Changes saved", asset.zarr)
                 # now that we have as a subdataset and know that it is all good,

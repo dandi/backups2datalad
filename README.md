@@ -175,8 +175,13 @@ Before running `backups2datalad`, the following setup must be performed:
       configuration file.
 
 - If pushing mirror repositories to GitHub, a GitHub access token with
-  appropriate permissions must be stored in the `hub.oauthtoken` key of your
-  `~/.gitconfig`, and an SSH key that has been registered with a GitHub account
+  appropriate permissions must be provided via one of the following methods
+  (in order of precedence):
+
+    1. Set the `GITHUB_TOKEN` environment variable
+    2. Store the token in the `hub.oauthtoken` key of your `~/.gitconfig`
+
+  Additionally, an SSH key that has been registered with a GitHub account
   must be in use as well.
 
 Usage

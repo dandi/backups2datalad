@@ -195,6 +195,17 @@ def print_logfile(
         " timestamp, unless different value set via config file]"
     ),
 )
+@click.option(
+    "--force-push",
+    multiple=True,
+    type=click.Choice(["dandisets", "zarrs", "all"], case_sensitive=False),
+    help=(
+        "Force-push to GitHub, overwriting remote history. Can be specified"
+        " multiple times. Values: 'dandisets' — force-push Dandiset repos,"
+        " 'zarrs' — force-push Zarr repos, 'all' — force-push both. WARNING:"
+        " This will overwrite remote Git history!"
+    ),
+)
 @click.argument("dandisets", nargs=-1)
 @click.pass_obj
 @print_logfile
@@ -209,6 +220,7 @@ async def update_from_backup(
     gc_assets: bool | None,
     mode: Mode | None,
     zarr_mode: ZarrMode | None,
+    force_push: tuple[str, ...],
 ) -> None:
     """
     Create & update local mirrors of Dandisets and the Zarrs within them.
@@ -233,6 +245,14 @@ async def update_from_backup(
             datasetter.config.zarr_mode = zarr_mode
         if gc_assets is not None:
             datasetter.config.gc_assets = gc_assets
+        if force_push:
+            datasetter.config.force_push = set(force_push)
+            if datasetter.config.force_push:
+                log.warning(
+                    "Force-push enabled for: %s - this will overwrite remote"
+                    " Git history!",
+                    ", ".join(sorted(datasetter.config.force_push)),
+                )
         await datasetter.update_from_backup(dandisets, exclude=exclude)
 
 

@@ -106,6 +106,7 @@ class Report:
 class Downloader:
     dandiset_id: str
     embargoed: bool
+    embargo_status: EmbargoStatus
     ds: AsyncDataset
     manager: Manager
     tracker: AssetTracker
@@ -168,12 +169,6 @@ class Downloader:
                 self.tracker.remote_assets.add(asset.path)
                 if downloading:
                     if asset.asset_type == AssetType.ZARR:
-                        if self.embargoed:
-                            raise RuntimeError(
-                                f"Dandiset {self.dandiset_id} is embargoed and"
-                                f" contains a Zarr at {asset.path}; do not know"
-                                " how to handle"
-                            )
                         try:
                             zarr_digest = asset.get_digest_value()
                         except NotFoundError:
@@ -354,7 +349,12 @@ class Downloader:
                 asset_paths=[asset.path],
             )
             self.nursery.start_soon(
-                partial(sync_zarr, link=zl, error_on_change=self.error_on_change),
+                partial(
+                    sync_zarr,
+                    link=zl,
+                    error_on_change=self.error_on_change,
+                    embargo_status=self.embargo_status,
+                ),
                 asset,
                 zarr_digest,
                 zarr_dspath,
@@ -511,6 +511,7 @@ async def async_assets(
                     dm = Downloader(
                         dandiset_id=dandiset.identifier,
                         embargoed=dandiset.embargo_status is EmbargoStatus.EMBARGOED,
+                        embargo_status=dandiset.embargo_status,
                         ds=ds,
                         manager=manager,
                         tracker=tracker,
