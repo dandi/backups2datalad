@@ -545,7 +545,19 @@ async def sync_zarr(
             manager.log.debug("Creating GitHub sibling")
             # Override default embargo status (from dataset) with parent
             # dandiset's status
-            await ds.set_embargo_status(embargo_status)
+            old_status = await ds.get_embargo_status()
+            if old_status != embargo_status:
+                await ds.set_embargo_status(embargo_status)
+                # Commit the embargo status change to avoid dirty state
+                await ds.commit(
+                    message=(
+                        "[backups2datalad] Set embargo status to"
+                        f" {embargo_status.value}"
+                    ),
+                    paths=[".datalad/config"],
+                    commit_date=asset.created,
+                    check_dirty=False,
+                )
             await ds.create_github_sibling(
                 owner=zgh, name=asset.zarr, backup_remote=manager.config.zarrs.remote
             )
