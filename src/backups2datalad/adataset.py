@@ -680,7 +680,7 @@ class AsyncDataset:
                 )
             )
             for key, value in [
-                ("remote.github.pushurl", f"git@github.com:{owner}/{name}.git"),
+                ("remote.github.pushurl", f"git@github.com:{owner}/{name}"),
                 (f"branch.{DEFAULT_BRANCH}.remote", "github"),
                 (f"branch.{DEFAULT_BRANCH}.merge", f"refs/heads/{DEFAULT_BRANCH}"),
             ]:

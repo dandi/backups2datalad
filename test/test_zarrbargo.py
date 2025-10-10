@@ -60,7 +60,14 @@ def test_ssh_to_https_url_conversion() -> None:
     """Test SSH to HTTPS URL conversion helper functions."""
     from backups2datalad.syncer import extract_repo_name, ssh_to_https_url
 
-    # Test SSH URL conversion to HTTPS
+    # Test SSH URL conversion to HTTPS (without .git suffix)
+    assert (
+        ssh_to_https_url("git@github.com:dandizarrs/zarr123")
+        == "https://github.com/dandizarrs/zarr123"
+    )
+    assert ssh_to_https_url("git@github.com:org/repo") == "https://github.com/org/repo"
+
+    # Test SSH URL with .git suffix also works
     assert (
         ssh_to_https_url("git@github.com:dandizarrs/zarr123.git")
         == "https://github.com/dandizarrs/zarr123"
@@ -74,8 +81,10 @@ def test_ssh_to_https_url_conversion() -> None:
         ssh_to_https_url("https://github.com/org/repo") == "https://github.com/org/repo"
     )
 
-    # Test repo name extraction from SSH URLs
+    # Test repo name extraction from SSH URLs (with and without .git)
+    assert extract_repo_name("git@github.com:dandizarrs/zarr123") == "zarr123"
     assert extract_repo_name("git@github.com:dandizarrs/zarr123.git") == "zarr123"
+    assert extract_repo_name("git@github.com:org/repo") == "repo"
     assert extract_repo_name("git@github.com:org/repo.git") == "repo"
 
     # Test repo name extraction from HTTPS URLs
@@ -85,24 +94,24 @@ def test_ssh_to_https_url_conversion() -> None:
 
 async def test_zarr_repo_unembargoing() -> None:
     """Test that unembargoed Dandisets update their Zarr repositories to public."""
-    # Create mocks - start with SSH URLs (private state)
+    # Create mocks - start with SSH URLs (private state, no .git suffix)
     ds = AsyncMock()
     ds.get_subdatasets = AsyncMock(
         return_value=[
             {
                 "path": "/fake/path/foo.zarr",
                 "gitmodule_path": "foo.zarr",
-                "gitmodule_url": "git@github.com:dandizarrs/zarr123.git",
+                "gitmodule_url": "git@github.com:dandizarrs/zarr123",
             },
             {
                 "path": "/fake/path/bar.ngff",
                 "gitmodule_path": "bar.ngff",
-                "gitmodule_url": "git@github.com:dandizarrs/zarr456.git",
+                "gitmodule_url": "git@github.com:dandizarrs/zarr456",
             },
             {
                 "path": "/fake/path/not_zarr",
                 "gitmodule_path": "not_zarr",
-                "gitmodule_url": "git@github.com:dandizarrs/non_zarr789.git",
+                "gitmodule_url": "git@github.com:dandizarrs/non_zarr789",
             },
         ]
     )

@@ -20,11 +20,13 @@ from .util import AssetTracker, UnexpectedChangeError, quantify
 def ssh_to_https_url(url: str) -> str:
     """Convert SSH GitHub URL to HTTPS URL.
 
-    Example: git@github.com:org/repo.git -> https://github.com/org/repo
+    Example: git@github.com:org/repo -> https://github.com/org/repo
     """
     match = re.match(r"git@github\.com:(.+?)(?:\.git)?$", url)
     if match:
-        return f"https://github.com/{match.group(1)}"
+        # Remove .git suffix if present
+        path = match.group(1).removesuffix(".git")
+        return f"https://github.com/{path}"
     return url
 
 
@@ -32,17 +34,17 @@ def extract_repo_name(url: str) -> str:
     """Extract repository name from GitHub URL (SSH or HTTPS).
 
     Examples:
-        git@github.com:org/repo.git -> repo
+        git@github.com:org/repo -> repo
         https://github.com/org/repo -> repo
     """
-    # Handle SSH URLs: git@github.com:org/repo.git
+    # Handle SSH URLs: git@github.com:org/repo
     match = re.match(r"git@github\.com:.+/(.+?)(?:\.git)?$", url)
     if match:
-        return match.group(1)
+        return match.group(1).removesuffix(".git")
     # Handle HTTPS URLs: https://github.com/org/repo
     match = re.match(r"https://github\.com/.+/(.+?)(?:\.git)?$", url)
     if match:
-        return match.group(1)
+        return match.group(1).removesuffix(".git")
     # Fallback to Path.name for backward compatibility
     return Path(url).name.removesuffix(".git")
 

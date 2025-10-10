@@ -589,9 +589,7 @@ class DandiDatasetter(AsyncResource):
                     embargo = await ds.get_embargo_status()
                     if embargo is EmbargoStatus.EMBARGOED:
                         # Use SSH for private repos to avoid authentication prompts
-                        src = (
-                            f"git@github.com:{self.config.zarr_gh_org}/{asset.zarr}.git"
-                        )
+                        src = f"git@github.com:{self.config.zarr_gh_org}/{asset.zarr}"
                     else:
                         src = (
                             f"https://github.com/{self.config.zarr_gh_org}/{asset.zarr}"
