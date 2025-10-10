@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 
 from dandi.consts import EmbargoStatus
 from ghrepo import GHRepo
@@ -14,6 +15,36 @@ from .logging import PrefixedLogger
 from .manager import Manager
 from .register_s3 import register_s3urls
 from .util import AssetTracker, UnexpectedChangeError, quantify
+
+
+def ssh_to_https_url(url: str) -> str:
+    """Convert SSH GitHub URL to HTTPS URL.
+
+    Example: git@github.com:org/repo.git -> https://github.com/org/repo
+    """
+    match = re.match(r"git@github\.com:(.+?)(?:\.git)?$", url)
+    if match:
+        return f"https://github.com/{match.group(1)}"
+    return url
+
+
+def extract_repo_name(url: str) -> str:
+    """Extract repository name from GitHub URL (SSH or HTTPS).
+
+    Examples:
+        git@github.com:org/repo.git -> repo
+        https://github.com/org/repo -> repo
+    """
+    # Handle SSH URLs: git@github.com:org/repo.git
+    match = re.match(r"git@github\.com:.+/(.+?)(?:\.git)?$", url)
+    if match:
+        return match.group(1)
+    # Handle HTTPS URLs: https://github.com/org/repo
+    match = re.match(r"https://github\.com/.+/(.+?)(?:\.git)?$", url)
+    if match:
+        return match.group(1)
+    # Fallback to Path.name for backward compatibility
+    return Path(url).name.removesuffix(".git")
 
 
 @dataclass
@@ -179,7 +210,8 @@ class Syncer:
         updated_submodules = {}
         for submodule in zarr_submodules:
             submodule_path = submodule["gitmodule_path"]
-            zarr_id = Path(submodule["gitmodule_url"]).name
+            old_url = submodule["gitmodule_url"]
+            zarr_id = extract_repo_name(old_url)
 
             self.log.info("Making Zarr repository %s public", zarr_id)
             # Let exceptions propagate - we want to know if this fails
@@ -188,19 +220,51 @@ class Syncer:
                 private=False,
             )
 
-            # Track for updating .gitmodules
-            updated_submodules[submodule_path] = "public"
+            # Convert SSH URL to HTTPS for public repos
+            new_url = ssh_to_https_url(old_url)
 
-        # Update github-access-status in .gitmodules for all Zarr submodules
+            # Track for updating .gitmodules
+            updated_submodules[submodule_path] = {
+                "status": "public",
+                "old_url": old_url,
+                "new_url": new_url,
+                "full_path": submodule["path"],
+            }
+
+        # Update github-access-status and URLs in .gitmodules for all Zarr submodules
         self.log.info(
             "Updating github-access-status in .gitmodules for %d Zarr " "submodules",
             len(updated_submodules),
         )
 
-        for path, status in updated_submodules.items():
+        for path, info in updated_submodules.items():
             await self.ds.set_repo_config(
-                f"submodule.{path}.github-access-status", status, file=".gitmodules"
+                f"submodule.{path}.github-access-status",
+                info["status"],
+                file=".gitmodules",
             )
+            # Update URL from SSH to HTTPS if it changed
+            if info["old_url"] != info["new_url"]:
+                await self.ds.set_repo_config(
+                    f"submodule.{path}.url", info["new_url"], file=".gitmodules"
+                )
+
+        # Update local git config URLs in subdatasets
+        for path, info in updated_submodules.items():
+            if info["old_url"] != info["new_url"]:
+                self.log.debug(
+                    "Updating local git config URL for %s from %s to %s",
+                    path,
+                    info["old_url"],
+                    info["new_url"],
+                )
+                await self.ds.call_git(
+                    "config",
+                    "--file",
+                    f"{info['full_path']}/.git/config",
+                    "remote.github.url",
+                    info["new_url"],
+                )
 
         # Commit the changes to .gitmodules
         await self.ds.commit_if_changed(

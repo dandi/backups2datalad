@@ -55,31 +55,60 @@ async def test_embargo_status_parameter() -> None:
     assert sig.parameters["embargo_status"].default == EmbargoStatus.OPEN
 
 
+@pytest.mark.ai_generated
+def test_ssh_to_https_url_conversion() -> None:
+    """Test SSH to HTTPS URL conversion helper functions."""
+    from backups2datalad.syncer import extract_repo_name, ssh_to_https_url
+
+    # Test SSH URL conversion to HTTPS
+    assert (
+        ssh_to_https_url("git@github.com:dandizarrs/zarr123.git")
+        == "https://github.com/dandizarrs/zarr123"
+    )
+    assert (
+        ssh_to_https_url("git@github.com:org/repo.git") == "https://github.com/org/repo"
+    )
+
+    # Test that HTTPS URLs pass through unchanged
+    assert (
+        ssh_to_https_url("https://github.com/org/repo") == "https://github.com/org/repo"
+    )
+
+    # Test repo name extraction from SSH URLs
+    assert extract_repo_name("git@github.com:dandizarrs/zarr123.git") == "zarr123"
+    assert extract_repo_name("git@github.com:org/repo.git") == "repo"
+
+    # Test repo name extraction from HTTPS URLs
+    assert extract_repo_name("https://github.com/dandizarrs/zarr456") == "zarr456"
+    assert extract_repo_name("https://github.com/org/repo") == "repo"
+
+
 async def test_zarr_repo_unembargoing() -> None:
     """Test that unembargoed Dandisets update their Zarr repositories to public."""
-    # Create mocks
+    # Create mocks - start with SSH URLs (private state)
     ds = AsyncMock()
     ds.get_subdatasets = AsyncMock(
         return_value=[
             {
                 "path": "/fake/path/foo.zarr",
                 "gitmodule_path": "foo.zarr",
-                "gitmodule_url": "https://github.com/dandizarrs/zarr123",
+                "gitmodule_url": "git@github.com:dandizarrs/zarr123.git",
             },
             {
                 "path": "/fake/path/bar.ngff",
                 "gitmodule_path": "bar.ngff",
-                "gitmodule_url": "https://github.com/dandizarrs/zarr456",
+                "gitmodule_url": "git@github.com:dandizarrs/zarr456.git",
             },
             {
                 "path": "/fake/path/not_zarr",
                 "gitmodule_path": "not_zarr",
-                "gitmodule_url": "https://github.com/dandizarrs/non_zarr789",
+                "gitmodule_url": "git@github.com:dandizarrs/non_zarr789.git",
             },
         ]
     )
     ds.set_repo_config = AsyncMock()
     ds.commit_if_changed = AsyncMock()
+    ds.call_git = AsyncMock()
 
     manager = MockManager()
 
@@ -103,12 +132,41 @@ async def test_zarr_repo_unembargoing() -> None:
     assert manager.edit_repo_calls[1][1] == {"private": False}
 
     # Verify that github-access-status was updated in .gitmodules
-    assert ds.set_repo_config.call_count == 2
+    # Should be called 4 times: 2 for access-status updates, 2 for URL updates
+    assert ds.set_repo_config.call_count == 4
     ds.set_repo_config.assert_any_call(
         "submodule.foo.zarr.github-access-status", "public", file=".gitmodules"
     )
     ds.set_repo_config.assert_any_call(
         "submodule.bar.ngff.github-access-status", "public", file=".gitmodules"
+    )
+    # Verify URLs were converted from SSH to HTTPS
+    ds.set_repo_config.assert_any_call(
+        "submodule.foo.zarr.url",
+        "https://github.com/dandizarrs/zarr123",
+        file=".gitmodules",
+    )
+    ds.set_repo_config.assert_any_call(
+        "submodule.bar.ngff.url",
+        "https://github.com/dandizarrs/zarr456",
+        file=".gitmodules",
+    )
+
+    # Verify that local git config URLs were updated in subdatasets
+    assert ds.call_git.call_count == 2
+    ds.call_git.assert_any_call(
+        "config",
+        "--file",
+        "/fake/path/foo.zarr/.git/config",
+        "remote.github.url",
+        "https://github.com/dandizarrs/zarr123",
+    )
+    ds.call_git.assert_any_call(
+        "config",
+        "--file",
+        "/fake/path/bar.ngff/.git/config",
+        "remote.github.url",
+        "https://github.com/dandizarrs/zarr456",
     )
 
     # Verify that a commit was made to .gitmodules
