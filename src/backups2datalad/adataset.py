@@ -651,6 +651,53 @@ class AsyncDataset:
     async def has_github_remote(self) -> bool:
         return "github" in (await self.read_git("remote")).splitlines()
 
+    async def fix_github_remote_url_for_embargo(self) -> bool:
+        """
+        Check if GitHub remote URL needs fixing for embargo status.
+
+        If the dataset is embargoed but has HTTPS URL, convert to SSH.
+        If the dataset is open but has SSH URL, convert to HTTPS.
+
+        Returns True if URL was fixed, False if no fix needed.
+        """
+        if not await self.has_github_remote():
+            return False
+
+        current_url = await self.get_repo_config("remote.github.url")
+        if current_url is None:
+            return False
+
+        embargo_status = await self.get_embargo_status()
+        is_embargoed = embargo_status is EmbargoStatus.EMBARGOED
+        is_ssh = current_url.startswith("git@github.com:")
+        is_https = current_url.startswith("https://github.com/")
+
+        # Check if URL type matches embargo status
+        if is_embargoed and is_https:
+            # Need to convert HTTPS to SSH
+            from .syncer import https_to_ssh_url
+
+            new_url = https_to_ssh_url(current_url)
+            log.info(
+                "Converting GitHub remote URL from HTTPS to SSH for embargoed repo: %s",
+                self.path,
+            )
+            await self.set_repo_config("remote.github.url", new_url)
+            return True
+        elif not is_embargoed and is_ssh:
+            # Need to convert SSH to HTTPS
+            from .syncer import ssh_to_https_url
+
+            new_url = ssh_to_https_url(current_url)
+            log.info(
+                "Converting GitHub remote URL from SSH to HTTPS for public repo: %s",
+                self.path,
+            )
+            await self.set_repo_config("remote.github.url", new_url)
+            return True
+
+        return False
+
     async def create_github_sibling(
         self,
         owner: str,
@@ -688,6 +735,8 @@ class AsyncDataset:
             return True
         else:
             log.debug("GitHub remote already exists for %s", name)
+            # Check if existing URL needs fixing
+            await self.fix_github_remote_url_for_embargo()
             return False
 
     async def get_remote_url(self) -> str:
