@@ -585,7 +585,15 @@ class DandiDatasetter(AsyncResource):
             async with dslock:
                 log.info("Zarr %s: cloning to %s", asset.zarr, asset.path)
                 if self.config.zarr_gh_org is not None:
-                    src = f"https://github.com/{self.config.zarr_gh_org}/{asset.zarr}"
+                    # Get parent Dandiset's embargo status to determine URL type
+                    embargo = await ds.get_embargo_status()
+                    if embargo is EmbargoStatus.EMBARGOED:
+                        # Use SSH for private repos to avoid authentication prompts
+                        src = f"git@github.com:{self.config.zarr_gh_org}/{asset.zarr}"
+                    else:
+                        src = (
+                            f"https://github.com/{self.config.zarr_gh_org}/{asset.zarr}"
+                        )
                 else:
                     src = str(ultimate_dspath)
                 await anyio.to_thread.run_sync(

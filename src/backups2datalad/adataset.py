@@ -663,13 +663,15 @@ class AsyncDataset:
         if not await self.has_github_remote():
             log.info("Creating GitHub sibling for %s under %s", name, owner)
             private = await self.get_embargo_status() is EmbargoStatus.EMBARGOED
+            # Use SSH for private repos to avoid authentication prompts
+            access_protocol = "ssh" if private else "https"
             await anyio.to_thread.run_sync(
                 partial(
                     self.ds.create_sibling_github,
                     reponame=name,
                     existing=existing,
                     name="github",
-                    access_protocol="https",
+                    access_protocol=access_protocol,
                     github_organization=owner,
                     publish_depends=(
                         backup_remote.name if backup_remote is not None else None
@@ -678,7 +680,7 @@ class AsyncDataset:
                 )
             )
             for key, value in [
-                ("remote.github.pushurl", f"git@github.com:{owner}/{name}.git"),
+                ("remote.github.pushurl", f"git@github.com:{owner}/{name}"),
                 (f"branch.{DEFAULT_BRANCH}.remote", "github"),
                 (f"branch.{DEFAULT_BRANCH}.merge", f"refs/heads/{DEFAULT_BRANCH}"),
             ]:
