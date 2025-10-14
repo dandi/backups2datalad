@@ -258,6 +258,11 @@ class DandiDatasetter(AsyncResource):
         manager.log.info("Syncing")
         if await ds.is_dirty():
             raise RuntimeError(f"Dirty {dandiset}; clean or save before running")
+
+        # Fix any URL mismatches between embargo status and current URLs
+        if await ds.fix_github_remote_url_for_embargo():
+            manager.log.info("Fixed GitHub remote URL to match embargo status")
+
         tracker = await anyio.to_thread.run_sync(AssetTracker.from_dataset, ds.pathobj)
         syncer = Syncer(
             manager=manager,
@@ -266,6 +271,11 @@ class DandiDatasetter(AsyncResource):
             tracker=tracker,
             error_on_change=error_on_change,
         )
+
+        # Fix Zarr submodule URLs if needed (without making GitHub API calls)
+        if await syncer.update_zarr_repos_privacy(update_github=False):
+            manager.log.info("Fixed Zarr submodule URLs to match embargo status")
+
         await syncer.update_embargo_status()
         await update_dandiset_metadata(dandiset, ds, log=manager.log)
         await syncer.sync_assets()

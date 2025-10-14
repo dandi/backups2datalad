@@ -30,6 +30,19 @@ def ssh_to_https_url(url: str) -> str:
     return url
 
 
+def https_to_ssh_url(url: str) -> str:
+    """Convert HTTPS GitHub URL to SSH URL.
+
+    Example: https://github.com/org/repo -> git@github.com:org/repo
+    """
+    match = re.match(r"https://github\.com/(.+?)(?:\.git)?$", url)
+    if match:
+        # Remove .git suffix if present
+        path = match.group(1).removesuffix(".git")
+        return f"git@github.com:{path}"
+    return url
+
+
 def extract_repo_name(url: str) -> str:
     """Extract repository name from GitHub URL (SSH or HTTPS).
 
@@ -174,21 +187,30 @@ class Syncer:
             msgparts.append("Only some metadata updates")
         return f"[backups2datalad] {', '.join(msgparts)}"
 
-    async def update_zarr_repos_privacy(self) -> None:
+    async def update_zarr_repos_privacy(self, *, update_github: bool = True) -> bool:
         """
-        Update all Zarr GitHub repositories to public when the parent Dandiset
-        is unembargoed. Also updates the github-access-status in .gitmodules
-        for all Zarr submodules.
+        Update Zarr submodule URLs and optionally GitHub repository privacy
+        based on parent Dandiset's embargo status.
 
-        Raises an exception if any Zarr repository fails to update, ensuring
-        problems are noticed and addressed rather than silently ignored.
+        If parent Dandiset is embargoed, Zarr submodules should use SSH URLs.
+        If parent Dandiset is public, Zarr submodules should use HTTPS URLs.
+
+        Args:
+            update_github: If True, also update GitHub repository privacy via API.
+                          If False, only fix URLs in .gitmodules and local configs.
+
+        Returns:
+            True if any changes were made, False otherwise.
+
+        Raises:
+            Exception if update_github=True and any GitHub API call fails.
         """
-        # Only proceed if we have GitHub org configured for both
-        # Dandisets and Zarrs
-        if not (self.config.gh_org and self.config.zarr_gh_org):
-            return
+        # Only proceed if we have GitHub org configured for Zarrs
+        if not self.config.zarr_gh_org:
+            return False
 
-        self.log.info("Updating privacy for Zarr repositories...")
+        embargo_status = await self.ds.get_embargo_status()
+        is_embargoed = embargo_status is EmbargoStatus.EMBARGOED
 
         # Get all submodules from the dataset
         submodules = await self.ds.get_subdatasets()
@@ -205,55 +227,91 @@ class Syncer:
                 zarr_submodules.append(submodule)
 
         if not zarr_submodules:
-            self.log.info("No Zarr repositories found to update")
-            return
+            return False
 
-        # Update all Zarr repositories - fail fast if any update fails
+        # Process all Zarr repositories
         updated_submodules = {}
         for submodule in zarr_submodules:
             submodule_path = submodule["gitmodule_path"]
             old_url = submodule["gitmodule_url"]
             zarr_id = extract_repo_name(old_url)
 
-            self.log.info("Making Zarr repository %s public", zarr_id)
-            # Let exceptions propagate - we want to know if this fails
-            await self.manager.edit_github_repo(
-                GHRepo(self.config.zarr_gh_org, zarr_id),
-                private=False,
-            )
+            is_ssh = old_url.startswith("git@github.com:")
+            is_https = old_url.startswith("https://github.com/")
 
-            # Convert SSH URL to HTTPS for public repos
-            new_url = ssh_to_https_url(old_url)
+            # Determine if URL needs fixing
+            needs_fix = False
+            if is_embargoed and is_https:
+                # Should be SSH
+                new_url = https_to_ssh_url(old_url)
+                needs_fix = True
+            elif not is_embargoed and is_ssh:
+                # Should be HTTPS
+                new_url = ssh_to_https_url(old_url)
+                needs_fix = True
+            else:
+                # URL is correct
+                new_url = old_url
+
+            if not needs_fix and not update_github:
+                # Nothing to do for this submodule
+                continue
+
+            # If update_github is True, update GitHub repository privacy
+            if update_github and self.config.gh_org:
+                if is_embargoed:
+                    self.log.info("Making Zarr repository %s private", zarr_id)
+                    await self.manager.edit_github_repo(
+                        GHRepo(self.config.zarr_gh_org, zarr_id),
+                        private=True,
+                    )
+                else:
+                    self.log.info("Making Zarr repository %s public", zarr_id)
+                    await self.manager.edit_github_repo(
+                        GHRepo(self.config.zarr_gh_org, zarr_id),
+                        private=False,
+                    )
 
             # Track for updating .gitmodules
             updated_submodules[submodule_path] = {
-                "status": "public",
+                "status": "private" if is_embargoed else "public",
                 "old_url": old_url,
                 "new_url": new_url,
                 "full_path": submodule["path"],
+                "url_changed": needs_fix,
             }
 
-        # Update github-access-status and URLs in .gitmodules for all Zarr submodules
-        self.log.info(
-            "Updating github-access-status in .gitmodules for %d Zarr " "submodules",
-            len(updated_submodules),
-        )
+        if not updated_submodules:
+            return False
+
+        # Update github-access-status and URLs in .gitmodules
+        if update_github:
+            self.log.info(
+                "Updating github-access-status in .gitmodules for %d Zarr submodules",
+                len(updated_submodules),
+            )
+        else:
+            self.log.info(
+                "Fixing URLs in .gitmodules for %d Zarr submodules",
+                len(updated_submodules),
+            )
 
         for path, info in updated_submodules.items():
+            # Always update github-access-status
             await self.ds.set_repo_config(
                 f"submodule.{path}.github-access-status",
                 info["status"],
                 file=".gitmodules",
             )
-            # Update URL from SSH to HTTPS if it changed
-            if info["old_url"] != info["new_url"]:
+            # Update URL if it changed
+            if info["url_changed"]:
                 await self.ds.set_repo_config(
                     f"submodule.{path}.url", info["new_url"], file=".gitmodules"
                 )
 
         # Update local git config URLs in subdatasets
         for path, info in updated_submodules.items():
-            if info["old_url"] != info["new_url"]:
+            if info["url_changed"]:
                 self.log.debug(
                     "Updating local git config URL for %s from %s to %s",
                     path,
@@ -269,8 +327,23 @@ class Syncer:
                 )
 
         # Commit the changes to .gitmodules
+        if update_github:
+            commit_msg = (
+                "[backups2datalad] Update github-access-status for Zarr submodules"
+            )
+        else:
+            url_fix_count = sum(
+                1 for info in updated_submodules.values() if info["url_changed"]
+            )
+            commit_msg = (
+                f"[backups2datalad] Fix {url_fix_count} Zarr submodule URL(s) "
+                "for embargo status"
+            )
+
         await self.ds.commit_if_changed(
-            "[backups2datalad] Update github-access-status for Zarr " "submodules",
+            commit_msg,
             paths=[".gitmodules"],
             check_dirty=False,
         )
+
+        return True

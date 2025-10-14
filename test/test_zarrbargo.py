@@ -58,7 +58,11 @@ async def test_embargo_status_parameter() -> None:
 @pytest.mark.ai_generated
 def test_ssh_to_https_url_conversion() -> None:
     """Test SSH to HTTPS URL conversion helper functions."""
-    from backups2datalad.syncer import extract_repo_name, ssh_to_https_url
+    from backups2datalad.syncer import (
+        extract_repo_name,
+        https_to_ssh_url,
+        ssh_to_https_url,
+    )
 
     # Test SSH URL conversion to HTTPS (without .git suffix)
     assert (
@@ -80,6 +84,25 @@ def test_ssh_to_https_url_conversion() -> None:
     assert (
         ssh_to_https_url("https://github.com/org/repo") == "https://github.com/org/repo"
     )
+
+    # Test HTTPS to SSH URL conversion (without .git suffix)
+    assert (
+        https_to_ssh_url("https://github.com/dandizarrs/zarr123")
+        == "git@github.com:dandizarrs/zarr123"
+    )
+    assert https_to_ssh_url("https://github.com/org/repo") == "git@github.com:org/repo"
+
+    # Test HTTPS URL with .git suffix also works
+    assert (
+        https_to_ssh_url("https://github.com/dandizarrs/zarr123.git")
+        == "git@github.com:dandizarrs/zarr123"
+    )
+    assert (
+        https_to_ssh_url("https://github.com/org/repo.git") == "git@github.com:org/repo"
+    )
+
+    # Test that SSH URLs pass through unchanged
+    assert https_to_ssh_url("git@github.com:org/repo") == "git@github.com:org/repo"
 
     # Test repo name extraction from SSH URLs (with and without .git)
     assert extract_repo_name("git@github.com:dandizarrs/zarr123") == "zarr123"
@@ -456,7 +479,9 @@ async def test_unembargo_dandiset_updates_zarr_privacy() -> None:
     syncer.report.commits = 0
 
     # Mock the dandiset embargo status transition
-    ds.get_embargo_status = AsyncMock(return_value=EmbargoStatus.EMBARGOED)
+    # Start with EMBARGOED, then return OPEN after set_embargo_status is called
+    embargo_statuses = [EmbargoStatus.EMBARGOED, EmbargoStatus.OPEN]
+    ds.get_embargo_status = AsyncMock(side_effect=embargo_statuses)
     ds.set_embargo_status = AsyncMock()
     ds.get_last_commit_date = AsyncMock()
     ds.save = AsyncMock()
