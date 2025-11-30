@@ -279,6 +279,7 @@ class Syncer:
                 "new_url": new_url,
                 "full_path": submodule["path"],
                 "url_changed": needs_fix,
+                "state": submodule.get("state", "absent"),
             }
 
         if not updated_submodules:
@@ -318,13 +319,22 @@ class Syncer:
                     info["old_url"],
                     info["new_url"],
                 )
-                await self.ds.call_git(
-                    "config",
-                    "--file",
-                    f"{info['full_path']}/.git/config",
-                    "remote.github.url",
-                    info["new_url"],
-                )
+                # Update parent's .git/config only if there's already a value there
+                current_url = await self.ds.get_repo_config(f"submodule.{path}.url")
+                if current_url:
+                    await self.ds.set_repo_config(
+                        f"submodule.{path}.url",
+                        info["new_url"],
+                    )
+                if info["state"] == "present":
+                    # Submodule is installed, also update its .git/config
+                    await self.ds.call_git(
+                        "config",
+                        "--file",
+                        f"{info['full_path']}/.git/config",
+                        "remote.github.url",
+                        info["new_url"],
+                    )
 
         # Commit the changes to .gitmodules
         if update_github:

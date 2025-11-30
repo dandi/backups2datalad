@@ -118,6 +118,7 @@ def test_ssh_to_https_url_conversion() -> None:
 async def test_zarr_repo_unembargoing() -> None:
     """Test that unembargoed Dandisets update their Zarr repositories to public."""
     # Create mocks - start with SSH URLs (private state, no .git suffix)
+    # foo.zarr is present (installed), bar.ngff is absent (not installed)
     ds = AsyncMock()
     ds.get_subdatasets = AsyncMock(
         return_value=[
@@ -125,22 +126,34 @@ async def test_zarr_repo_unembargoing() -> None:
                 "path": "/fake/path/foo.zarr",
                 "gitmodule_path": "foo.zarr",
                 "gitmodule_url": "git@github.com:dandizarrs/zarr123",
+                "state": "present",
             },
             {
                 "path": "/fake/path/bar.ngff",
                 "gitmodule_path": "bar.ngff",
                 "gitmodule_url": "git@github.com:dandizarrs/zarr456",
+                "state": "absent",
             },
             {
                 "path": "/fake/path/not_zarr",
                 "gitmodule_path": "not_zarr",
                 "gitmodule_url": "git@github.com:dandizarrs/non_zarr789",
+                "state": "present",
             },
         ]
     )
     ds.set_repo_config = AsyncMock()
     ds.commit_if_changed = AsyncMock()
     ds.call_git = AsyncMock()
+    # Mock get_repo_config to return existing URL for foo.zarr only
+    # (simulating that foo.zarr has been initialized with git submodule init)
+    ds.get_repo_config = AsyncMock(
+        side_effect=lambda key: (
+            "git@github.com:dandizarrs/zarr123"
+            if key == "submodule.foo.zarr.url"
+            else None
+        )
+    )
 
     manager = MockManager()
 
@@ -163,16 +176,18 @@ async def test_zarr_repo_unembargoing() -> None:
     assert manager.edit_repo_calls[1][0] == GHRepo("dandizarrs", "zarr456")
     assert manager.edit_repo_calls[1][1] == {"private": False}
 
-    # Verify that github-access-status was updated in .gitmodules
-    # Should be called 4 times: 2 for access-status updates, 2 for URL updates
-    assert ds.set_repo_config.call_count == 4
+    # Verify set_repo_config calls:
+    #   2 for access-status updates in .gitmodules
+    #   2 for URL updates in .gitmodules
+    #   1 for URL update in parent's .git/config (only foo.zarr has existing entry)
+    assert ds.set_repo_config.call_count == 5
     ds.set_repo_config.assert_any_call(
         "submodule.foo.zarr.github-access-status", "public", file=".gitmodules"
     )
     ds.set_repo_config.assert_any_call(
         "submodule.bar.ngff.github-access-status", "public", file=".gitmodules"
     )
-    # Verify URLs were converted from SSH to HTTPS
+    # Verify URLs were converted from SSH to HTTPS in .gitmodules
     ds.set_repo_config.assert_any_call(
         "submodule.foo.zarr.url",
         "https://github.com/dandizarrs/zarr123",
@@ -183,22 +198,22 @@ async def test_zarr_repo_unembargoing() -> None:
         "https://github.com/dandizarrs/zarr456",
         file=".gitmodules",
     )
+    # Verify URL was updated in parent's .git/config only for foo.zarr
+    # (bar.ngff doesn't have an existing entry in .git/config)
+    ds.set_repo_config.assert_any_call(
+        "submodule.foo.zarr.url",
+        "https://github.com/dandizarrs/zarr123",
+    )
 
-    # Verify that local git config URLs were updated in subdatasets
-    assert ds.call_git.call_count == 2
+    # Verify that local git config URLs were updated only for installed subdatasets
+    # (foo.zarr is present, bar.ngff is absent)
+    assert ds.call_git.call_count == 1
     ds.call_git.assert_any_call(
         "config",
         "--file",
         "/fake/path/foo.zarr/.git/config",
         "remote.github.url",
         "https://github.com/dandizarrs/zarr123",
-    )
-    ds.call_git.assert_any_call(
-        "config",
-        "--file",
-        "/fake/path/bar.ngff/.git/config",
-        "remote.github.url",
-        "https://github.com/dandizarrs/zarr456",
     )
 
     # Verify that a commit was made to .gitmodules
@@ -446,11 +461,13 @@ async def test_unembargo_dandiset_updates_zarr_privacy() -> None:
                 "path": "/path/data1.zarr",
                 "gitmodule_path": "data1.zarr",
                 "gitmodule_url": "https://github.com/dandizarrs/zarr001",
+                "state": "present",
             },
             {
                 "path": "/path/data2.ngff",
                 "gitmodule_path": "data2.ngff",
                 "gitmodule_url": "https://github.com/dandizarrs/zarr002",
+                "state": "absent",
             },
         ]
     )
