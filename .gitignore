@@ -5,3 +5,4 @@
 .tox/
 dist/
 src/backups2datalad/_version.py
+__pycache__
