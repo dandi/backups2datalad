@@ -210,7 +210,12 @@ def docker_archive() -> Iterator[Archive]:
                     break
             else:
                 raise RuntimeError("Django container did not start up in time")
-        os.environ["DANDI_API_KEY"] = django_api_key  # For uploading
+        # stock DANDI_API_KEY is the one which is expected by the
+        # backups2datalad CLI so we would need to set it also for testing
+        # external execution of the CLI.
+        os.environ["DANDI_API_KEY"] = os.environ[
+            "DANDI_API_LOCAL_DOCKER_TESTS_API_KEY"
+        ] = django_api_key  # For uploading
         yield Archive(
             instance=instance,
             api_token=django_api_key,
