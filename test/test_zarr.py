@@ -9,7 +9,7 @@ from conftest import Archive, SampleDandiset
 from datalad.api import Dataset
 import numpy as np
 import pytest
-from test_util import GitRepo
+from test_util import GitRepo, zarr_format_of
 
 from backups2datalad.adandi import RemoteZarrAsset
 from backups2datalad.adataset import AsyncDataset, DatasetStats
@@ -89,8 +89,15 @@ async def test_backup_zarr(
     assert gitrepo.get_commit_count() == 3
     assert gitrepo.get_commit_subject("HEAD") == "[backups2datalad] 2 files added"
 
+    # On-disk size of the Zarr store differs between zarr-python's V2 layout
+    # (.zarray / .zgroup, default in zarr-python 2.x) and V3 layout
+    # (zarr.json, default in 3.x); see dandi/dandi-cli#1858 for the same
+    # accommodation upstream.
+    expected_zarr_size = {"2": 1535, "3": 3954}[
+        zarr_format_of(new_dandiset.zarr_assets["sample.zarr"])
+    ]
     assert await AsyncDataset(ds.pathobj).get_stats(config=di.config) == DatasetStats(
-        files=6, size=1535
+        files=6, size=expected_zarr_size
     )
 
     log.info("test_backup_zarr: Syncing unmodified Zarr dandiset")

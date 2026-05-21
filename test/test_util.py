@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -127,3 +127,21 @@ def unzulu(ts: str) -> str:
     # as "Z" rather than "+00:00", which breaks comparisons against stringified
     # Python datetimes.
     return re.sub(r"Z$", "+00:00", ts)
+
+
+def zarr_format_of(names: Iterable[str]) -> str:
+    """Return the Zarr serialisation format ("2" or "3") implied by a Zarr
+    store's file inventory.
+
+    V3 stores carry ``zarr.json`` array/group metadata files; V2 stores carry
+    ``.zarray`` / ``.zgroup``.  ``zarr.save`` defaults to whichever format the
+    installed ``zarr-python`` version writes — that's V2 in zarr-python 2.x
+    and V3 in 3.x, and on-disk digests / sizes differ between the two
+    layouts (see dandi/dandi-cli#1858).
+    """
+    seen = set(names)
+    if any(n.endswith("zarr.json") for n in seen):
+        return "3"
+    if any(n.endswith(".zarray") or n.endswith(".zgroup") for n in seen):
+        return "2"
+    raise ValueError(f"Cannot determine Zarr format from files: {sorted(seen)!r}")
