@@ -23,7 +23,7 @@ dependencies = [
     "aiobotocore",
     "anyio ~= 4.0",
     "asyncclick >= 8.0.1",
-    "dandi >= 0.55.0",
+    "dandi >= 0.75.1",
     "dandischema",
     "datalad >= 0.19.6",
     "ghrepo ~= 0.1",
