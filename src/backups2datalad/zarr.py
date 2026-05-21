@@ -587,7 +587,8 @@ async def sync_zarr(
             )
             await zsync.run()
         report = zsync.report
-        if report or await zsync.ds.is_dirty():
+        made_commit = bool(report) or await zsync.ds.is_dirty()
+        if made_commit:
             if report:
                 summary = report.get_summary()
             else:
@@ -618,7 +619,13 @@ async def sync_zarr(
         else:
             manager.log.info("no changes; not committing")
         if link is not None:
-            if manager.gh is not None:
+            # Mirror the dandiset-side gate (datasetter.update_dandiset): only
+            # refresh the GitHub description when we actually changed
+            # something or the user asked for FORCE mode, so a no-op cron
+            # doesn't fan out into one `GET /repos/...` per zarr.
+            if manager.gh is not None and (
+                made_commit or manager.config.zarr_mode is ZarrMode.FORCE
+            ):
                 stats = await ds.get_stats(config=manager.config)
                 await manager.set_zarr_description(asset.zarr, stats)
             link.commit_hash = await ds.get_commit_hash()
