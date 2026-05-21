@@ -18,6 +18,7 @@ from dandi.consts import DandiInstance, dandiset_metadata_file, known_instances
 from dandi.exceptions import NotFoundError
 from dandi.upload import upload
 from dandischema.consts import DANDI_SCHEMA_VERSION
+from dandischema.models import DigestType
 from datalad.api import Dataset
 from datalad.tests.utils_pytest import assert_repo_status
 import pytest
@@ -307,6 +308,45 @@ class SampleDandiset:
                 **kwargs,
             )
         )
+        # dandi-cli's `upload()` returns as soon as the asset is registered
+        # with the API, but the SHA-256 digest is computed asynchronously by
+        # the dandi-archive celery worker.  `update-from-backup` skips the
+        # download for any asset whose SHA-256 isn't ready yet, which
+        # produced flaky "missing file" failures in `test_backup_command`
+        # (see CI run 26239575722 / pre-existing `test_binary` flake on
+        # main).  Wait until the server has computed digests for every blob
+        # asset we just uploaded before returning, so callers can run
+        # `update-from-backup` deterministically.
+        await self._wait_for_blob_digests()
+
+    async def _wait_for_blob_digests(
+        self, timeout: float = 60.0, poll_interval: float = 1.0
+    ) -> None:
+        expected = set(self.text_assets) | set(self.blob_assets)
+        if not expected:
+            return
+        deadline = anyio.current_time() + timeout
+        not_ready: list[str] = list(expected)
+        while True:
+            not_ready = []
+            async for asset in self.dandiset.aget_assets():
+                if asset.path not in expected:
+                    continue
+                try:
+                    sha = asset.get_digest_value(DigestType.sha2_256)
+                except NotFoundError:
+                    sha = None
+                if sha is None:
+                    not_ready.append(asset.path)
+            if not not_ready:
+                return
+            if anyio.current_time() >= deadline:
+                raise TimeoutError(
+                    f"dandi-archive did not compute SHA-256 for"
+                    f" {len(not_ready)} asset(s) within {timeout}s:"
+                    f" {sorted(not_ready)}"
+                )
+            await anyio.sleep(poll_interval)
 
     async def check_backup(
         self, backup_ds: Dataset, zarr_root: Path | None = None
