@@ -243,7 +243,20 @@ class DandiDatasetter(AsyncResource):
                     data="nothing",
                     force=self.config.should_force_push_dandisets(),
                 )
-            await self.manager.set_dandiset_description(dandiset, stats, ds)
+            # Only refresh GitHub description / visibility when we actually
+            # changed something or the user explicitly asked for FORCE mode.
+            # Doing this unconditionally produced a `GET /repos/...` per
+            # dandiset per run (~22 req/s with default workers), which is the
+            # exact burst that trips GitHub's secondary rate limit and floods
+            # the log with 403's.  `update-github-metadata` remains the
+            # explicit escape hatch for an out-of-band refresh.
+            if changed or dmanager.config.mode is Mode.FORCE:
+                await self.manager.set_dandiset_description(dandiset, stats, ds)
+            else:
+                dmanager.log.debug(
+                    "Skipping GitHub description refresh: no commits and"
+                    " mode is not 'force'"
+                )
         return changed
 
     async def sync_dataset(

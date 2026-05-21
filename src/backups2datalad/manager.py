@@ -131,7 +131,11 @@ class GitHub(AsyncResource):
 
     async def get_repo(self, repo: GHRepo) -> dict[str, Any]:
         log.debug("Getting repository info for %s", repo)
-        r = await arequest(self.client, "GET", repo.api_url)
+        # Retry on 403's: GitHub's secondary (abuse) rate limit returns 403
+        # under bursty parallel access, even when the primary 5000/hr budget
+        # is far from exhausted.  edit_repo already retries on 403 for the
+        # same reason.
+        r = await arequest(self.client, "GET", repo.api_url, retry_on=[403])
         data = r.json()
         assert isinstance(data, dict), f"Expected dict, got {type(data)}"
         assert all(

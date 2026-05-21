@@ -132,6 +132,14 @@ async def arequest(
             r = await client.request(method, url, follow_redirects=True, **kwargs)
             r.raise_for_status()
         except (httpx.HTTPError, ssl.SSLError) as e:
+            # For HTTP status errors, capture body + rate-limit/retry headers
+            # so 403s (esp. GitHub secondary rate limits) can be distinguished
+            # from auth/permission failures in the logs.
+            err_detail = (
+                _describe_http_error(e.response)
+                if isinstance(e, httpx.HTTPStatusError)
+                else ""
+            )
             if isinstance(e, (httpx.RequestError, ssl.SSLError)) or (
                 isinstance(e, httpx.HTTPStatusError)
                 and (
@@ -141,20 +149,54 @@ async def arequest(
                 try:
                     delay = next(waits)
                 except StopIteration:
+                    if err_detail:
+                        log.error(
+                            "Giving up on %s request to %s after retries; %s",
+                            method.upper(),
+                            url,
+                            err_detail,
+                        )
                     raise e
                 log.warning(
-                    "Retrying %s request to %s in %f seconds as it raised %s: %s",
+                    "Retrying %s request to %s in %f seconds as it raised %s: %s%s",
                     method.upper(),
                     url,
                     delay,
                     type(e).__name__,
                     str(e),
+                    f"; {err_detail}" if err_detail else "",
                 )
                 await anyio.sleep(delay)
                 continue
             else:
+                if err_detail:
+                    log.error(
+                        "%s request to %s failed: %s; %s",
+                        method.upper(),
+                        url,
+                        str(e),
+                        err_detail,
+                    )
                 raise
         return r
+
+
+def _describe_http_error(response: httpx.Response) -> str:
+    parts = []
+    for hdr in (
+        "retry-after",
+        "x-ratelimit-remaining",
+        "x-ratelimit-reset",
+        "x-ratelimit-resource",
+    ):
+        value = response.headers.get(hdr)
+        if value is not None:
+            parts.append(f"{hdr}={value}")
+    body = response.text
+    if body:
+        body = textwrap.shorten(body.replace("\n", " "), width=500, placeholder="...")
+        parts.append(f"body={body!r}")
+    return "; ".join(parts)
 
 
 @dataclass
