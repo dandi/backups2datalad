@@ -110,6 +110,11 @@ services:
       retries: 5
 
   rabbitmq:
-    image: rabbitmq:management
+    # Pinned to 4.2-management to match dandi-cli's test docker-compose;
+    # newer `:management` tags broke the dandi-archive celery wire-up and
+    # caused Zarr-upload tests to hang forever in "server calculating
+    # checksum" because celery never picked up the calculate_sha256 /
+    # ingest_zarr_archive jobs.  See dandi/dandi-cli#1841.
+    image: rabbitmq:4.2-management
     expose:
       - "5672"
