@@ -277,8 +277,18 @@ class Downloader:
                     self.report.updated += 1
             if to_update:
                 await self.ds.remove(blob.path)
-                if blob.is_binary():
-                    blob.log.info("File is binary; registering key with git-annex")
+                is_binary = blob.is_binary()
+                if is_binary or blob.asset.size > (10 << 20):
+                    if is_binary:
+                        blob.log.info(
+                            "File is binary; registering key with git-annex"
+                        )
+                    else:
+                        blob.log.info(
+                            "File is text but large (%d bytes);"
+                            " registering key with git-annex",
+                            blob.asset.size,
+                        )
                     key = await self.annex.mkkey(
                         PurePosixPath(blob.path).name,
                         blob.asset.size,
@@ -303,11 +313,6 @@ class Downloader:
                         )
                     self.tracker.finish_asset(blob.path)
                     self.report.registered += 1
-                elif blob.asset.size > (10 << 20):
-                    raise RuntimeError(
-                        f"{blob.path} identified as text but is"
-                        f" {blob.asset.size} bytes!"
-                    )
                 else:
                     await self.ensure_addurl()
                     url = blob.asset.base_download_url

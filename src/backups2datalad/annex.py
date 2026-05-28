@@ -5,7 +5,7 @@ from collections.abc import AsyncGenerator
 from contextlib import aclosing
 from dataclasses import dataclass, field
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import TracebackType
 
 import anyio
@@ -21,7 +21,6 @@ class AsyncAnnex:
     repo: Path
     digest_type: str = "SHA256"
     pfromkey: TextProcess | None = None
-    pexaminekey: TextProcess | None = None
     pwhereis: TextProcess | None = None
     pregisterurl: TextProcess | None = None
     locks: dict[str, anyio.Lock] = field(
@@ -40,7 +39,6 @@ class AsyncAnnex:
         if exc_type is None:
             for p in [
                 self.pfromkey,
-                self.pexaminekey,
                 self.pwhereis,
                 self.pregisterurl,
             ]:
@@ -50,7 +48,6 @@ class AsyncAnnex:
             with anyio.CancelScope(shield=True):
                 for p in [
                     self.pfromkey,
-                    self.pexaminekey,
                     self.pwhereis,
                     self.pregisterurl,
                 ]:
@@ -81,18 +78,14 @@ class AsyncAnnex:
             ### TODO: Raise an exception?
 
     async def mkkey(self, filename: str, size: int, digest: str) -> str:
-        async with self.locks["examinekey"]:
-            if self.pexaminekey is None:
-                self.pexaminekey = await open_git_annex(
-                    "examinekey",
-                    "--batch",
-                    f"--migrate-to-backend={self.digest_type}E",
-                    path=self.repo,
-                )
-            await self.pexaminekey.send(
-                f"{self.digest_type}-s{size}--{digest} {filename}\n"
-            )
-            return (await self.pexaminekey.receive()).strip()
+        # Construct the SHA256E key directly in Python to avoid issues with
+        # spaces in filenames when passing to git-annex examinekey batch mode.
+        # git-annex's SHA256E backend appends up to two trailing extensions to
+        # the key (e.g. ".nii.gz").  Files with no extension produce an empty
+        # string, which is valid and matches git-annex's own behaviour.
+        suffixes = PurePosixPath(filename).suffixes
+        ext = "".join(suffixes[-2:])
+        return f"{self.digest_type}E-s{size}--{digest}{ext}"
 
     async def get_key_remotes(self, key: str) -> list[str] | None:
         # Returns None if key is not known to git-annex
