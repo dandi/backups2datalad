@@ -35,6 +35,22 @@ BATCH_COMMANDS: dict[str, tuple[str, ...]] = {
 }
 
 
+def render_request(render: Callable[[T], str], item: T) -> str:
+    """
+    Render ``item`` as a single request line for a ``--batch`` subprocess.
+
+    Batch protocols are one line in, one line out, so an embedded newline
+    would turn one request into two and leave every later response in the
+    chunk attributed to the wrong request.  git-annex takes raw file paths for
+    `examinekey` and `fromkey`, and an S3 object key may legally contain a
+    newline, so refuse rather than silently corrupt the backup.
+    """
+    line = render(item)
+    if not line.endswith("\n") or "\n" in line[:-1]:
+        raise ValueError(f"Batch request for {item!r} is not a single line: {line!r}")
+    return line
+
+
 @dataclass
 class AsyncAnnex:
     repo: Path
@@ -91,11 +107,14 @@ class AsyncAnnex:
             self.procs[name] = p
             return p
 
-    async def _close_proc(self, name: str) -> None:
+    async def _close_proc(self, name: str, force: bool = False) -> None:
         p = self.procs.pop(name, None)
         self.sent.pop(name, None)
         if p is not None:
-            await p.aclose()
+            if force:
+                await p.force_aclose()
+            else:
+                await p.aclose()
 
     async def _pipeline(self, p: TextProcess, requests: Sequence[str]) -> list[str]:
         """
@@ -135,8 +154,9 @@ class AsyncAnnex:
         """
         Feed ``items`` (rendered as request lines by ``render``) to the
         ``--batch`` subprocess ``name`` in chunks, passing each item and its
-        response line to ``handle``.  Only one chunk's worth of requests and
-        responses is held in memory at a time.
+        response line to ``handle``.  `_batch` itself only holds one chunk's
+        worth of requests and responses at a time, though callers that collect
+        results (e.g. `mkkeys()`) still accumulate one entry per item.
         """
         if not items:
             return
@@ -144,13 +164,23 @@ class AsyncAnnex:
             done = 0
             for i in range(0, len(items), BATCH_CHUNK_SIZE):
                 chunk = items[i : i + BATCH_CHUNK_SIZE]
+                requests = [render_request(render, it) for it in chunk]
                 p = await self._get_proc(name)
-                responses = await self._pipeline(p, [render(it) for it in chunk])
+                try:
+                    responses = await self._pipeline(p, requests)
+                except BaseException:
+                    # The subprocess is now in an unknown state: some requests
+                    # may have been written without their responses being read
+                    # (or a request may have been written only partially), so
+                    # reusing it would misattribute every later response.
+                    with anyio.CancelScope(shield=True):
+                        await self._close_proc(name, force=True)
+                    raise
+                done += len(chunk)
+                self.sent[name] += len(chunk)
                 if handle is not None:
                     for it, resp in zip(chunk, responses):
                         handle(it, resp)
-                done += len(chunk)
-                self.sent[name] += len(chunk)
                 if restart_after is not None and self.sent[name] >= restart_after:
                     await self._close_proc(name)
                 if progress is not None:
@@ -186,11 +216,30 @@ class AsyncAnnex:
 
     async def mkkeys(self, files: Sequence[tuple[str, int, str]]) -> list[str]:
         keys: list[str] = []
+
+        def handle(f: tuple[str, int, str], response: str) -> None:
+            filename, size, digest = f
+            key = response.strip()
+            # `examinekey` output is a bare key rather than JSON, so -- unlike
+            # the other batch commands -- a response stream that got out of
+            # step with the requests would not fail to parse; it would just
+            # silently annex every file under the previous file's key.  The
+            # key is fully determined by the request apart from the extension,
+            # so check it:
+            expected = f"{self.digest_type}E-s{size}--{digest}"
+            if not key.startswith(expected):
+                raise RuntimeError(
+                    f"`git annex examinekey` [cwd={self.repo}] returned"
+                    f" {key!r} for {filename!r}, which does not start with the"
+                    f" expected {expected!r}"
+                )
+            keys.append(key)
+
         await self._batch(
             "examinekey",
             files,
             lambda f: f"{self.digest_type}-s{f[1]}--{f[2]} {f[0]}\n",
-            lambda _f, response: keys.append(response.strip()),
+            handle,
         )
         return keys
 

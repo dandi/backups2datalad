@@ -160,9 +160,21 @@ entry dominates the runtime.
 - `registerurl` runs with `annex.alwayscompact=false`, and git-annex only
   commits its journal to the git-annex branch when the process exits.  The
   process is therefore restarted every `JOURNAL_FLUSH_INTERVAL` requests so the
-  flat `.git/annex/journal/` directory doesn't grow to one file per key.
+  flat `.git/annex/journal/` directory doesn't grow to one file per key.  This
+  is attached to `register_urls()`, so it applies to the Dandiset blob backup
+  and `register_s3` paths too, not just Zarrs.
 - The `whereis` lookup only exists to log "not in backup remote", so it is
   skipped entirely when no backup remote is configured.
+- Pipelining means a desynchronised response stream would misattribute a whole
+  chunk rather than a single response, so two guards exist: `render_request()`
+  rejects a request containing an embedded newline (S3 object keys may contain
+  one), and `mkkeys()` checks each returned key against the size and digest it
+  asked for -- `examinekey` output is a bare key, so unlike the `--json`
+  commands a shifted response would otherwise parse fine and silently annex
+  files under the wrong keys.  A batch call that fails discards its subprocess
+  instead of reusing one whose stdout still holds unread responses.
+- Failures inside a batch call surface as an `ExceptionGroup` (anyio task
+  group) rather than the bare exception the one-at-a-time code raised.
 
 ## Main Workflow
 
