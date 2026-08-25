@@ -141,6 +141,29 @@ Zarr files within embargoed Dandisets receive special handling to maintain priva
 - `Syncer.update_zarr_repos_privacy()` in `syncer.py` - Batch updating Zarr repository privacy
 - `sync_zarr()` in `zarr.py` - Creating Zarr repos with embargo-aware privacy
 
+## Zarr Backup Performance
+
+Zarrs routinely have tens of thousands of entries, so anything done once per
+entry dominates the runtime.
+
+- `AsyncAnnex` (`annex.py`) talks to long-running `git annex --batch`
+  subprocesses.  Use the plural methods (`mkkeys()`, `get_keys_remotes()`,
+  `from_keys()`, `register_urls()`), which *pipeline* their requests: a whole
+  chunk (`BATCH_CHUNK_SIZE`) is written by one task while the responses are read
+  concurrently by another.  The singular wrappers (`mkkey()`, `from_key()`, ...)
+  are one-item calls on top of the same machinery and pay a full round trip per
+  item, so never call them in a loop over Zarr entries.
+- `ZarrSyncer.update_entries()` (`zarr.py`) therefore runs the registration as
+  four whole-list phases (make keys → whereis → fromkey → registerurl) rather
+  than five round trips per entry.  It logs progress once per chunk instead of
+  once per URL; the per-chunk timestamps make it obvious which phase is slow.
+- `registerurl` runs with `annex.alwayscompact=false`, and git-annex only
+  commits its journal to the git-annex branch when the process exits.  The
+  process is therefore restarted every `JOURNAL_FLUSH_INTERVAL` requests so the
+  flat `.git/annex/journal/` directory doesn't grow to one file per key.
+- The `whereis` lookup only exists to log "not in backup remote", so it is
+  skipped entirely when no backup remote is configured.
+
 ## Main Workflow
 
 1. Configuration is loaded from a YAML file

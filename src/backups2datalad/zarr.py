@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator, Callable, Iterator
 from contextlib import aclosing, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -238,32 +238,7 @@ class ZarrSyncer:
                                 to_delete.add(str(entry))
                                 self.report.updated += 1
                 await self.prune_deleted(to_delete)
-                for entry in to_update:
-                    key = await self.annex.mkkey(
-                        entry.name, entry.size, entry.md5_digest
-                    )
-                    remotes = await self.annex.get_key_remotes(key)
-                    await self.annex.from_key(key, str(entry))
-                    await self.register_url(str(entry), key, entry.bucket_url)
-                    prefix = quote_plus(str(entry))
-                    await self.register_url(
-                        str(entry),
-                        key,
-                        (
-                            f"{self.api_url}/zarr/{self.zarr_id}/files"
-                            f"?prefix={prefix}&download=true"
-                        ),
-                    )
-                    if (
-                        remotes is not None
-                        and self.backup_remote is not None
-                        and self.backup_remote not in remotes
-                    ):
-                        self.log.info(
-                            "%s: Not in backup remote %s",
-                            entry,
-                            self.backup_remote,
-                        )
+                await self.update_entries(to_update)
                 final_checksum = str(zcc.process())
                 modern_asset = await self.asset.refetch()
                 changed_during_sync = self.asset.modified != modern_asset.modified
@@ -478,9 +453,62 @@ class ZarrSyncer:
         else:
             raise RuntimeError(f"{filepath} unexpectedly not under git-annex")
 
-    async def register_url(self, path: str, key: str, url: str) -> None:
-        self.log.info("%s: Registering URL %s", path, url)
-        await self.annex.register_url(key, url)
+    def progress_logger(self, msg: str, total: int) -> Callable[[int], None]:
+        def log_progress(done: int) -> None:
+            self.log.info(msg, done, total)
+
+        return log_progress
+
+    async def update_entries(self, to_update: list[ZarrEntry]) -> None:
+        """
+        Register the given entries (which are either new or modified) with
+        git-annex and attach their download URLs.
+
+        Each step is performed for all entries at once via git-annex's
+        ``--batch`` interfaces rather than entry-by-entry; with tens of
+        thousands of entries the per-entry round trips otherwise dominate the
+        runtime.
+        """
+        if not to_update:
+            return
+        total = len(to_update)
+        self.log.info("Registering %s with git-annex", quantify(total, "file"))
+        keys = await self.annex.mkkeys(
+            [(entry.name, entry.size, entry.md5_digest) for entry in to_update]
+        )
+        if self.backup_remote is not None:
+            remotes = await self.annex.get_keys_remotes(keys)
+            for entry, entry_remotes in zip(to_update, remotes):
+                if (
+                    entry_remotes is not None
+                    and self.backup_remote not in entry_remotes
+                ):
+                    self.log.info(
+                        "%s: Not in backup remote %s", entry, self.backup_remote
+                    )
+        await self.annex.from_keys(
+            [(key, str(entry)) for key, entry in zip(keys, to_update)],
+            progress=self.progress_logger(
+                "Registered %d/%d keys with git-annex", total
+            ),
+        )
+        keyurls: list[tuple[str, str]] = []
+        for key, entry in zip(keys, to_update):
+            prefix = quote_plus(str(entry))
+            self.log.debug("%s: Registering URLs for key %s", entry, key)
+            keyurls.append((key, entry.bucket_url))
+            keyurls.append(
+                (
+                    key,
+                    f"{self.api_url}/zarr/{self.zarr_id}/files"
+                    f"?prefix={prefix}&download=true",
+                )
+            )
+        await self.annex.register_urls(
+            keyurls,
+            progress=self.progress_logger("Registered %d/%d URLs", len(keyurls)),
+        )
+        self.log.info("Finished registering %s with git-annex", quantify(total, "file"))
 
     async def get_local_checksum(self) -> str:
         if self._local_checksum is None:
