@@ -1,0 +1,184 @@
+#!/bin/bash
+# Back up one Zarr twice -- once with a baseline revision of this repo, once
+# with the working revision -- and compare how long each took and whether they
+# produced the same repository state.
+#
+# Both runs start from an empty directory, so this measures a from-scratch
+# Zarr backup.  Neither run pushes anything to GitHub.
+#
+# Usage:
+#   tools/compare-zarr-backup [options] ZARR_ID
+#
+# Options:
+#   -b REV     baseline revision to compare against  [default: origin/main]
+#   -t REV     revision under test                   [default: HEAD]
+#   -o DIR     output directory                      [default: ./zarr-ab]
+#   -c FILE    production config to take the Zarr backup remote from
+#   -d ID      Dandiset owning the Zarr (looked up via the API if omitted)
+#   -n         run each variant twice and report both timings
+#
+# Requires: git-annex, datalad, DANDI_API_KEY, and a Python that can
+# `pip install -e` this repo.  `git fetch` first if -b names a remote ref.
+#
+# Each run's stdout is in <outdir>/<variant>/run<N>/stdout.log and its log
+# output plus `/usr/bin/time -v` stats are in run.log alongside it.
+
+set -euo pipefail
+
+BASE_REV=origin/main
+TEST_REV=HEAD
+OUTDIR=$PWD/zarr-ab
+CONFIG=
+DANDISET=
+REPEAT=1
+
+while getopts "b:t:o:c:d:nh" opt; do
+    case $opt in
+        b) BASE_REV=$OPTARG ;;
+        t) TEST_REV=$OPTARG ;;
+        o) OUTDIR=$(realpath -m "$OPTARG") ;;
+        c) CONFIG=$(realpath "$OPTARG") ;;
+        d) DANDISET=$OPTARG ;;
+        n) REPEAT=2 ;;
+        h) sed -n '2,25p' "$0"; exit 0 ;;
+        *) exit 2 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+if [ $# -ne 1 ]; then
+    echo "Usage: $0 [options] ZARR_ID (-h for help)" >&2
+    exit 2
+fi
+ZARR_ID=$1
+REPO=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+
+mkdir -p "$OUTDIR"
+echo "Repo:     $REPO"
+echo "Baseline: $BASE_REV -> $(git -C "$REPO" rev-parse --short "$BASE_REV")"
+echo "Test:     $TEST_REV -> $(git -C "$REPO" rev-parse --short "$TEST_REV")"
+echo "Output:   $OUTDIR"
+
+# --- Set up an isolated checkout + venv per variant ------------------------
+
+setup() {  # setup NAME REV
+    local name=$1 rev=$2
+    local wt="$OUTDIR/$name/src" venv="$OUTDIR/$name/venv"
+    if [ ! -d "$wt" ]; then
+        git -C "$REPO" worktree add --detach "$wt" "$rev"
+    fi
+    if [ ! -d "$venv" ]; then
+        python3 -m venv "$venv"
+        "$venv/bin/pip" install -q -e "$wt"
+    fi
+    # The runner lives in the revision under test, but it only uses public
+    # API, so use one copy for both variants to keep the comparison honest.
+    cp "$REPO/tools/sync-one-zarr" "$OUTDIR/$name/sync-one-zarr"
+}
+
+# --- Run one backup -------------------------------------------------------
+
+run() {  # run NAME ATTEMPT
+    local name=$1 attempt=$2
+    local venv="$OUTDIR/$name/venv"
+    local root="$OUTDIR/$name/run$attempt"
+    local dsdir="$root/zarrs/$ZARR_ID"
+    rm -rf "$root"
+    mkdir -p "$root/zarrs"
+    local args=("$ZARR_ID" "$dsdir")
+    [ -n "$CONFIG" ] && args+=(-c "$CONFIG")
+    [ -n "$DANDISET" ] && args+=(--dandiset "$DANDISET")
+    echo "=== $name run$attempt ==="
+    /usr/bin/time -v "$venv/bin/python" "$OUTDIR/$name/sync-one-zarr" "${args[@]}" \
+        > "$root/stdout.log" 2> "$root/run.log" || {
+            echo "FAILED; see $root/run.log" >&2
+            tail -30 "$root/run.log" >&2
+            return 1
+        }
+    grep -E "^(ELAPSED_SECONDS)" "$root/stdout.log" || true
+    grep -E "Elapsed \(wall clock\)|Maximum resident|User time|System time" "$root/run.log"
+}
+
+# --- Fingerprint the resulting dataset ------------------------------------
+#
+# Commit SHAs are NOT comparable: custom_commit_env() pins GIT_AUTHOR_DATE but
+# the committer date comes from the wall clock, so two runs of *identical* code
+# produce different SHAs.  Neither are most of the git-annex branch's contents:
+# each `datalad create` mints a fresh repo UUID, `initremote` mints fresh
+# special-remote UUIDs, and every log line is stamped with the wall clock.
+#
+# So compare what is actually determined by the input:
+#   * the tree of each commit, and each commit's message and author identity
+#   * every path -> annex key mapping, from the working tree
+#   * the URLs registered for each key
+#   * which keys are recorded as present in the *web* remote, whose UUID is
+#     the well-known constant below (other remotes' UUIDs vary per run)
+
+WEB_UUID=00000000-0000-0000-0000-000000000001
+
+fingerprint() {  # fingerprint DSDIR OUTFILE
+    local ds=$1 out=$2
+    {
+        echo "## git log (tree, author, subject; committer date omitted -- not reproducible)"
+        git -C "$ds" log --reverse --format='%T %an <%ae> %aI %s' draft
+        echo
+        echo "## tree of draft HEAD"
+        git -C "$ds" rev-parse 'draft^{tree}'
+        echo
+        echo "## git tree entries"
+        git -C "$ds" ls-tree -r draft | sort
+        echo
+        echo "## path -> annex key (working tree symlinks)"
+        ( cd "$ds" && find . -path ./.git -prune -o -type l -printf '%P\t%l\n' \
+          | sed -E 's|\t.*/|\t|' | sort )
+        echo
+        echo "## registered URLs per key (timestamps stripped)"
+        { git -C "$ds" grep -I --no-color -e '' git-annex -- '*.log.web' || true; } \
+        | sed -E 's/^git-annex:([^:]*)\.log\.web:[0-9]+(\.[0-9]+)?s? /\1 /' \
+        | sort
+        echo
+        echo "## keys recorded present in the web remote"
+        { git -C "$ds" grep -I --no-color -e "$WEB_UUID" git-annex -- '*.log' || true; } \
+        | sed -E "s/^git-annex:([^:]*)\.log:[0-9]+(\.[0-9]+)?s? /\1 /" \
+        | sort
+    } > "$out"
+}
+
+# --- Go --------------------------------------------------------------------
+
+setup base "$BASE_REV"
+setup test "$TEST_REV"
+
+for attempt in $(seq 1 "$REPEAT"); do
+    run base "$attempt"
+    run test "$attempt"
+done
+
+BASE_DS="$OUTDIR/base/run1/zarrs/$ZARR_ID"
+TEST_DS="$OUTDIR/test/run1/zarrs/$ZARR_ID"
+fingerprint "$BASE_DS" "$OUTDIR/base.fingerprint"
+fingerprint "$TEST_DS" "$OUTDIR/test.fingerprint"
+
+echo
+echo "=== state comparison ==="
+if diff -u "$OUTDIR/base.fingerprint" "$OUTDIR/test.fingerprint" > "$OUTDIR/fingerprint.diff"; then
+    echo "IDENTICAL: same history, same trees, same keys, same registered URLs"
+else
+    echo "DIFFERENT: see $OUTDIR/fingerprint.diff"
+    head -60 "$OUTDIR/fingerprint.diff"
+    exit 1
+fi
+
+echo
+echo "=== git fsck (both) ==="
+git -C "$BASE_DS" fsck --no-progress && echo "base ok"
+git -C "$TEST_DS" fsck --no-progress && echo "test ok"
+
+echo
+echo "=== timings ==="
+for name in base test; do
+    for attempt in $(seq 1 "$REPEAT"); do
+        printf '%-5s run%s  %s\n' "$name" "$attempt" \
+            "$(grep -h ELAPSED_SECONDS "$OUTDIR/$name/run$attempt/stdout.log" | awk '{print $2 " s"}')"
+    done
+done

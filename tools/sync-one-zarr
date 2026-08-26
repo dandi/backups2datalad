@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""
+Back up a single Zarr into a fresh dataset directory.
+
+This calls `sync_zarr()` directly rather than going through
+`backups2datalad backup-zarrs`, which would back up every Zarr in a
+Dandiset.  Intended for A/B timing one Zarr between two versions of the code;
+see tools/compare-zarr-backup.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+from pathlib import Path
+import sys
+import time
+
+import anyio
+from dandi.consts import EmbargoStatus
+
+from backups2datalad.adandi import AsyncDandiClient
+from backups2datalad.config import BackupConfig, ResourceConfig
+from backups2datalad.logging import log
+from backups2datalad.manager import Manager
+from backups2datalad.zarr import sync_zarr
+
+
+def get_config(args: argparse.Namespace) -> BackupConfig:
+    if args.config is not None:
+        # Use the production config so that the run exercises the same code
+        # paths (in particular, `zarrs.remote` being set is what makes the
+        # `whereis` phase run at all).  GitHub orgs are cleared so that nothing
+        # is pushed anywhere.
+        config = BackupConfig.load_yaml(args.config)
+        config.dandisets.github_org = None
+        if config.zarrs is None:
+            sys.exit(f"{args.config}: no `zarrs` section configured")
+        config.zarrs.github_org = None
+    else:
+        config = BackupConfig(zarrs=ResourceConfig(path="zarrs"))
+    config.backup_root = args.dsdir.parent
+    if args.no_backup_remote and config.zarrs is not None:
+        config.zarrs.remote = None
+    return config
+
+
+async def amain(args: argparse.Namespace) -> None:
+    token = os.environ.get("DANDI_API_KEY")
+    if not token:
+        sys.exit("DANDI_API_KEY is not set")
+    config = get_config(args)
+    assert config.zarrs is not None
+    log.info(
+        "Backup remote: %s",
+        config.zarrs.remote.name if config.zarrs.remote is not None else "<none>",
+    )
+    async with AsyncDandiClient.for_dandi_instance(
+        config.dandi_instance, token=token
+    ) as client:
+        dandiset_id = args.dandiset
+        if dandiset_id is None:
+            info = await client.get(f"/zarr/{args.zarr_id}/")
+            try:
+                dandiset_id = info["dandiset"]
+            except KeyError:
+                sys.exit(
+                    f"Could not determine the Dandiset for Zarr {args.zarr_id}"
+                    f" from {info!r}; pass --dandiset"
+                )
+            log.info("Zarr %s belongs to Dandiset %s", args.zarr_id, dandiset_id)
+        d = await client.get_dandiset(dandiset_id, "draft")
+        asset = None
+        async for a in d.aget_zarr_assets():
+            if a.zarr == args.zarr_id:
+                asset = a
+                break
+        if asset is None:
+            sys.exit(f"Zarr {args.zarr_id} not found in Dandiset {dandiset_id}")
+        log.info("Backing up Zarr %s at %s", asset.zarr, asset.path)
+        manager = Manager(config=config, gh=None, log=log, token=token)
+        started = time.monotonic()
+        async with manager:
+            await sync_zarr(
+                asset,
+                asset.get_digest_value(),
+                args.dsdir,
+                manager.with_sublogger(f"Zarr {asset.zarr}"),
+                embargo_status=EmbargoStatus.OPEN,
+            )
+        elapsed = time.monotonic() - started
+    log.info("sync_zarr() took %.1f seconds", elapsed)
+    print(f"ELAPSED_SECONDS {elapsed:.3f}")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("zarr_id")
+    p.add_argument("dsdir", type=Path, help="dataset directory to create")
+    p.add_argument(
+        "--dandiset",
+        help="Dandiset owning the Zarr; looked up via the API if not given",
+    )
+    p.add_argument(
+        "-c",
+        "--config",
+        type=Path,
+        help=(
+            "production backups2datalad config to take the Zarr backup remote"
+            " from; without it the Zarr is backed up with no backup remote,"
+            " which skips the `whereis` phase entirely"
+        ),
+    )
+    p.add_argument(
+        "--no-backup-remote",
+        action="store_true",
+        help="drop the backup remote even when --config supplies one",
+    )
+    p.add_argument("-l", "--log-level", default="INFO")
+    args = p.parse_args()
+    logging.basicConfig(
+        format="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S%z",
+        level=getattr(logging, args.log_level.upper()),
+        force=True,
+    )
+    anyio.run(amain, args)
+
+
+if __name__ == "__main__":
+    main()
