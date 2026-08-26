@@ -245,12 +245,9 @@ class AsyncAnnex:
         corresponding key is not known to git-annex.
 
         Distinct keys are queried once each, however many times they appear in
-        ``keys``.  Zarr entries routinely share a key (identical chunk content
-        hashes the same), and `whereis` output for a key lists every URL ever
-        registered on it -- for a hot key in a large Zarr that is a single JSON
-        line tens of megabytes long.  Asking about it once per entry rather
-        than once per key made the registration phase quadratic in the number
-        of duplicated chunks.
+        ``keys``: Zarr entries routinely share a key, and `whereis` output for
+        a key lists every URL registered on it, which for a hot key in a large
+        Zarr is a single JSON line tens of megabytes long.
         """
         by_key: dict[str, list[str] | None] = {}
         unique = list(dict.fromkeys(keys))

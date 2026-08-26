@@ -24,7 +24,7 @@ import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream
 from anyio.streams.text import TextReceiveStream
 import httpx
-from linesep import TerminatedSplitter
+from linesep import SplitterEmptyError, TerminatedSplitter, get_newline_splitter
 
 from .consts import DEFAULT_WORKERS, GIT_OPTIONS
 from .logging import log
@@ -371,19 +371,9 @@ async def kill_on_error(
 class LineReceiveStream(anyio.abc.ObjectReceiveStream[str]):
     """
     Stream wrapper that splits strings from ``transport_stream`` on newlines
-    and returns each line individually, with its terminator retained.
+    and returns each line individually.  Requires the linesep_ package.
 
-    With ``newline=None`` (the default) this follows universal-newlines rules:
-    ``\n``, ``\r\n``, and a lone ``\r`` all terminate a line and are
-    translated to ``\n`` in the returned string.  A final line with no
-    terminator is returned as-is.
-
-    The splitting is incremental: each chunk received from the transport is
-    scanned once, and the pieces of a line are joined only when that line is
-    complete.  That matters because a single line can be very large -- ``git
-    annex whereis --json`` for a key with many registered URLs runs to tens of
-    megabytes -- and the obvious implementation (append to a buffer, re-scan
-    the buffer from the start) is quadratic in the length of the line.
+    .. _linesep: https://github.com/jwodder/linesep
     """
 
     def __init__(
@@ -394,103 +384,23 @@ class LineReceiveStream(anyio.abc.ObjectReceiveStream[str]):
         """
         :param transport_stream: any `str`-based receive stream
         :param newline:
-            ``None`` for universal-newlines mode (see above); otherwise the
-            exact string that terminates a line, retained untranslated
+            controls how universal newlines mode works; has the same set of
+            allowed values and semantics as the ``newline`` argument to
+            `open()`
         """
         self._stream = transport_stream
-        self._newline = newline
-        #: Pieces of the line currently being accumulated, none of which
-        #: contain a terminator
-        self._parts: list[str] = []
-        #: The chunk currently being scanned, and how far into it we have got
-        self._cur: str | None = None
-        self._pos: int = 0
-        #: Set when a chunk ended with a ``\r`` that might yet turn out to be
-        #: the first half of a ``\r\n``
-        self._carry_cr: bool = False
-        self._eof: bool = False
-
-    def _flush(self, tail: str = "") -> str:
-        if self._parts:
-            self._parts.append(tail)
-            line = "".join(self._parts)
-            self._parts.clear()
-            return line
-        return tail
-
-    def _find(self, s: str, pos: int) -> tuple[int, int] | None:
-        """
-        Locate the next terminator in ``s`` at or after ``pos``, returning its
-        span, or `None` if there is none.  Returns ``(-1, -1)`` to mean "``s``
-        ends with a ``\r`` whose meaning depends on the next chunk".
-        """
-        if self._newline is not None:
-            i = s.find(self._newline, pos)
-            return None if i < 0 else (i, i + len(self._newline))
-        i_n = s.find("\n", pos)
-        # Only look for a CR *before* the next LF, so that scanning a chunk of
-        # many LF-terminated lines stays linear in the chunk's length rather
-        # than re-scanning the tail once per line.
-        i_r = s.find("\r", pos) if i_n < 0 else s.find("\r", pos, i_n)
-        if i_r < 0:
-            return None if i_n < 0 else (i_n, i_n + 1)
-        if i_r == len(s) - 1:
-            return (-1, -1)
-        return (i_r, i_r + 2 if s[i_r + 1] == "\n" else i_r + 1)
-
-    def _take_line(self) -> str | None:
-        assert self._cur is not None
-        s, pos = self._cur, self._pos
-        if pos >= len(s):
-            return None
-        span = self._find(s, pos)
-        if span is None:
-            self._parts.append(s[pos:])
-            self._pos = len(s)
-            return None
-        start, end = span
-        if start < 0:
-            # Trailing CR: hold it back until we know whether an LF follows.
-            self._parts.append(s[pos : len(s) - 1])
-            self._carry_cr = True
-            self._pos = len(s)
-            return None
-        self._pos = end
-        sep = "\n" if self._newline is None else s[start:end]
-        return self._flush(s[pos:start] + sep)
+        self._splitter = get_newline_splitter(newline, retain=True)
 
     async def receive(self) -> str:
-        while True:
-            if self._cur is not None:
-                line = self._take_line()
-                if line is not None:
-                    return line
-                self._cur = None
-            if self._eof:
-                if self._carry_cr:
-                    self._carry_cr = False
-                    return self._flush("\n")
-                rest = self._flush()
-                if rest:
-                    return rest
-                raise anyio.EndOfStream()
+        while not self._splitter.nonempty and not self._splitter.closed:
             try:
-                data = await self._stream.receive()
+                self._splitter.feed(await self._stream.receive())
             except anyio.EndOfStream:
-                self._eof = True
-                continue
-            if not data:
-                continue
-            if self._carry_cr:
-                # The held CR terminates the pending line either way; an LF
-                # immediately after it is the rest of a CRLF and is consumed.
-                self._carry_cr = False
-                line = self._flush("\n")
-                self._cur = data
-                self._pos = 1 if data[0] == "\n" else 0
-                return line
-            self._cur = data
-            self._pos = 0
+                self._splitter.close()
+        try:
+            return self._splitter.get()
+        except SplitterEmptyError:
+            raise anyio.EndOfStream()
 
     async def aclose(self) -> None:
         await self._stream.aclose()
