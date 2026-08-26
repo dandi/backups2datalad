@@ -41,6 +41,21 @@ for line in sys.stdin:
     sys.stdout.flush()
 """
 
+# Answers each key with a `whereis --json`-shaped line, and records every key it
+# was asked about so the test can assert that duplicates were not re-queried.
+WHEREIS_SCRIPT = """\
+import json, sys
+seen = open(sys.argv[1], "w")
+for line in sys.stdin:
+    key = line.rstrip("\\n")
+    print(key, file=seen, flush=True)
+    sys.stdout.write(json.dumps({
+        "success": True, "key": key,
+        "whereis": [{"description": "[backup]"}], "untrusted": [],
+    }) + "\\n")
+    sys.stdout.flush()
+"""
+
 
 def pipe_buf_size() -> int:
     r, w = None, None
@@ -209,3 +224,39 @@ async def test_mkkeys_rejects_desynchronised_response(tmp_path: Path) -> None:
     async with annex:
         with pytest.raises(RuntimeError, match="does not start with the expected"):
             await annex.mkkeys([("foo.txt", 12, "0" * 32)])
+
+
+@pytest.mark.ai_generated
+async def test_get_keys_remotes_queries_each_key_once(tmp_path: Path) -> None:
+    """
+    Zarr entries routinely share a key, and `whereis` output for a key lists
+    every URL registered on it, so a hot key's response is enormous.  Each
+    distinct key must be asked about once, with the answer fanned back out to
+    every position it occupied.
+    """
+    asked = tmp_path / "asked.txt"
+
+    class WhereisAnnex(AsyncAnnex):
+        async def _get_proc(self, name: str) -> TextProcess:
+            try:
+                return self.procs[name]
+            except KeyError:
+                p = await anyio.open_process(
+                    [sys.executable, "-c", WHEREIS_SCRIPT, str(asked)],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=None,
+                )
+                assert p.stdout is not None
+                proc = TextProcess(
+                    p, LineReceiveStream(TextReceiveStream(p.stdout)), "whereis"
+                )
+                self.procs[name] = proc
+                return proc
+
+    keys = ["KEY-hot"] * 5000 + ["KEY-a", "KEY-hot", "KEY-b"]
+    annex = WhereisAnnex(tmp_path)
+    async with annex:
+        remotes = await annex.get_keys_remotes(keys)
+    assert remotes == [["backup"]] * len(keys)
+    assert asked.read_text().split() == ["KEY-hot", "KEY-a", "KEY-b"]

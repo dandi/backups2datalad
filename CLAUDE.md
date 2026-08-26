@@ -175,7 +175,20 @@ entry dominates the runtime.
   git-annex branch commit, and they get more expensive as the branch grows).
   Don't re-add that without measuring first.
 - The `whereis` lookup only exists to log "not in backup remote", so it is
-  skipped entirely when no backup remote is configured.
+  skipped entirely when no backup remote is configured, and
+  `get_keys_remotes()` queries each *distinct* key once.  That dedup is not
+  cosmetic: Zarr entries routinely share a key (identical chunk content hashes
+  the same), and `whereis --json` for a key lists every URL ever registered on
+  it -- for a hot key in a large Zarr that is one JSON line of tens of
+  megabytes.  Asking about it once per entry instead of once per key is what
+  made a 33k-entry Zarr take days.
+- `LineReceiveStream` (`aioutil.py`) splits that output incrementally, scanning
+  each chunk once and joining a line's pieces only when it is complete.  It
+  used to append to a buffer and re-scan it from the start on every chunk,
+  which is quadratic in the length of a single line: 33 s to read one 32 MiB
+  line, versus 0.04 s now.  Keep it linear -- and note it is byte-compatible
+  with the `linesep` universal-newline splitter it replaced (there is a
+  randomised parity test against it).
 - Pipelining means a desynchronised response stream would misattribute a whole
   chunk rather than a single response, so two guards exist: `render_request()`
   rejects a request containing an embedded newline (S3 object keys may contain

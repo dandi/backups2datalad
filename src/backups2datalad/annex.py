@@ -240,23 +240,33 @@ class AsyncAnnex:
         return key
 
     async def get_keys_remotes(self, keys: Sequence[str]) -> list[list[str] | None]:
-        # An entry is None if the corresponding key is not known to git-annex
-        remotes: list[list[str] | None] = []
+        """
+        Look up which remotes hold each of ``keys``; an entry is None if the
+        corresponding key is not known to git-annex.
 
-        def handle(_key: str, response: str) -> None:
+        Distinct keys are queried once each, however many times they appear in
+        ``keys``.  Zarr entries routinely share a key (identical chunk content
+        hashes the same), and `whereis` output for a key lists every URL ever
+        registered on it -- for a hot key in a large Zarr that is a single JSON
+        line tens of megabytes long.  Asking about it once per entry rather
+        than once per key made the registration phase quadratic in the number
+        of duplicated chunks.
+        """
+        by_key: dict[str, list[str] | None] = {}
+        unique = list(dict.fromkeys(keys))
+
+        def handle(key: str, response: str) -> None:
             whereis = json.loads(response)
             if whereis["success"]:
-                remotes.append(
-                    [
-                        w["description"].strip("[]")
-                        for w in whereis["whereis"] + whereis["untrusted"]
-                    ]
-                )
+                by_key[key] = [
+                    w["description"].strip("[]")
+                    for w in whereis["whereis"] + whereis["untrusted"]
+                ]
             else:
-                remotes.append(None)
+                by_key[key] = None
 
-        await self._batch("whereis", keys, lambda key: f"{key}\n", handle)
-        return remotes
+        await self._batch("whereis", unique, lambda key: f"{key}\n", handle)
+        return [by_key[key] for key in keys]
 
     async def get_key_remotes(self, key: str) -> list[str] | None:
         # Returns None if key is not known to git-annex
