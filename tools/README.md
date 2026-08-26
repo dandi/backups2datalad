@@ -76,9 +76,10 @@ tools/bench-zarr-registration -n 8000 --mode batched /tmp/bench/batched
 ```
 
 `--mode batched` prints a per-phase breakdown, which is the useful part: it
-says which git-annex command the time is going to.  `--journal-flush N`
-overrides `JOURNAL_FLUSH_INTERVAL` so the subprocess-restart behaviour can be
-measured rather than assumed.
+says which git-annex command the time is going to.  Measured on one machine
+with git-annex 10.20240129, it is `fromkey` -- around 5.7 ms/entry, roughly
+two thirds of the total, flat from n=2,000 to n=20,000 -- and batching cannot
+help with that, since it is git-annex's own symlink-and-stage work.
 
 The two modes must produce byte-identical repositories; the `fingerprint`
 function in `compare-zarr-backup` will tell you whether they did.

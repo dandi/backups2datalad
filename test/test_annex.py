@@ -160,37 +160,11 @@ async def test_batch_pairs_responses_across_chunks(tmp_path: Path) -> None:
 
 
 @pytest.mark.ai_generated
-async def test_batch_restarts_process_and_stays_in_sync(tmp_path: Path) -> None:
-    """
-    With ``restart_after`` set, the subprocess is torn down and respawned
-    mid-run; responses must still line up with their requests afterwards.
-    """
-    restart_after = BATCH_CHUNK_SIZE * 2
-    n = BATCH_CHUNK_SIZE * 5
-    items = [f"item{i:06d}" for i in range(n)]
-    seen: list[tuple[str, str]] = []
-    annex = EchoAnnex(tmp_path)
-    async with annex:
-        await annex._batch(
-            "registerurl",
-            items,
-            lambda it: f"{it}\n",
-            lambda it, resp: seen.append((it, resp.rstrip("\n"))),
-            restart_after=restart_after,
-        )
-        # Restarts after chunks 2 and 4, so 3 processes in total; `sent` is
-        # left holding only the requests made since the last restart.
-        assert annex.opened == 3
-        assert annex.sent["registerurl"] == BATCH_CHUNK_SIZE
-    assert seen == [(it, f"resp:{it}") for it in items]
-    assert annex.procs == {}
-
-
-@pytest.mark.ai_generated
 async def test_batch_discards_process_after_failure(tmp_path: Path) -> None:
     """
-    A subprocess that dies mid-chunk must not be reused: its stdout still
-    holds unread responses, so a later request would read a stale one.
+    A subprocess that dies mid-chunk must not be reused: its stdout could
+    still hold unread responses, so a later request would read a stale one.
+    The next call must get a fresh process and stay in sync on it.
     """
     annex = EchoAnnex(tmp_path)
     async with annex:
@@ -202,6 +176,18 @@ async def test_batch_discards_process_after_failure(tmp_path: Path) -> None:
         with pytest.raises(Exception, match="unhandled errors in a TaskGroup"):
             await annex._batch("fromkey", ["a", "b"], lambda it: f"{it}\n")
         assert "fromkey" not in annex.procs
+        assert annex.opened == 1
+        # A later call reopens and pairs responses correctly on the new process
+        seen: list[tuple[str, str]] = []
+        items = [f"item{i:04d}" for i in range(BATCH_CHUNK_SIZE + 5)]
+        await annex._batch(
+            "fromkey",
+            items,
+            lambda it: f"{it}\n",
+            lambda it, resp: seen.append((it, resp.rstrip("\n"))),
+        )
+        assert annex.opened == 2
+        assert seen == [(it, f"resp:{it}") for it in items]
 
 
 @pytest.mark.ai_generated

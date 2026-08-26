@@ -157,12 +157,22 @@ entry dominates the runtime.
   four whole-list phases (make keys → whereis → fromkey → registerurl) rather
   than five round trips per entry.  It logs progress once per chunk instead of
   once per URL; the per-chunk timestamps make it obvious which phase is slow.
+- Measured with `tools/bench-zarr-registration` (git-annex 10.20240129): the
+  batched path is ~1.5x the per-entry loop (8.5 vs 13.7 ms/entry), and the
+  per-entry cost is *flat* from n=500 to n=20,000 -- nothing here is
+  superlinear in the number of entries.  After batching, `examinekey` is
+  essentially free (0.03 ms/entry) and `fromkey` dominates at ~5.7 ms/entry,
+  which is git-annex's own work.  A production backup running far slower than
+  ~9 ms/entry is hitting something environmental, not this code path.
 - `registerurl` runs with `annex.alwayscompact=false`, and git-annex only
-  commits its journal to the git-annex branch when the process exits.  The
-  process is therefore restarted every `JOURNAL_FLUSH_INTERVAL` requests so the
-  flat `.git/annex/journal/` directory doesn't grow to one file per key.  This
-  is attached to `register_urls()`, so it applies to the Dandiset blob backup
-  and `register_s3` paths too, not just Zarrs.
+  commits its journal to the git-annex branch when the process exits, so a
+  batch process kept alive for a whole Zarr accumulates one journal file per
+  key in the flat `.git/annex/journal/`.  This *looks* like it should degrade,
+  and an earlier version of this code restarted the process periodically to
+  bound it -- but `tools/bench-zarr-registration` measured `registerurl` flat
+  at ~1.6 ms/entry from 16,000 to 40,000 journal files, while the restarts
+  themselves doubled its cost (each one forces a git-annex branch commit).
+  Don't re-add that without measuring first.
 - The `whereis` lookup only exists to log "not in backup remote", so it is
   skipped entirely when no backup remote is configured.
 - Pipelining means a desynchronised response stream would misattribute a whole

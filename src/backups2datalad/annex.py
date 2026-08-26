@@ -12,7 +12,7 @@ from typing import TypeVar
 import anyio
 
 from .aioutil import TextProcess, open_git_annex, stream_null_command
-from .consts import BATCH_CHUNK_SIZE, GIT_OPTIONS, JOURNAL_FLUSH_INTERVAL
+from .consts import BATCH_CHUNK_SIZE, GIT_OPTIONS
 from .logging import log
 from .util import format_errors
 
@@ -58,8 +58,6 @@ class AsyncAnnex:
     #: Open ``git annex --batch`` subprocesses, keyed as in `BATCH_COMMANDS`
     #: (plus ``"examinekey"``, whose command line depends on `digest_type`)
     procs: dict[str, TextProcess] = field(init=False, default_factory=dict)
-    #: Number of requests sent to each subprocess since it was last (re)started
-    sent: dict[str, int] = field(init=False, default_factory=lambda: defaultdict(int))
     locks: dict[str, anyio.Lock] = field(
         init=False, default_factory=lambda: defaultdict(anyio.Lock)
     )
@@ -75,7 +73,6 @@ class AsyncAnnex:
     ) -> None:
         procs = list(self.procs.values())
         self.procs.clear()
-        self.sent.clear()
         if exc_type is None:
             for p in procs:
                 await p.aclose()
@@ -109,7 +106,6 @@ class AsyncAnnex:
 
     async def _close_proc(self, name: str, force: bool = False) -> None:
         p = self.procs.pop(name, None)
-        self.sent.pop(name, None)
         if p is not None:
             if force:
                 await p.force_aclose()
@@ -148,7 +144,6 @@ class AsyncAnnex:
         render: Callable[[T], str],
         handle: Callable[[T, str], None] | None = None,
         *,
-        restart_after: int | None = None,
         progress: Callable[[int], None] | None = None,
     ) -> None:
         """
@@ -177,12 +172,9 @@ class AsyncAnnex:
                         await self._close_proc(name, force=True)
                     raise
                 done += len(chunk)
-                self.sent[name] += len(chunk)
                 if handle is not None:
                     for it, resp in zip(chunk, responses):
                         handle(it, resp)
-                if restart_after is not None and self.sent[name] >= restart_after:
-                    await self._close_proc(name)
                 if progress is not None:
                     progress(done)
 
@@ -293,7 +285,6 @@ class AsyncAnnex:
             keyurls,
             lambda ku: f"{ku[0]} {ku[1]}\n",
             handle,
-            restart_after=JOURNAL_FLUSH_INTERVAL,
             progress=progress,
         )
 

@@ -33,13 +33,3 @@ MAX_ZARR_SYNCS = 5
 # subprocess while its responses are read concurrently, instead of paying a
 # send-wait-receive round trip per request.
 BATCH_CHUNK_SIZE = 1000
-
-# Number of git-annex-branch-modifying batch requests (i.e. `registerurl`)
-# after which the batch process is closed & reopened.  git-annex only commits
-# its journal to the git-annex branch when the process exits, and every
-# journalled change is a separate file in the flat `.git/annex/journal/`
-# directory, so a process that is kept alive for a Zarr with tens of thousands
-# of entries ends up creating (and repeatedly looking up) files in a directory
-# with a comparable number of entries, which degrades badly.  Restarting the
-# process periodically bounds the journal size.
-JOURNAL_FLUSH_INTERVAL = 5000

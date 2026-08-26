@@ -127,10 +127,6 @@ async def register_batched(
 
 
 async def amain(args: argparse.Namespace) -> None:
-    if args.journal_flush is not None:
-        import backups2datalad.annex as _annex
-
-        _annex.JOURNAL_FLUSH_INTERVAL = args.journal_flush
     entries = make_entries(args.number)
     init_repo(args.repo)
     register = register_serial if args.mode == "serial" else register_batched
@@ -168,15 +164,6 @@ def main() -> None:
         help=(
             "skip the whereis lookup; production has zarrs.remote set, so"
             " leave it on for a representative comparison"
-        ),
-    )
-    p.add_argument(
-        "--journal-flush",
-        type=int,
-        help=(
-            "override JOURNAL_FLUSH_INTERVAL (how many registerurl requests"
-            " before the subprocess is restarted so git-annex commits its"
-            " journal); pass a huge number to disable restarting"
         ),
     )
     p.add_argument("-l", "--log-level", default="WARNING")
