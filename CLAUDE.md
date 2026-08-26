@@ -170,8 +170,9 @@ entry dominates the runtime.
   key in the flat `.git/annex/journal/`.  This *looks* like it should degrade,
   and an earlier version of this code restarted the process periodically to
   bound it -- but `tools/bench-zarr-registration` measured `registerurl` flat
-  at ~1.6 ms/entry from 16,000 to 40,000 journal files, while the restarts
-  themselves doubled its cost (each one forces a git-annex branch commit).
+  at ~1.7 ms/entry from 16,000 to 40,000 journal files, while the restarts
+  themselves cost +104% at n=8,000 and +139% at n=20,000 (each one forces a
+  git-annex branch commit, and they get more expensive as the branch grows).
   Don't re-add that without measuring first.
 - The `whereis` lookup only exists to log "not in backup remote", so it is
   skipped entirely when no backup remote is configured.
