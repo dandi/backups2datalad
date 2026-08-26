@@ -238,11 +238,14 @@ class ZarrSyncer:
                                 to_delete.add(str(entry))
                                 self.report.updated += 1
                 await self.prune_deleted(to_delete)
+                if self.backup_remote is not None:
+                    missing = await self.annex.get_keys_missing_from(self.backup_remote)
+                else:
+                    missing = set()
                 for entry in to_update:
                     key = await self.annex.mkkey(
                         entry.name, entry.size, entry.md5_digest
                     )
-                    remotes = await self.annex.get_key_remotes(key)
                     await self.annex.from_key(key, str(entry))
                     await self.register_url(str(entry), key, entry.bucket_url)
                     prefix = quote_plus(str(entry))
@@ -254,11 +257,7 @@ class ZarrSyncer:
                             f"?prefix={prefix}&download=true"
                         ),
                     )
-                    if (
-                        remotes is not None
-                        and self.backup_remote is not None
-                        and self.backup_remote not in remotes
-                    ):
+                    if key in missing:
                         self.log.info(
                             "%s: Not in backup remote %s",
                             entry,

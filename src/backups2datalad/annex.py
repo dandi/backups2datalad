@@ -10,7 +10,12 @@ from types import TracebackType
 
 import anyio
 
-from .aioutil import TextProcess, open_git_annex, stream_null_command
+from .aioutil import (
+    TextProcess,
+    open_git_annex,
+    stream_lines_command,
+    stream_null_command,
+)
 from .consts import GIT_OPTIONS
 from .logging import log
 from .util import format_errors
@@ -22,7 +27,6 @@ class AsyncAnnex:
     digest_type: str = "SHA256"
     pfromkey: TextProcess | None = None
     pexaminekey: TextProcess | None = None
-    pwhereis: TextProcess | None = None
     pregisterurl: TextProcess | None = None
     locks: dict[str, anyio.Lock] = field(
         init=False, default_factory=lambda: defaultdict(anyio.Lock)
@@ -41,7 +45,6 @@ class AsyncAnnex:
             for p in [
                 self.pfromkey,
                 self.pexaminekey,
-                self.pwhereis,
                 self.pregisterurl,
             ]:
                 if p is not None:
@@ -51,7 +54,6 @@ class AsyncAnnex:
                 for p in [
                     self.pfromkey,
                     self.pexaminekey,
-                    self.pwhereis,
                     self.pregisterurl,
                 ]:
                     if p is not None:
@@ -94,27 +96,33 @@ class AsyncAnnex:
             )
             return (await self.pexaminekey.receive()).strip()
 
-    async def get_key_remotes(self, key: str) -> list[str] | None:
-        # Returns None if key is not known to git-annex
-        async with self.locks["whereis"]:
-            if self.pwhereis is None:
-                self.pwhereis = await open_git_annex(
-                    "whereis",
-                    "--batch-keys",
-                    "--json",
-                    "--json-error-messages",
-                    path=self.repo,
-                    warn_on_fail=False,
-                )
-            await self.pwhereis.send(f"{key}\n")
-            whereis = json.loads(await self.pwhereis.receive())
-        if whereis["success"]:
-            return [
-                w["description"].strip("[]")
-                for w in whereis["whereis"] + whereis["untrusted"]
-            ]
-        else:
-            return None
+    async def get_keys_missing_from(self, remote: str) -> set[str]:
+        """
+        Return the keys that git-annex records as present somewhere but not in
+        ``remote``.
+
+        This is a single pass over the repository rather than a lookup per
+        key.  The obvious alternative, ``whereis``, also serialises every URL
+        registered on a key, and a Zarr key shared by many identical chunks
+        accumulates enough of those to make its output tens of megabytes.
+        """
+        keys = set()
+        async with aclosing(
+            stream_lines_command(
+                "git",
+                *GIT_OPTIONS,
+                "annex",
+                "findkeys",
+                "--copies=1",
+                "--not",
+                "--in",
+                remote,
+                cwd=self.repo,
+            )
+        ) as p:
+            async for key in p:
+                keys.add(key.rstrip("\n"))
+        return keys
 
     async def register_url(self, key: str, url: str) -> None:
         async with self.locks["registerurl"]:
