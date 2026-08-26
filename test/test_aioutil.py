@@ -15,12 +15,16 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import logging
+import random
 import threading
+import time
 
+import anyio
 import httpx
+from linesep import get_newline_splitter
 import pytest
 
-from backups2datalad.aioutil import arequest
+from backups2datalad.aioutil import LineReceiveStream, arequest
 
 pytestmark = pytest.mark.anyio
 
@@ -172,3 +176,104 @@ async def test_arequest_2xx_emits_no_error_diagnostics(
     assert counter["count"] == 1
     for record in caplog.records:
         assert record.levelno < logging.WARNING, record.getMessage()
+
+
+# ---------------------------------------------------------------------------
+# LineReceiveStream
+# ---------------------------------------------------------------------------
+
+
+class _Chunks:
+    """A minimal `str` receive stream that yields the given chunks."""
+
+    def __init__(self, chunks: list[str]) -> None:
+        self.chunks = list(chunks)
+
+    async def receive(self) -> str:
+        if not self.chunks:
+            raise anyio.EndOfStream()
+        return self.chunks.pop(0)
+
+    async def aclose(self) -> None:
+        pass
+
+    @property
+    def extra_attributes(self) -> dict:
+        return {}
+
+
+async def read_all(chunks: list[str]) -> list[str]:
+    stream = LineReceiveStream(_Chunks(chunks))  # type: ignore[arg-type]
+    lines = []
+    while True:
+        try:
+            lines.append(await stream.receive())
+        except anyio.EndOfStream:
+            return lines
+
+
+def split_with_linesep(chunks: list[str]) -> list[str]:
+    """The previous implementation, as a test oracle."""
+    splitter = get_newline_splitter(None, retain=True)
+    out: list[str] = []
+    for c in chunks:
+        splitter.feed(c)
+        out.extend(splitter.getall())
+    splitter.close()
+    out.extend(splitter.getall())
+    return out
+
+
+@pytest.mark.ai_generated
+@pytest.mark.parametrize(
+    "chunks,expected",
+    [
+        (["a\nb\n"], ["a\n", "b\n"]),
+        (["a\r\nb\r\n"], ["a\n", "b\n"]),
+        (["a\rb\r"], ["a\n", "b\n"]),
+        (["a\r", "\nb\n"], ["a\n", "b\n"]),
+        (["a\r", "b\n"], ["a\n", "b\n"]),
+        (["no-terminator"], ["no-terminator"]),
+        (["a\n\n\nb"], ["a\n", "\n", "\n", "b"]),
+        (["xxxxx\r"], ["xxxxx\n"]),
+        (["par", "tial ", "line\n"], ["partial line\n"]),
+        ([], []),
+    ],
+)
+async def test_line_receive_stream_universal_newlines(
+    chunks: list[str], expected: list[str]
+) -> None:
+    assert await read_all(chunks) == expected
+
+
+@pytest.mark.ai_generated
+async def test_line_receive_stream_matches_linesep() -> None:
+    """Randomised parity against the `linesep` splitter this replaced."""
+    rnd = random.Random(0xB2D)
+    for _ in range(2000):
+        text = "".join(
+            rnd.choice(["a", "b", "\n", "\r", "\r\n", "", "zz"])
+            for _ in range(rnd.randint(0, 14))
+        )
+        chunks, i = [], 0
+        while i < len(text):
+            j = min(len(text), i + rnd.randint(1, 4))
+            chunks.append(text[i:j])
+            i = j
+        assert await read_all(chunks) == split_with_linesep(chunks), chunks
+
+
+@pytest.mark.ai_generated
+async def test_line_receive_stream_long_line_is_linear() -> None:
+    """
+    A single very long line must not cost time quadratic in its length: the
+    previous implementation took ~33s to read 32 MiB of one.  The bound is
+    loose enough not to be flaky, but far below the quadratic cost.
+    """
+    line = "x" * (32 * 1024 * 1024) + "\n"
+    chunks = [line[i : i + 65536] for i in range(0, len(line), 65536)]
+    started = time.monotonic()
+    lines = await read_all(chunks)
+    elapsed = time.monotonic() - started
+    assert lines == [line]
+    assert elapsed < 5, f"reading a 32 MiB line took {elapsed:.1f}s"
