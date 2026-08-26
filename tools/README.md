@@ -20,13 +20,22 @@ directory (`./zarr-ab` by default), so the two runs can't contaminate each
 other, and each backup starts from an empty directory.  Nothing is pushed to
 GitHub: the GitHub orgs are cleared from the config before the run.
 
-Pass `-c` with the production config so that the run exercises the same code
-paths as production -- in particular, `zarrs.remote` being set is what makes
-the `whereis` phase run at all.  Without it the Zarr is backed up with no
-backup remote, which the current code skips `whereis` for entirely, making the
-comparison flattering rather than representative.  If the backup remote can't
-be initialised in your test environment (credentials, network), add
-`--no-backup-remote`... but then say so when quoting the numbers.
+### Nothing deployed is touched
+
+No deployed config is read, no deployed backup root is written to, and nothing
+is pushed to GitHub (the GitHub orgs are cleared from the config before the
+run).  The only production systems involved are the DANDI API and S3, both
+read-only: the run lists the Zarr's object versions to learn its entries.  The
+Zarr's content is never downloaded -- `fromkey` and `registerurl` only record
+metadata.
+
+`zarrs.remote` being set is what makes the `whereis` phase run at all, so a
+run with no backup remote is not representative.  Rather than borrowing the
+deployed one, a local `type=directory` remote is stood up inside the output
+directory: same code path, no credentials, no deployed storage.  `-c` will use
+a real config's remote instead if you want that, and `--no-backup-remote`
+drops the remote entirely -- but timings taken that way skip `whereis` and
+aren't comparable to production.
 
 `-n` runs each variant twice, which is worth doing: the first run of either
 variant pays for cold caches and the S3 listing.
@@ -51,6 +60,28 @@ What the script compares is everything the input actually determines:
 
 A clean run ends with `IDENTICAL`; otherwise the diff is left in
 `<outdir>/fingerprint.diff`.  Both datasets also get a `git fsck`.
+
+## `bench-zarr-registration`
+
+An isolated micro-benchmark of just the entry-registration phase -- the part
+the batching change actually affects.  Needs nothing but git-annex: no DANDI
+API, no S3, no DataLad, no config, no network.  It synthesises N Zarr entries
+with made-up digests and URLs and registers them into a throwaway repo, either
+`--mode serial` (one entry at a time, the pre-batching path, which works on
+both old and new revisions) or `--mode batched`.
+
+```shell
+tools/bench-zarr-registration -n 8000 --mode serial  /tmp/bench/serial
+tools/bench-zarr-registration -n 8000 --mode batched /tmp/bench/batched
+```
+
+`--mode batched` prints a per-phase breakdown, which is the useful part: it
+says which git-annex command the time is going to.  `--journal-flush N`
+overrides `JOURNAL_FLUSH_INTERVAL` so the subprocess-restart behaviour can be
+measured rather than assumed.
+
+The two modes must produce byte-identical repositories; the `fingerprint`
+function in `compare-zarr-backup` will tell you whether they did.
 
 ## `sync-one-zarr`
 

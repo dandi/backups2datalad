@@ -4,7 +4,10 @@
 # produced the same repository state.
 #
 # Both runs start from an empty directory, so this measures a from-scratch
-# Zarr backup.  Neither run pushes anything to GitHub.
+# Zarr backup.  Nothing deployed is touched: no deployed config is read, no
+# deployed backup root is written to, and nothing is pushed to GitHub.  The
+# only production systems involved are the DANDI API and S3, both read-only
+# (listing the Zarr's objects); the Zarr's content is never downloaded.  Neither run pushes anything to GitHub.
 #
 # Usage:
 #   tools/compare-zarr-backup [options] ZARR_ID
@@ -13,7 +16,8 @@
 #   -b REV     baseline revision to compare against  [default: origin/main]
 #   -t REV     revision under test                   [default: HEAD]
 #   -o DIR     output directory                      [default: ./zarr-ab]
-#   -c FILE    production config to take the Zarr backup remote from
+#   -c FILE    deployed config to take the Zarr backup remote from
+#              (not needed; a local directory remote is used by default)
 #   -d ID      Dandiset owning the Zarr (looked up via the API if omitted)
 #   -n         run each variant twice and report both timings
 #

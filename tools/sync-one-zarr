@@ -21,7 +21,7 @@ import anyio
 from dandi.consts import EmbargoStatus
 
 from backups2datalad.adandi import AsyncDandiClient
-from backups2datalad.config import BackupConfig, ResourceConfig
+from backups2datalad.config import BackupConfig, Remote, ResourceConfig
 from backups2datalad.logging import log
 from backups2datalad.manager import Manager
 from backups2datalad.zarr import sync_zarr
@@ -29,10 +29,10 @@ from backups2datalad.zarr import sync_zarr
 
 def get_config(args: argparse.Namespace) -> BackupConfig:
     if args.config is not None:
-        # Use the production config so that the run exercises the same code
-        # paths (in particular, `zarrs.remote` being set is what makes the
-        # `whereis` phase run at all).  GitHub orgs are cleared so that nothing
-        # is pushed anywhere.
+        # Reads the deployed config, and will `initremote` the real backup
+        # remote.  Nothing is written to the deployed backup root and nothing
+        # is pushed (the GitHub orgs are cleared below), but this does talk to
+        # the real backup storage, so it is opt-in.
         config = BackupConfig.load_yaml(args.config)
         config.dandisets.github_org = None
         if config.zarrs is None:
@@ -41,8 +41,21 @@ def get_config(args: argparse.Namespace) -> BackupConfig:
     else:
         config = BackupConfig(zarrs=ResourceConfig(path="zarrs"))
     config.backup_root = args.dsdir.parent
-    if args.no_backup_remote and config.zarrs is not None:
+    assert config.zarrs is not None
+    if args.no_backup_remote:
         config.zarrs.remote = None
+    elif config.zarrs.remote is None:
+        # `zarrs.remote` being set is what makes the `whereis` phase run at
+        # all, so a run with no backup remote is not representative of
+        # production.  Stand in a local directory remote: same code path, no
+        # credentials, no deployed storage, nothing outside the backup root.
+        fake = args.dsdir.parent / "fake-backup-remote"
+        fake.mkdir(parents=True, exist_ok=True)
+        config.zarrs.remote = Remote(
+            name="fake-backup",
+            type="directory",
+            options={"directory": str(fake), "encryption": "none"},
+        )
     return config
 
 
@@ -107,15 +120,20 @@ def main() -> None:
         "--config",
         type=Path,
         help=(
-            "production backups2datalad config to take the Zarr backup remote"
-            " from; without it the Zarr is backed up with no backup remote,"
-            " which skips the `whereis` phase entirely"
+            "deployed backups2datalad config to take the Zarr backup remote"
+            " from.  Not needed, and not recommended: by default a local"
+            " directory remote is stood up instead, which exercises the same"
+            " code path without touching deployed storage"
         ),
     )
     p.add_argument(
         "--no-backup-remote",
         action="store_true",
-        help="drop the backup remote even when --config supplies one",
+        help=(
+            "run with no backup remote at all.  This skips the `whereis`"
+            " phase, which production does not, so timings taken this way are"
+            " not comparable to production"
+        ),
     )
     p.add_argument("-l", "--log-level", default="INFO")
     args = p.parse_args()

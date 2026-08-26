@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""
+Micro-benchmark for the Zarr entry-registration phase, in isolation.
+
+Creates a throwaway git-annex repo, synthesises N Zarr entries, and registers
+them with git-annex the way `ZarrSyncer` does -- either one entry at a time
+(``serial``: what the code did before the batching change) or as whole-list
+batches (``batched``).
+
+Nothing outside the given directory is touched: no DANDI API, no S3, no
+DataLad, no GitHub, no config file, no deployed backup root.  The synthesised
+entries have made-up digests and URLs; git-annex never fetches them, since
+`fromkey`/`registerurl` only record metadata.
+
+This deliberately measures *only* what the batching change affects.  A real
+Zarr backup also lists S3 object versions, builds a checksum tree, and creates
+a DataLad dataset; none of that differs between the two code paths.
+
+  tools/bench-zarr-registration -n 5000 --mode serial  /tmp/bench/serial
+  tools/bench-zarr-registration -n 5000 --mode batched /tmp/bench/batched
+"""
+
+from __future__ import annotations
+
+import argparse
+from hashlib import md5
+import logging
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+from urllib.parse import quote, quote_plus
+
+import anyio
+
+from backups2datalad.annex import AsyncAnnex
+
+ZARR_ID = "00000000-0000-0000-0000-000000000000"
+API_URL = "https://api.dandiarchive.org/api"
+BUCKET_URL = "https://dandiarchive.s3.amazonaws.com"
+
+
+def make_entries(n: int) -> list[tuple[str, int, str, str, str]]:
+    """
+    (path, size, md5_digest, bucket_url, api_url) for `n` synthetic entries,
+    laid out like a real Zarr (nested chunk directories, chunk-shaped names).
+    """
+    entries = []
+    for i in range(n):
+        path = f"{i % 8}/{i // 8 % 64}_{i // 512 % 64}_{i % 64}"
+        digest = md5(path.encode()).hexdigest()
+        size = 4096 + (i % 977)
+        key = f"zarr/{ZARR_ID}/{path}"
+        entries.append(
+            (
+                path,
+                size,
+                digest,
+                f"{BUCKET_URL}/{quote(key)}?versionId={digest[:32]}",
+                f"{API_URL}/zarr/{ZARR_ID}/files"
+                f"?prefix={quote_plus(path)}&download=true",
+            )
+        )
+    return entries
+
+
+def init_repo(repo: Path) -> None:
+    if repo.exists():
+        shutil.rmtree(repo)
+    repo.mkdir(parents=True)
+
+    def run(*a: str) -> None:
+        subprocess.run(a, cwd=repo, check=True, capture_output=True)
+
+    run("git", "init", "-q", "-b", "draft")
+    run("git", "config", "user.name", "DANDI User")
+    run("git", "config", "user.email", "info@dandiarchive.org")
+    run("git", "config", "annex.backend", "MD5E")
+    run("git", "annex", "init", "-q", "bench")
+
+
+async def register_serial(
+    annex: AsyncAnnex, entries: list, whereis: bool
+) -> None:
+    """One entry at a time -- the pre-batching code path."""
+    for path, size, digest, bucket_url, api_url in entries:
+        name = path.rsplit("/", 1)[-1]
+        key = await annex.mkkey(name, size, digest)
+        if whereis:
+            await annex.get_key_remotes(key)
+        await annex.from_key(key, path)
+        await annex.register_url(key, bucket_url)
+        await annex.register_url(key, api_url)
+
+
+async def register_batched(
+    annex: AsyncAnnex, entries: list, whereis: bool
+) -> None:
+    """Whole-list batches -- what ZarrSyncer.update_entries() does."""
+    if not hasattr(annex, "mkkeys"):
+        sys.exit("This revision has no batch methods; --mode batched needs them")
+    t0 = time.monotonic()
+    keys = await annex.mkkeys(
+        [(path.rsplit("/", 1)[-1], size, digest) for path, size, digest, _, _ in entries]
+    )
+    t1 = time.monotonic()
+    if whereis:
+        await annex.get_keys_remotes(keys)
+    t2 = time.monotonic()
+    await annex.from_keys([(key, e[0]) for key, e in zip(keys, entries)])
+    t3 = time.monotonic()
+    keyurls = []
+    for key, (_path, _size, _digest, bucket_url, api_url) in zip(keys, entries):
+        keyurls.append((key, bucket_url))
+        keyurls.append((key, api_url))
+    await annex.register_urls(keyurls)
+    t4 = time.monotonic()
+    n = len(entries)
+    for label, dt in [
+        ("examinekey", t1 - t0),
+        ("whereis", t2 - t1),
+        ("fromkey", t3 - t2),
+        ("registerurl", t4 - t3),
+    ]:
+        print(f"PHASE {label:12s} {dt:8.3f} s  {dt / n * 1000:7.3f} ms/entry")
+
+
+async def amain(args: argparse.Namespace) -> None:
+    if args.journal_flush is not None:
+        import backups2datalad.annex as _annex
+
+        _annex.JOURNAL_FLUSH_INTERVAL = args.journal_flush
+    entries = make_entries(args.number)
+    init_repo(args.repo)
+    register = register_serial if args.mode == "serial" else register_batched
+    started = time.monotonic()
+    async with AsyncAnnex(args.repo, digest_type="MD5") as annex:
+        await register(annex, entries, args.whereis)
+    elapsed = time.monotonic() - started
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "bench"],
+        cwd=args.repo,
+        check=True,
+        capture_output=True,
+        env={
+            **__import__("os").environ,
+            "GIT_AUTHOR_DATE": "2020-01-01T00:00:00+0000",
+            "GIT_COMMITTER_DATE": "2020-01-01T00:00:00+0000",
+        },
+    )
+    print(f"mode={args.mode} entries={args.number} whereis={args.whereis}")
+    print(f"ELAPSED_SECONDS {elapsed:.3f}")
+    print(f"PER_ENTRY_MS {elapsed / args.number * 1000:.3f}")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument("repo", type=Path, help="throwaway repo directory (recreated)")
+    p.add_argument("-n", "--number", type=int, default=5000)
+    p.add_argument("--mode", choices=["serial", "batched"], default="batched")
+    p.add_argument(
+        "--no-whereis",
+        dest="whereis",
+        action="store_false",
+        help=(
+            "skip the whereis lookup; production has zarrs.remote set, so"
+            " leave it on for a representative comparison"
+        ),
+    )
+    p.add_argument(
+        "--journal-flush",
+        type=int,
+        help=(
+            "override JOURNAL_FLUSH_INTERVAL (how many registerurl requests"
+            " before the subprocess is restarted so git-annex commits its"
+            " journal); pass a huge number to disable restarting"
+        ),
+    )
+    p.add_argument("-l", "--log-level", default="WARNING")
+    args = p.parse_args()
+    logging.basicConfig(
+        format="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
+        level=getattr(logging, args.log_level.upper()),
+        force=True,
+    )
+    anyio.run(amain, args)
+
+
+if __name__ == "__main__":
+    main()
