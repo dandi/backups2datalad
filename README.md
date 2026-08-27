@@ -222,9 +222,42 @@ the subcommands.
 - `register-s3urls` — Ensure that all blob assets in the backup of the given
   Dandiset have their S3 URLs registered with git-annex
 
+- `check-largefiles` — Report files in Dandiset mirrors that are stored on the
+  wrong side of the `annex.largefiles` policy (see "Storage policy" below)
+
 Run `backups2datalad <subcommand> --help` for further details on each
 subcommand.
 
 The primary mirroring subcommands are `update-from-backup`, `populate`, and
 `populate-zarrs`; the other subcommands are for minor/maintenance tasks and
 usually do not need to be run.
+
+
+Storage policy
+==============
+
+Whether a file in a Dandiset mirror is stored in Git or in git-annex is decided
+by the `annex.largefiles` setting in the mirror's `.gitattributes`, which
+`backups2datalad` manages via the `cfg_dandi_text2git` procedure (a fixed-up
+version of DataLad's `text2git`):
+
+    * annex.largefiles=(((mimeencoding=binary)and(largerthan=0))or(largerthan=10MiB))
+    **/.git* annex.largefiles=nothing
+
+That is, text files are stored in Git, while binary files and files larger than
+10 MiB — including Dandiset metadata such as `.dandi/assets.json` — are stored
+in git-annex.  Only Git's own files are exempt, as they can never be annexed.
+
+The procedure is applied when a mirror is created and, for mirrors created
+under an older policy, on every `update-from-backup` run, which commits the
+updated `.gitattributes` using the date of the mirror's current HEAD commit so
+as not to introduce a jump in commit timestamps.  It can also be applied by
+hand to a single dataset with:
+
+    DATALAD_LOCATIONS_EXTRA__PROCEDURES=$(python -c 'import backups2datalad.procedures as p; print(p.PROCEDURES_PATH)') \
+        datalad run-procedure -d path/to/mirror cfg_dandi_text2git
+
+Note that `annex.largefiles` is only consulted when a file is added to a
+dataset, so changing the policy does not move any files that are already
+committed; `backups2datalad check-largefiles` reports which files would move
+the next time they are written.

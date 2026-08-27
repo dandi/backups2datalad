@@ -27,7 +27,14 @@ from zarr_checksum.tree import ZarrChecksumTree
 from .aioutil import areadcmd, aruncmd, stream_lines_command, stream_null_command
 from .config import BackupConfig, Remote
 from .consts import DEFAULT_BRANCH, GIT_OPTIONS
+from .gitattributes import (
+    TEXT_SIZE_LIMIT_BYTES,
+    is_exempt,
+    looks_textual,
+    set_policy,
+)
 from .logging import log
+from .procedures import DANDI_TEXT2GIT, DANDI_TEXT2GIT_PROCEDURE
 from .util import custom_commit_env, exp_wait, fromisoformat, is_meta_file, key2hash
 
 EMBARGO_STATUS_KEY = "dandi.dandiset.embargo-status"
@@ -62,7 +69,7 @@ class AsyncDataset:
         commit_date: datetime | None = None,
         backup_remote: Remote | None = None,
         backend: str = "SHA256E",
-        cfg_proc: str | None = "text2git",
+        cfg_proc: str | None = DANDI_TEXT2GIT,
         embargo_status: EmbargoStatus = EmbargoStatus.OPEN,
     ) -> bool:
         # Returns True if the dataset was freshly created
@@ -108,6 +115,40 @@ class AsyncDataset:
                 "(not metadata=distribution-restrictions=*)",
             )
         log.debug("Dataset for %s created", desc)
+        return True
+
+    async def ensure_gitattributes(
+        self, desc: str, commit_date: datetime | None = None
+    ) -> bool:
+        """
+        Ensure that the dataset's ``.gitattributes`` matches the current
+        ``annex.largefiles`` policy, committing any change.
+
+        Returns `True` if a commit was made.  ``commit_date`` should normally be
+        the date of the current HEAD commit, so that bringing an old backup up
+        to the current policy does not introduce a jump in commit timestamps.
+        """
+        # Running the procedure means starting up `datalad`, which is not worth
+        # doing for the datasets (i.e., nearly all of them, nearly all of the
+        # time) that already comply with the policy:
+        try:
+            attributes = (self.pathobj / ".gitattributes").read_text()
+        except FileNotFoundError:
+            attributes = ""
+        if attributes == set_policy(attributes):
+            return False
+        before = await self.get_commit_hash()
+        await aruncmd(
+            "datalad",
+            "run-procedure",
+            "--dataset",
+            self.path,
+            DANDI_TEXT2GIT_PROCEDURE,
+            env=custom_commit_env(commit_date),
+        )
+        if await self.get_commit_hash() == before:
+            return False
+        log.info("%s: Updated .gitattributes to current largefiles policy", desc)
         return True
 
     async def ensure_dandi_provider(self, api_url: str) -> None:
@@ -603,6 +644,47 @@ class AsyncDataset:
                 filedict[f.file] = replace(filedict[f.file], size=f.bytesize)
         return list(filedict.values())
 
+    async def get_largefiles_impact(
+        self, limit: int = TEXT_SIZE_LIMIT_BYTES
+    ) -> LargefilesImpact:
+        """
+        Report which files in the dataset's HEAD commit are stored on the wrong
+        side of the current ``annex.largefiles`` policy.
+
+        `annex.largefiles` is only consulted when a file is added, so changing
+        the policy does not move anything by itself; this reports what would
+        move the next time each file is added anew.
+        """
+        annexed: dict[str, int] = {}
+        async with aclosing(self.aiter_annexed_files()) as afiles:
+            async for f in afiles:
+                annexed[f.file] = f.bytesize
+        impact = LargefilesImpact(path=self.pathobj, limit=limit)
+        async with aclosing(
+            stream_null_command("git", "ls-tree", "-lrz", "HEAD", cwd=self.pathobj)
+        ) as p:
+            async for entry in p:
+                fst = FileStat.from_entry(entry)
+                if fst.type is not ObjectType.BLOB or is_exempt(fst.path):
+                    # Submodules (Zarrs) have their own policy, and Git's own
+                    # files are exempt from the size limit
+                    continue
+                if (size := annexed.get(fst.path)) is not None:
+                    # Annexed files that are small enough to go into Git *and*
+                    # appear to be text.  Whether git-annex would actually
+                    # consider them text depends on their content, which we do
+                    # not necessarily have, hence "maybe".
+                    if size <= limit and looks_textual(fst.path):
+                        impact.maybe_to_git.append(FileStat(fst.path, fst.type, size))
+                else:
+                    # Anything currently in Git already passed the "binary"
+                    # half of the policy when it was added, so size alone
+                    # decides whether it now belongs in git-annex.
+                    assert fst.size is not None
+                    if fst.size > limit:
+                        impact.to_annex.append(fst)
+        return impact
+
     async def aiter_annexed_files(self) -> AsyncGenerator[AnnexedFile, None]:
         async with aclosing(
             stream_lines_command(
@@ -926,6 +1008,40 @@ class FileStat:
             type=ObjectType(typename),
             size=None if sizestr == "-" else int(sizestr),
         )
+
+
+@dataclass
+class LargefilesImpact:
+    """
+    Files that are stored on the wrong side of the current
+    ``annex.largefiles`` policy; see `AsyncDataset.get_largefiles_impact()`.
+    """
+
+    #: Path to the dataset
+    path: Path
+    #: Size limit that the report was made against
+    limit: int
+    #: Files stored in Git that the policy would now put into git-annex
+    to_annex: list[FileStat] = field(default_factory=list)
+    #: Annexed files that the policy would likely now put into Git.  This is
+    #: approximate: it is based on the filenames, as deciding for certain
+    #: requires the files' contents, which may not be present locally.
+    maybe_to_git: list[FileStat] = field(default_factory=list)
+
+    @property
+    def to_annex_size(self) -> int:
+        return sum(f.size or 0 for f in self.to_annex)
+
+    @property
+    def maybe_to_git_size(self) -> int:
+        return sum(f.size or 0 for f in self.maybe_to_git)
+
+    @property
+    def largest_in_git(self) -> FileStat | None:
+        return max(self.to_annex, key=lambda f: f.size or 0, default=None)
+
+    def __bool__(self) -> bool:
+        return bool(self.to_annex or self.maybe_to_git)
 
 
 @dataclass

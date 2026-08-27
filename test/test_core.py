@@ -12,12 +12,14 @@ from dandi.utils import yaml_load
 from datalad.api import Dataset
 from datalad.tests.utils_pytest import assert_repo_status, ok_file_under_git
 import pytest
+from test_gitattributes import TEXT2GIT
 from test_util import GitRepo
 
 from backups2datalad.adataset import AssetsState, AsyncDataset
 from backups2datalad.config import BackupConfig
 from backups2datalad.consts import DEFAULT_BRANCH
 from backups2datalad.datasetter import DandiDatasetter
+from backups2datalad.gitattributes import set_policy
 
 log = logging.getLogger("test_backups2datalad.test_core")
 
@@ -424,3 +426,51 @@ async def test_custom_commit_date(tmp_path: Path) -> None:
     repo = GitRepo(tmp_path)
     assert repo.get_commit_date("HEAD") == "2021-06-01T12:34:56+00:00"
     assert repo.get_commit_author("HEAD") == "DANDI User <info@dandiarchive.org>"
+
+
+@pytest.mark.ai_generated
+async def test_gitattributes_policy_migration(
+    docker_archive: Archive, text_dandiset: SampleDandiset, tmp_path: Path
+) -> None:
+    """
+    A Dandiset that has not changed on the server is still brought up to the
+    current `annex.largefiles` policy.
+    """
+    di = DandiDatasetter(
+        dandi_client=text_dandiset.client,
+        config=BackupConfig(
+            backup_root=tmp_path,
+            dandi_instance=docker_archive.instance_id,
+            s3bucket=docker_archive.s3bucket,
+            s3endpoint=docker_archive.s3endpoint,
+            content_url_regex=f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/",
+        ),
+    )
+    dandiset_id = text_dandiset.dandiset_id
+    log.info("test_gitattributes_policy_migration: Syncing test dandiset")
+    await di.update_from_backup([dandiset_id])
+
+    dspath = tmp_path / "dandisets" / dandiset_id
+    ds = AsyncDataset(dspath)
+    assert (dspath / ".gitattributes").read_text() == set_policy(TEXT2GIT)
+
+    # Put the mirror back into the state that `datalad create -c text2git`
+    # would have left it in:
+    (dspath / ".gitattributes").write_text(TEXT2GIT)
+    await ds.save("Restore legacy .gitattributes")
+    repo = GitRepo(dspath)
+    commits_before = int(repo.readcmd("rev-list", "--count", "HEAD"))
+    commit_date = await ds.get_last_commit_date()
+
+    # The Dandiset has not been modified on the server, so nothing is synced,
+    # but the policy is applied all the same:
+    await di.update_from_backup([dandiset_id])
+    assert (dspath / ".gitattributes").read_text() == set_policy(TEXT2GIT)
+    assert int(repo.readcmd("rev-list", "--count", "HEAD")) == commits_before + 1
+    # ... without introducing a jump in commit timestamps:
+    assert await ds.get_last_commit_date() == commit_date
+    assert_repo_status(ds.path)
+
+    # A further run makes no further commits:
+    await di.update_from_backup([dandiset_id])
+    assert int(repo.readcmd("rev-list", "--count", "HEAD")) == commits_before + 1

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import random
+import subprocess
 import sys
 import textwrap
 from types import TracebackType
@@ -22,7 +23,8 @@ from datalad.support.json_py import dump
 
 from .config import BackupConfig
 from .consts import MINIMUM_GIT_ANNEX_VERSION
-from .logging import PrefixedLogger
+from .logging import PrefixedLogger, log
+from .procedures import PROCEDURES_PATH
 
 if TYPE_CHECKING:
     from .adandi import RemoteAsset, RemoteDandiset
@@ -54,15 +56,11 @@ class AssetTracker:
         filepath = dspath / ".dandi" / "assets.json"
         local_assets = set(dataset_files(dspath))
         asset_metadata: dict[str, dict] = {}
-        try:
-            with filepath.open() as fp:
-                for md in json.load(fp):
-                    if isinstance(md, str):
-                        raise RuntimeError(f"Old assets.json format found in {dspath}")
-                    else:
-                        asset_metadata[md["path"].lstrip("/")] = md
-        except FileNotFoundError:
-            pass
+        for md in load_metadata_json(filepath):
+            if isinstance(md, str):
+                raise RuntimeError(f"Old assets.json format found in {dspath}")
+            else:
+                asset_metadata[md["path"].lstrip("/")] = md
         return cls(
             filepath=filepath, local_assets=local_assets, asset_metadata=asset_metadata
         )
@@ -130,8 +128,37 @@ class AssetTracker:
         return len(self.future_assets)
 
 
+def load_metadata_json(filepath: Path) -> Any:
+    """
+    Read a JSON metadata file (e.g., ``.dandi/assets.json``) from a dataset,
+    returning an empty list if it does not exist.
+
+    Such a file is normally stored in Git, but a large enough one is put into
+    git-annex (see `backups2datalad.gitattributes`), in which case its content
+    has to be fetched if it is not present locally.
+    """
+    try:
+        with filepath.open() as fp:
+            return json.load(fp)
+    except FileNotFoundError:
+        if not filepath.is_symlink():
+            # The file simply does not exist
+            return []
+        # The file is annexed and its content is not present locally
+        log.info("%s is annexed and not present locally; fetching", filepath)
+        subprocess.run(
+            ["git", "annex", "get", "--", filepath.name],
+            cwd=filepath.parent,
+            check=True,
+        )
+        with filepath.open() as fp:
+            return json.load(fp)
+
+
 def custom_commit_env(dt: datetime | None) -> dict[str, str]:
     env = os.environ.copy()
+    # Make the procedures shipped with this package discoverable by `datalad`:
+    env["DATALAD_LOCATIONS_EXTRA__PROCEDURES"] = str(PROCEDURES_PATH)
     if dt is not None:
         env["GIT_AUTHOR_NAME"] = "DANDI User"
         env["GIT_AUTHOR_EMAIL"] = "info@dandiarchive.org"

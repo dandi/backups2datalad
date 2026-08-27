@@ -10,21 +10,23 @@ from pathlib import Path
 import re
 import shlex
 import sys
-from typing import Concatenate, ParamSpec
+from typing import Any, Concatenate, ParamSpec
 
 import asyncclick as click
 import dandi
 from dandi.consts import DANDISET_ID_REGEX, EmbargoStatus
 import dandischema
 from datalad.api import Dataset
+from humanize import naturalsize
 
 from . import __version__
 from .adandi import AsyncDandiClient
-from .adataset import AsyncDataset
+from .adataset import AsyncDataset, LargefilesImpact
 from .aioutil import pool_amap, stream_lines_command
 from .config import BackupConfig, Mode, ZarrMode
 from .consts import GIT_OPTIONS
 from .datasetter import DandiDatasetter
+from .gitattributes import TEXT_SIZE_LIMIT, parse_size
 from .logging import log
 from .register_s3 import register_s3urls
 from .util import check_git_annex_version, format_errors, pdb_excepthook, quantify
@@ -511,6 +513,131 @@ async def populate_zarrs(
             sys.exit(f"{quantify(len(report.failed), 'populate-zarr job')} failed")
 
 
+@main.command("check-largefiles")
+@click.option(
+    "-e",
+    "--exclude",
+    help="Skip dandisets matching the given regex",
+    metavar="REGEX",
+    type=re.compile,
+)
+@click.option(
+    "-l",
+    "--limit",
+    default=TEXT_SIZE_LIMIT,
+    help="Size limit to report against  [default: the configured policy]",
+    metavar="SIZE",
+    show_default=False,
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit the report as JSON")
+@click.option("-w", "--workers", type=int, help="Number of workers to run concurrently")
+@click.argument("dandisets", nargs=-1)
+@click.pass_obj
+async def check_largefiles_cmd(
+    datasetter: DandiDatasetter,
+    dandisets: Sequence[str],
+    exclude: re.Pattern[str] | None,
+    limit: str,
+    as_json: bool,
+    workers: int | None,
+) -> None:
+    """
+    Report files stored on the wrong side of the `annex.largefiles` policy.
+
+    For each Dandiset mirror, this lists the files that are stored in Git but
+    that the current policy would put into git-annex (because they are larger
+    than the size limit), and, approximately, the files that are annexed but
+    that the policy would now put into Git.
+
+    Note that `annex.largefiles` is only consulted when a file is added, so
+    nothing moves until a listed file is next written.  This command makes no
+    changes and contacts no servers.
+    """
+    check_git_annex_version()
+    try:
+        limit_bytes = parse_size(limit)
+    except ValueError as e:
+        raise click.UsageError(str(e))
+    async with datasetter:
+        if workers is not None:
+            datasetter.config.workers = workers
+        if dandisets:
+            diriter = (datasetter.config.dandiset_root / d for d in dandisets)
+        else:
+            diriter = datasetter.config.dandiset_root.iterdir()
+        dirs: list[Path] = []
+        for p in diriter:
+            if p.is_dir() and re.fullmatch(DANDISET_ID_REGEX, p.name):
+                if exclude is not None and exclude.search(p.name):
+                    log.debug("Skipping dandiset %s", p.name)
+                else:
+                    dirs.append(p)
+            else:
+                log.debug("Skipping non-Dandiset node %s", p.name)
+        report = await pool_amap(
+            partial(get_largefiles_impact, limit=limit_bytes),
+            afilter_installed(sorted(dirs)),
+            workers=datasetter.config.workers,
+        )
+        impacts = sorted(
+            (impact for _, impact in report.results), key=lambda i: i.path.name
+        )
+        if as_json:
+            print(
+                json.dumps(
+                    [impact_to_dict(impact) for impact in impacts],
+                    indent=4,
+                )
+            )
+        else:
+            print_largefiles_report(impacts, limit_bytes)
+        if report.failed:
+            sys.exit(f"{quantify(len(report.failed), 'check-largefiles job')} failed")
+
+
+async def get_largefiles_impact(dirpath: Path, limit: int) -> LargefilesImpact:
+    return await AsyncDataset(dirpath).get_largefiles_impact(limit)
+
+
+def impact_to_dict(impact: LargefilesImpact) -> dict[str, Any]:
+    return {
+        "dandiset": impact.path.name,
+        "limit": impact.limit,
+        "to_annex": [{"path": f.path, "size": f.size} for f in impact.to_annex],
+        "maybe_to_git": [
+            {"path": f.path, "size": f.size} for f in impact.maybe_to_git
+        ],
+    }
+
+
+def print_largefiles_report(impacts: list[LargefilesImpact], limit: int) -> None:
+    print(f"Reporting against a size limit of {naturalsize(limit)}\n")
+    header = f"{'DANDISET':10} {'TO ANNEX':>9} {'SIZE':>10} {'TO GIT?':>8}  LARGEST IN GIT"
+    print(header)
+    print("-" * len(header))
+    for impact in impacts:
+        if not impact:
+            continue
+        if (largest := impact.largest_in_git) is not None:
+            worst = f"{largest.path} ({naturalsize(largest.size or 0)})"
+        else:
+            worst = "-"
+        print(
+            f"{impact.path.name:10} {len(impact.to_annex):9}"
+            f" {naturalsize(impact.to_annex_size):>10}"
+            f" {len(impact.maybe_to_git):8}  {worst}"
+        )
+    total_annex = sum(len(i.to_annex) for i in impacts)
+    total_size = sum(i.to_annex_size for i in impacts)
+    total_git = sum(len(i.maybe_to_git) for i in impacts)
+    print(
+        f"\n{quantify(len(impacts), 'Dandiset')} checked:"
+        f" {quantify(total_annex, 'file')} ({naturalsize(total_size)}) in Git"
+        f" would now be annexed,"
+        f" {quantify(total_git, 'annexed file')} would now be in Git"
+    )
+
+
 @main.command()
 @click.argument(
     "dirpath", type=click.Path(file_okay=False, exists=True, path_type=Path)
@@ -568,7 +695,10 @@ async def populate(
         i = 0
         while True:
             try:
-                # everything but content of .dandi/ should be moved to backup
+                # Note that `.dandi/` used to be excluded here, back when
+                # everything in it was guaranteed to be stored in Git; a large
+                # enough `.dandi/assets.json` is now annexed and thus needs to
+                # be copied to the backup remote like anything else.
                 await call_annex_json(
                     "copy",
                     "-c",
@@ -582,8 +712,6 @@ async def populate(
                     "--not",
                     "--in",
                     backup_remote,
-                    "--exclude",
-                    ".dandi/*",
                     path=dirpath,
                 )
             except RuntimeError as e:

@@ -96,6 +96,12 @@ class DandiDatasetter(AsyncResource):
         exclude: re.Pattern[str] | None = None,
     ) -> None:
         superds = await self.ensure_superdataset()
+        # `ensure_superdataset()` is called on every run of every command, so
+        # the policy is applied here rather than there in order to keep the
+        # commit-making to the mirroring commands.
+        await superds.ensure_gitattributes(
+            desc="superdataset", commit_date=await superds.get_last_commit_date()
+        )
         report = await pool_amap(
             self.update_dandiset,
             self.get_dandisets(dandiset_ids, exclude=exclude),
@@ -205,6 +211,15 @@ class DandiDatasetter(AsyncResource):
         if dandiset.embargo_status is EmbargoStatus.EMBARGOED:
             await ds.ensure_dandi_provider(self.dandi_client.api_url)
         dmanager = self.manager.with_sublogger(f"Dandiset {dandiset.identifier}")
+        # Bring backups made under an older `annex.largefiles` policy up to the
+        # current one.  This is done before the check for changes on the server
+        # below so that every Dandiset is updated, not just the ones that are
+        # being synced.  The date of the current HEAD commit is used as the
+        # commit date so as not to introduce a jump in commit timestamps.
+        reconfigured = await ds.ensure_gitattributes(
+            desc=f"Dandiset {dandiset.identifier}",
+            commit_date=await ds.get_last_commit_date(),
+        )
         state = ds.get_assets_state()
         if (
             dmanager.config.mode is Mode.FORCE
@@ -227,6 +242,7 @@ class DandiDatasetter(AsyncResource):
                 "Remote Dandiset has not been modified since last backup; not syncing"
             )
             changed = False
+        changed = changed or reconfigured
         await self.ensure_github_remote(ds, dandiset.identifier)
         await self.tag_releases(
             dandiset, ds, push=self.config.gh_org is not None, log=dmanager.log

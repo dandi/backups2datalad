@@ -180,6 +180,42 @@ async def test_my_new_feature() -> None:
 
 This allows filtering or identifying AI-generated tests separately if needed.
 
+## Storage Policy (`annex.largefiles`)
+
+Whether a file in a Dandiset mirror goes into Git or git-annex is decided by
+`annex.largefiles` in the mirror's `.gitattributes`.  DataLad's stock `text2git`
+procedure puts *every* text file into Git regardless of size, which resulted in
+Dandisets with huge text assets committed directly to Git, so the tool ships its
+own procedure instead:
+
+```
+* annex.largefiles=(((mimeencoding=binary)and(largerthan=0))or(largerthan=10MiB))
+**/.git* annex.largefiles=nothing
+```
+
+Note that the exemption for Git's own files comes *after* the general rule;
+`.gitattributes` gives precedence to the last matching line, and `text2git` gets
+this backwards.  Nothing else is exempt: `.dandi/assets.json` and other metadata
+are annexed once they exceed the limit.
+
+Implementation:
+- `gitattributes.py` — single source of truth for the policy: `TEXT_SIZE_LIMIT`,
+  `LARGEFILES_EXPRESSION`, `POLICY`, and the idempotent `apply_policy()`
+- `procedures/cfg_dandi_text2git.py` — the DataLad procedure, which calls
+  `apply_policy()` and commits; discoverable because `util.custom_commit_env()`
+  sets `DATALAD_LOCATIONS_EXTRA__PROCEDURES`
+- `AsyncDataset.ensure_installed()` passes `cfg_proc="dandi_text2git"` to
+  `datalad create` (Zarr datasets pass `cfg_proc=None` and are unaffected)
+- `AsyncDataset.ensure_gitattributes()` runs the procedure on an existing
+  dataset; called from `DandiDatasetter.update_dandiset()` *before* the check
+  for server-side changes (so that unchanged Dandisets are migrated too) and
+  from `ensure_superdataset()`.  The commit is made with the date of the current
+  HEAD commit so as not to introduce a jump in commit timestamps.
+- `AsyncDataset.get_largefiles_impact()` and the `check-largefiles` command
+  report files stored on the wrong side of the policy.  `annex.largefiles` is
+  only consulted when a file is added, so changing the policy moves nothing by
+  itself.
+
 ## Force-Push Feature
 
 When repositories need to be rebuilt from scratch (e.g., after history rewrites), the `--force-push` option allows overwriting remote Git history on GitHub:
