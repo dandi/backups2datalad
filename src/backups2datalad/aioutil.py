@@ -309,8 +309,13 @@ async def stream_null_command(
 
 
 async def stream_lines_command(
-    *args: str | Path, cwd: Path | None = None
+    *args: str | Path, cwd: Path | None = None, check: bool = False
 ) -> AsyncGenerator[str, None]:
+    """
+    If ``check`` is true, raise `subprocess.CalledProcessError` when the
+    command exits nonzero.  Note that, as for any generator, this can only
+    happen if the caller iterates to exhaustion.
+    """
     argstrs = [str(a) for a in args]
     desc = f"`{shlex.join(argstrs)}`"
     if cwd is not None:
@@ -328,7 +333,9 @@ async def stream_lines_command(
         desc,
         p.returncode,
     )
-    ### TODO: Raise an exception if p.returncode is nonzero?
+    if check and (rc := p.returncode) is not None and rc != 0:
+        raise subprocess.CalledProcessError(rc, argstrs)
+    ### TODO: Should `check` be the default?
 
 
 @asynccontextmanager
