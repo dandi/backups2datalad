@@ -25,8 +25,8 @@ from pydantic import BaseModel
 from zarr_checksum.tree import ZarrChecksumTree
 
 from .aioutil import (
-    ERRORS,
     ENCODING,
+    ERRORS,
     areadcmd,
     aruncmd,
     stream_null_command,
@@ -616,9 +616,9 @@ class AsyncDataset:
         # replaces bytes that aren't valid UTF-8 with U+FFFD, while `git
         # ls-tree` emits them verbatim.  The two spellings of the same path
         # then don't compare equal, which `get_file_stats()` needs them to.
-        # `${file}` comes last because it is the only field that can contain a
-        # space; `\000` separates records because it is the only byte a path
-        # cannot contain.
+        # Every field is NUL-separated, not just the records: NUL is the one
+        # byte a path cannot contain, and a key is not guaranteed to be free
+        # of spaces (`git annex fromkey --force` will accept one).
         async with aclosing(
             stream_null_command(
                 "git",
@@ -626,13 +626,18 @@ class AsyncDataset:
                 "annex",
                 "find",
                 "--include=*",
-                r"--format=${backend} ${bytesize} ${key} ${file}\000",
+                r"--format=${backend}\000${bytesize}\000${key}\000${file}\000",
                 cwd=self.pathobj,
             )
         ) as p:
-            async for record in p:
+            fields: list[str] = []
+            async for value in p:
+                fields.append(value)
+                if len(fields) < 4:
+                    continue
+                backend, bytesize, key, fname = fields
+                fields = []
                 try:
-                    backend, bytesize, key, fname = record.split(" ", 3)
                     data = AnnexedFile(
                         backend=backend, bytesize=int(bytesize), key=key, file=fname
                     )
@@ -641,11 +646,16 @@ class AsyncDataset:
                         "Error parsing `git-annex find` output for %s: bad"
                         " output record %r",
                         self.path,
-                        record,
+                        (backend, bytesize, key, fname),
                     )
                     raise
                 else:
                     yield data
+            if fields:
+                raise RuntimeError(
+                    f"`git-annex find` output for {self.path} ended mid-record:"
+                    f" {fields!r}"
+                )
 
     async def compute_zarr_checksum(self) -> str:
         log.debug(

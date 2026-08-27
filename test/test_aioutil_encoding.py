@@ -18,6 +18,7 @@ import subprocess
 
 import pytest
 
+from backups2datalad.adataset import AsyncDataset
 from backups2datalad.aioutil import (
     areadcmd,
     open_git_annex,
@@ -27,9 +28,8 @@ from backups2datalad.aioutil import (
 
 pytestmark = pytest.mark.anyio
 
-#: Not valid UTF-8, so `surrogateescape` renders it as the lone surrogate
-#: U+DCFF.  This is what `os.fsdecode()` produces for the same byte.
-BAD_BYTE = b"\xff"
+#: Not valid UTF-8, so `surrogateescape` renders the bad byte as the lone
+#: surrogate U+DCFF, which is what `os.fsdecode()` produces for it.
 BAD_NAME = b"bad-\xff-name.txt"
 
 
@@ -104,7 +104,7 @@ async def test_text_process_send_non_utf8(tmp_path: Path) -> None:
     # Covers the *send* side: `TextProcess.send()` encodes, and a filename
     # that isn't valid UTF-8 must not raise on the way out.  (git-annex keeps
     # only the extension, so the byte doesn't come back; the receive side goes
-    # through the same `text_stream()` as the tests above.)
+    # through the same `_text_stream()` as the tests above.)
     repo = tmp_path / "repo"
     repo.mkdir()
     for args in (
@@ -131,8 +131,6 @@ async def test_get_file_stats_non_utf8(tmp_path: Path) -> None:
     # The motivating case.  `git ls-tree -lrz` emits the path bytes verbatim,
     # but `git annex find --json` replaces the invalid ones with U+FFFD, so
     # matching the two by path needs `--format`, which is verbatim too.
-    from backups2datalad.adataset import AsyncDataset
-
     repo = tmp_path / "repo"
     expected = make_repo_with_bad_name(repo, annex=True)
     stats = await AsyncDataset(repo).get_file_stats()
@@ -159,3 +157,46 @@ async def test_open_git_annex_receives_non_utf8(tmp_path: Path) -> None:
         await p.aclose()
     assert key == "MD5E-s7--0123456789abcdef0123456789abcdef" + name[len("file") :]
     assert os.fsencode(key).endswith(b".t\xffxt")
+
+
+@pytest.mark.ai_generated
+async def test_remove_batch_non_utf8(tmp_path: Path) -> None:
+    # `remove_batch()` writes the paths to a temp file for
+    # `--pathspec-file-nul`, and is fed straight from `AsyncAnnex.list_files()`
+    # -- i.e. from `git ls-tree -z`, which emits the bytes verbatim.
+    repo = tmp_path / "repo"
+    name = make_repo_with_bad_name(repo, annex=True)
+    ds = AsyncDataset(repo)
+    await ds.remove_batch([name])
+    assert not (repo / name).exists()
+
+
+@pytest.mark.ai_generated
+async def test_read_file_from_commit_non_utf8(tmp_path: Path) -> None:
+    # The point of decoding *and* encoding leniently here: `read_file_from_commit`
+    # must not raise `UnicodeEncodeError`, which is a sibling of
+    # `UnicodeDecodeError` rather than a subclass and so would escape the
+    # `except` clause in `commit_has_assets()`.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in (
+        ["git", "init", "-q", "-b", "draft"],
+        ["git", "config", "user.name", "Test"],
+        ["git", "config", "user.email", "test@example.com"],
+    ):
+        subprocess.run(args, cwd=repo, check=True, capture_output=True)
+    (repo / "plain.json").write_bytes(b'[{"path": "a\xff b"}]')
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "bad content"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    ds = AsyncDataset(repo)
+    commit = (await ds.get_commit_hash()).strip()
+    content = await ds.read_file_from_commit(commit, "plain.json")
+    # Whatever comes back, the failure mode that matters is the exception type
+    # a caller has to catch, so assert on that rather than on the bytes.
+    with pytest.raises(UnicodeDecodeError):
+        content.decode("utf-8")
