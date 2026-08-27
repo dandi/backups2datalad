@@ -33,25 +33,29 @@ pytestmark = pytest.mark.anyio
 BAD_NAME = b"bad-\xff-name.txt"
 
 
-def make_repo_with_bad_name(path: Path, annex: bool = False) -> str:
+def run(path: Path, *args: str) -> None:
+    subprocess.run(args, cwd=path, check=True, capture_output=True)
+
+
+def init_repo(path: Path, annex: bool = False) -> None:
     path.mkdir(parents=True, exist_ok=True)
-
-    def run(*args: str) -> None:
-        subprocess.run(args, cwd=path, check=True, capture_output=True)
-
-    run("git", "init", "-q", "-b", "draft")
-    run("git", "config", "user.name", "Test")
-    run("git", "config", "user.email", "test@example.com")
+    run(path, "git", "init", "-q", "-b", "draft")
+    run(path, "git", "config", "user.name", "Test")
+    run(path, "git", "config", "user.email", "test@example.com")
     if annex:
-        run("git", "annex", "init", "-q", "test")
+        run(path, "git", "annex", "init", "-q", "test")
+
+
+def make_repo_with_bad_name(path: Path, annex: bool = False) -> str:
+    init_repo(path, annex=annex)
     (path / os.fsdecode(BAD_NAME)).write_bytes(b"content")
     if annex:
         # `git annex add`, not `git add`: `git annex find` only sees annexed
         # files, and that is the command whose path spelling is under test.
-        run("git", "annex", "add", "-q", ".")
+        run(path, "git", "annex", "add", "-q", ".")
     else:
-        run("git", "add", "-A")
-    run("git", "commit", "-qm", "bad name")
+        run(path, "git", "add", "-A")
+    run(path, "git", "commit", "-qm", "bad name")
     return os.fsdecode(BAD_NAME)
 
 
@@ -106,14 +110,7 @@ async def test_text_process_send_non_utf8(tmp_path: Path) -> None:
     # only the extension, so the byte doesn't come back; the receive side goes
     # through the same `_text_stream()` as the tests above.)
     repo = tmp_path / "repo"
-    repo.mkdir()
-    for args in (
-        ["git", "init", "-q", "-b", "draft"],
-        ["git", "config", "user.name", "Test"],
-        ["git", "config", "user.email", "test@example.com"],
-        ["git", "annex", "init", "-q", "test"],
-    ):
-        subprocess.run(args, cwd=repo, check=True, capture_output=True)
+    init_repo(repo, annex=True)
     name = os.fsdecode(BAD_NAME)
     p = await open_git_annex(
         "examinekey", "--batch", "--migrate-to-backend=MD5E", path=repo
@@ -178,21 +175,12 @@ async def test_read_file_from_commit_non_utf8(tmp_path: Path) -> None:
     # `UnicodeDecodeError` rather than a subclass and so would escape the
     # `except` clause in `commit_has_assets()`.
     repo = tmp_path / "repo"
-    repo.mkdir()
-    for args in (
-        ["git", "init", "-q", "-b", "draft"],
-        ["git", "config", "user.name", "Test"],
-        ["git", "config", "user.email", "test@example.com"],
-    ):
-        subprocess.run(args, cwd=repo, check=True, capture_output=True)
+    init_repo(repo)
+    # No trailing newline: `read_git(strip=True)` would eat one, so the bytes
+    # only round-trip exactly without it.
     (repo / "plain.json").write_bytes(b'[{"path": "a\xff b"}]')
-    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-qm", "bad content"],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-    )
+    run(repo, "git", "add", "-A")
+    run(repo, "git", "commit", "-qm", "bad content")
     ds = AsyncDataset(repo)
     commit = (await ds.get_commit_hash()).strip()
     content = await ds.read_file_from_commit(commit, "plain.json")
@@ -200,3 +188,42 @@ async def test_read_file_from_commit_non_utf8(tmp_path: Path) -> None:
     # a caller has to catch, so assert on that rather than on the bytes.
     with pytest.raises(UnicodeDecodeError):
         content.decode("utf-8")
+
+
+@pytest.mark.ai_generated
+async def test_get_file_stats_key_containing_space(tmp_path: Path) -> None:
+    # git-annex escapes spaces out of the keys it generates, but `fromkey
+    # --force` accepts one, and then splitting a `find --format` record on
+    # spaces assigns the tail of the key to the filename.  The forged key
+    # needs a *size*, or `int()` fails before the mis-parse can show.
+    repo = tmp_path / "repo"
+    init_repo(repo, annex=True)
+    key = (
+        "SHA256E-s7--"
+        "ed7002b439e9ac845f22357d822bac1444730fbdb6016d3ec9432297b9ec9f73"
+        " with space.txt"
+    )
+    run(repo, "git", "annex", "fromkey", "--force", key, "spaced.dat")
+    run(repo, "git", "commit", "-qm", "forged key")
+    stats = await AsyncDataset(repo).get_file_stats()
+    by_path = {s.path: s for s in stats}
+    assert "spaced.dat" in by_path
+    assert by_path["spaced.dat"].size == 7
+
+
+@pytest.mark.ai_generated
+async def test_update_submodule_non_utf8_path(tmp_path: Path) -> None:
+    # `git update-index --index-info` makes a gitlink at any path, so this
+    # needs no actual submodule.
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    (repo / "seed.txt").write_text("seed\n")
+    run(repo, "git", "add", "-A")
+    run(repo, "git", "commit", "-qm", "seed")
+    ds = AsyncDataset(repo)
+    commit_hash = (await ds.get_commit_hash()).strip()
+    await ds.update_submodule(os.fsdecode(b"zarr-\xff-dir"), commit_hash)
+    index = subprocess.run(
+        ["git", "ls-files", "-s", "-z"], cwd=repo, capture_output=True, check=True
+    ).stdout
+    assert b"zarr-\xff-dir" in index
