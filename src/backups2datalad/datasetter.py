@@ -717,7 +717,12 @@ class DandiDatasetter(AsyncResource):
         logdir.mkdir(exist_ok=True, parents=True)
         filename = f"{ts:%Y.%m.%d.%H.%M.%SZ}.log"
         self.logfile = logdir / filename
-        handler = logging.FileHandler(self.logfile, encoding="utf-8")
+        # `backslashreplace` so that a path that isn't valid UTF-8 — which
+        # reaches here as surrogates, see `aioutil.ENCODE_ERRORS` — is written
+        # visibly rather than making the handler raise and drop the record.
+        handler = logging.FileHandler(
+            self.logfile, encoding="utf-8", errors="backslashreplace"
+        )
         handler.setLevel(logging.DEBUG)
         handler.addFilter(quiet_filter(logging.WARNING))
         fmter = logging.Formatter(

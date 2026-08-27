@@ -34,6 +34,22 @@ T = TypeVar("T")
 InT = TypeVar("InT")
 OutT = TypeVar("OutT")
 
+#: How text is translated to and from the bytes on a subprocess pipe.
+#:
+#: git and git-annex emit filesystem paths verbatim, and a path is a byte
+#: string that need not be valid UTF-8.  Decoding strictly aborts the backup on
+#: such a path with a `UnicodeDecodeError` that names no file;
+#: ``surrogateescape`` instead round-trips the offending bytes, which is the
+#: scheme `os.fsdecode()` uses and what `aruncmd()` already used for the output
+#: it logs.
+ENCODING = "utf-8"
+ENCODE_ERRORS = "surrogateescape"
+
+
+def text_stream(stream: anyio.abc.ByteReceiveStream) -> TextReceiveStream:
+    """Decode a subprocess pipe, tolerating paths that aren't valid UTF-8."""
+    return TextReceiveStream(stream, encoding=ENCODING, errors=ENCODE_ERRORS)
+
 
 @dataclass
 class TextProcess(anyio.abc.ObjectStream[str]):
@@ -79,7 +95,7 @@ class TextProcess(anyio.abc.ObjectStream[str]):
                 f" {self.p.returncode}!"
             )
         assert self.p.stdin is not None
-        await self.p.stdin.send(s.encode("utf-8"))
+        await self.p.stdin.send(s.encode(ENCODING, ENCODE_ERRORS))
 
     async def receive(self) -> str:
         return await self.stdout.receive()
@@ -112,7 +128,7 @@ async def open_git_annex(
         env=env,
     )
     assert p.stdout is not None
-    stdout = LineReceiveStream(TextReceiveStream(p.stdout))
+    stdout = LineReceiveStream(text_stream(p.stdout))
     return TextProcess(p, stdout, desc, warn_on_fail=warn_on_fail)
 
 
@@ -249,13 +265,13 @@ async def aruncmd(
     except subprocess.CalledProcessError as e:
         if e.returncode not in quiet_rcs:
             label = "Stdout" if e.stderr is not None else "Output"
-            stdout = e.stdout.decode("utf-8", "surrogateescape")
+            stdout = e.stdout.decode(ENCODING, ENCODE_ERRORS)
             if stdout:
                 output = f"{label}:\n\n" + textwrap.indent(stdout, " " * 4)
             else:
                 output = f"{label}: <empty>"
             if e.stderr is not None:
-                stderr = e.stderr.decode("utf-8", "surrogateescape")
+                stderr = e.stderr.decode(ENCODING, ENCODE_ERRORS)
                 if stderr:
                     output += "\n\nStderr:\n\n" + textwrap.indent(stderr, " " * 4)
                 else:
@@ -273,7 +289,7 @@ async def areadcmd(*args: str | Path, strip: bool = True, **kwargs: Any) -> str:
     kwargs["stdout"] = subprocess.PIPE
     kwargs.setdefault("stderr", None)
     r = await aruncmd(*args, **kwargs)
-    s = r.stdout.decode("utf-8")
+    s = r.stdout.decode(ENCODING, ENCODE_ERRORS)
     if strip:
         s = s.strip()
     return s
@@ -292,7 +308,7 @@ async def stream_null_command(
     ) as p:
         assert p.stdout is not None
         try:
-            stream = TextReceiveStream(p.stdout)
+            stream = text_stream(p.stdout)
             splitter = TerminatedSplitter("\0", retain=False)
             async for chunk in splitter.aitersplit(stream):
                 yield chunk
@@ -320,7 +336,7 @@ async def stream_lines_command(
         await anyio.open_process(argstrs, cwd=cwd, stderr=None), desc
     ) as p:
         assert p.stdout is not None
-        async for line in LineReceiveStream(TextReceiveStream(p.stdout)):
+        async for line in LineReceiveStream(text_stream(p.stdout)):
             yield line
     log.log(
         logging.DEBUG if p.returncode == 0 else logging.WARNING,
