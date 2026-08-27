@@ -31,6 +31,7 @@ class AsyncAnnex:
     locks: dict[str, anyio.Lock] = field(
         init=False, default_factory=lambda: defaultdict(anyio.Lock)
     )
+    missing_from: dict[str, set[str]] = field(init=False, default_factory=dict)
 
     async def __aenter__(self) -> AsyncAnnex:
         return self
@@ -96,33 +97,47 @@ class AsyncAnnex:
             )
             return (await self.pexaminekey.receive()).strip()
 
-    async def get_keys_missing_from(self, remote: str) -> set[str]:
+    async def get_keys_missing_from(self, remote: str | None) -> set[str]:
         """
         Return the keys that git-annex records as present somewhere but not in
-        ``remote``.
+        ``remote``, or an empty set if ``remote`` is `None`.
 
         This is a single pass over the repository rather than a lookup per
         key.  The obvious alternative, ``whereis``, also serialises every URL
         registered on a key, and a Zarr key shared by many identical chunks
         accumulates enough of those to make its output tens of megabytes.
+
+        The result is computed on first use and cached for the lifetime of
+        this object, i.e. for one Dandiset or Zarr sync.
         """
-        keys = set()
-        async with aclosing(
-            stream_lines_command(
-                "git",
-                *GIT_OPTIONS,
-                "annex",
-                "findkeys",
-                "--copies=1",
-                "--not",
-                "--in",
-                remote,
-                cwd=self.repo,
-            )
-        ) as p:
-            async for key in p:
-                keys.add(key.rstrip("\n"))
-        return keys
+        if remote is None:
+            return set()
+        # Checked before locking so that the common case — a hit, once per
+        # asset — doesn't pay for the two event loop checkpoints that even an
+        # uncontended `anyio.Lock` acquisition performs.  Safe to double-check
+        # because there is no `await` between the lookup and the return.
+        if (keys := self.missing_from.get(remote)) is not None:
+            return keys
+        async with self.locks[f"findkeys {remote}"]:
+            if (keys := self.missing_from.get(remote)) is None:
+                keys = set()
+                async with aclosing(
+                    stream_lines_command(
+                        "git",
+                        *GIT_OPTIONS,
+                        "annex",
+                        "findkeys",
+                        "--copies=1",
+                        "--not",
+                        "--in",
+                        remote,
+                        cwd=self.repo,
+                    )
+                ) as p:
+                    async for key in p:
+                        keys.add(key.rstrip("\n"))
+                self.missing_from[remote] = keys
+            return keys
 
     async def register_url(self, key: str, url: str) -> None:
         async with self.locks["registerurl"]:

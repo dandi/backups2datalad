@@ -128,3 +128,47 @@ async def test_get_keys_missing_from_empty_repo(tmp_path: Path) -> None:
     )
     async with AsyncAnnex(repo, digest_type="MD5") as annex:
         assert await annex.get_keys_missing_from("backup") == set()
+
+
+@pytest.mark.ai_generated
+async def test_get_keys_missing_from_no_remote(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    make_repo(repo)
+    async with AsyncAnnex(repo, digest_type="MD5") as annex:
+        assert await annex.get_keys_missing_from(None) == set()
+
+
+@pytest.mark.ai_generated
+async def test_get_keys_missing_from_is_cached(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    make_repo(repo)
+    backup = tmp_path / "backup"
+    backup.mkdir()
+    subprocess.run(
+        [
+            "git",
+            "annex",
+            "initremote",
+            "backup",
+            "type=directory",
+            f"directory={backup}",
+            "encryption=none",
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    async with AsyncAnnex(repo, digest_type="MD5") as annex:
+        assert await annex.get_keys_missing_from("backup") == set()
+        (repo / "new.dat").write_bytes(b"new content")
+        subprocess.run(
+            ["git", "annex", "add", "new.dat"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        # A second call returns the set sampled by the first one rather than
+        # re-running `findkeys`.
+        assert await annex.get_keys_missing_from("backup") == set()
+    async with AsyncAnnex(repo, digest_type="MD5") as annex2:
+        assert await annex2.get_keys_missing_from("backup") != set()

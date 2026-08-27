@@ -123,8 +123,6 @@ class Downloader:
     download_receiver: MemoryObjectReceiveStream[ToDownload] = field(init=False)
     zarrs: dict[str, ZarrLink] = field(init=False, default_factory=dict)
     need_add: list[str] = field(init=False, default_factory=list)
-    missing_from_backup: set[str] | None = field(init=False, default=None)
-    missing_lock: anyio.Lock = field(init=False, default_factory=anyio.Lock)
 
     def __post_init__(self) -> None:
         (
@@ -233,23 +231,6 @@ class Downloader:
                             )
                             self.report.old_unhashed += 1
 
-    async def get_keys_missing_from_backup(self) -> set[str]:
-        """
-        Keys that git-annex knows about but that aren't in the backup remote.
-
-        Computed once per Dandiset, on first use, and empty when no backup
-        remote is configured.
-        """
-        async with self.missing_lock:
-            if self.missing_from_backup is None:
-                if (remote := self.config.dandisets.remote) is None:
-                    self.missing_from_backup = set()
-                else:
-                    self.missing_from_backup = await self.annex.get_keys_missing_from(
-                        remote.name
-                    )
-            return self.missing_from_backup
-
     async def process_blob(
         self,
         blob: BlobBackup,
@@ -311,8 +292,9 @@ class Downloader:
                         self.annex, key, blob.asset.base_download_url
                     )
                     if (
-                        (remote := self.config.dandisets.remote) is not None
-                        and key in await self.get_keys_missing_from_backup()
+                        remote := self.config.dandisets.remote
+                    ) is not None and key in await self.annex.get_keys_missing_from(
+                        remote.name
                     ):
                         blob.log.info("Not in backup remote %r", remote.name)
                     self.tracker.finish_asset(blob.path)
