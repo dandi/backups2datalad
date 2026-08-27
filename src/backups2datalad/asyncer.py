@@ -143,6 +143,16 @@ class Downloader:
         return self.ds.pathobj
 
     async def __aenter__(self) -> Downloader:
+        # Sample the keys missing from the backup remote before any asset is
+        # registered, so that "Not in backup remote" means "missing when this
+        # run started" rather than depending on which asset reaches the check
+        # first.  Costs one `findkeys` per Dandiset per run, even on a no-op,
+        # but only when a backup remote is configured; with none it is a
+        # `None` short-circuit rather than a subprocess.
+        remote = self.config.dandisets.remote
+        await self.annex.get_keys_missing_from(
+            remote.name if remote is not None else None
+        )
         return self
 
     async def __aexit__(
@@ -291,16 +301,12 @@ class Downloader:
                     await blob.register_url(
                         self.annex, key, blob.asset.base_download_url
                     )
-                    remotes = await self.annex.get_key_remotes(key)
                     if (
-                        remotes is not None
-                        and self.config.dandisets.remote is not None
-                        and self.config.dandisets.remote.name not in remotes
+                        remote := self.config.dandisets.remote
+                    ) is not None and key in await self.annex.get_keys_missing_from(
+                        remote.name
                     ):
-                        blob.log.info(
-                            "Not in backup remote %r",
-                            self.config.dandisets.remote.name,
-                        )
+                        blob.log.info("Not in backup remote %r", remote.name)
                     self.tracker.finish_asset(blob.path)
                     self.report.registered += 1
                 elif blob.asset.size > (10 << 20):
