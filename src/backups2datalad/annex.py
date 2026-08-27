@@ -123,6 +123,9 @@ class AsyncAnnex:
         if (keys := self.missing_from.get(remote)) is not None:
             return keys
         async with self.locks[f"findkeys {remote}"]:
+            # Re-checked, not redundant with the above: acquiring the lock is
+            # an `await`, so another task may have filled the cache while this
+            # one waited for it.
             if (keys := self.missing_from.get(remote)) is None:
                 keys = set()
                 async with aclosing(
