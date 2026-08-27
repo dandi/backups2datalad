@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 
+import anyio
 import pytest
 
 from backups2datalad.annex import AsyncAnnex
@@ -252,3 +253,45 @@ async def test_get_keys_missing_from_untrusted_only(tmp_path: Path) -> None:
 
     async with AsyncAnnex(repo, digest_type="MD5") as annex:
         assert key in await annex.get_keys_missing_from("backup")
+
+
+@pytest.mark.ai_generated
+async def test_get_keys_missing_from_concurrent(tmp_path: Path) -> None:
+    # Two tasks racing on a cold cache: the one that loses the race must find
+    # the set already computed when it acquires the lock, rather than running
+    # `findkeys` a second time.
+    repo = tmp_path / "repo"
+    make_repo(repo)
+    backup = tmp_path / "backup"
+    backup.mkdir()
+    subprocess.run(
+        [
+            "git",
+            "annex",
+            "initremote",
+            "backup",
+            "type=directory",
+            f"directory={backup}",
+            "encryption=none",
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    (repo / "a.dat").write_bytes(b"a content")
+    subprocess.run(
+        ["git", "annex", "add", "a.dat"], cwd=repo, check=True, capture_output=True
+    )
+
+    results: list[set[str]] = []
+
+    async def lookup() -> None:
+        results.append(await annex.get_keys_missing_from("backup"))
+
+    async with AsyncAnnex(repo, digest_type="MD5") as annex:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(lookup)
+            tg.start_soon(lookup)
+        assert len(results) == 2
+        assert results[0] is results[1]
+        assert results[0] is annex.missing_from["backup"]
