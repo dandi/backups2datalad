@@ -3,8 +3,10 @@ Tests that subprocess output containing bytes that aren't valid UTF-8 is
 tolerated rather than aborting the run.
 
 A filesystem path is a byte string on POSIX and need not be valid UTF-8, and
-git and git-annex emit paths verbatim, so every one of these commands can
-produce such bytes.
+git emits paths verbatim, so every one of these commands can produce such
+bytes.  git-annex's ``--json`` output is the exception -- it replaces them
+with U+FFFD -- which is why `aiter_annexed_files()` uses ``--format``; see
+`test_get_file_stats_non_utf8`.
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ BAD_BYTE = b"\xff"
 BAD_NAME = b"bad-\xff-name.txt"
 
 
-def make_repo_with_bad_name(path: Path) -> str:
+def make_repo_with_bad_name(path: Path, annex: bool = False) -> str:
     path.mkdir(parents=True, exist_ok=True)
 
     def run(*args: str) -> None:
@@ -40,8 +42,15 @@ def make_repo_with_bad_name(path: Path) -> str:
     run("git", "init", "-q", "-b", "draft")
     run("git", "config", "user.name", "Test")
     run("git", "config", "user.email", "test@example.com")
+    if annex:
+        run("git", "annex", "init", "-q", "test")
     (path / os.fsdecode(BAD_NAME)).write_bytes(b"content")
-    run("git", "add", "-A")
+    if annex:
+        # `git annex add`, not `git add`: `git annex find` only sees annexed
+        # files, and that is the command whose path spelling is under test.
+        run("git", "annex", "add", "-q", ".")
+    else:
+        run("git", "add", "-A")
     run("git", "commit", "-qm", "bad name")
     return os.fsdecode(BAD_NAME)
 
@@ -115,3 +124,38 @@ async def test_text_process_send_non_utf8(tmp_path: Path) -> None:
     finally:
         await p.aclose()
     assert key == "MD5E-s7--0123456789abcdef0123456789abcdef.txt"
+
+
+@pytest.mark.ai_generated
+async def test_get_file_stats_non_utf8(tmp_path: Path) -> None:
+    # The motivating case.  `git ls-tree -lrz` emits the path bytes verbatim,
+    # but `git annex find --json` replaces the invalid ones with U+FFFD, so
+    # matching the two by path needs `--format`, which is verbatim too.
+    from backups2datalad.adataset import AsyncDataset
+
+    repo = tmp_path / "repo"
+    expected = make_repo_with_bad_name(repo, annex=True)
+    stats = await AsyncDataset(repo).get_file_stats()
+    by_path = {s.path: s for s in stats}
+    assert expected in by_path
+    assert by_path[expected].size == len(b"content")
+
+
+@pytest.mark.ai_generated
+async def test_open_git_annex_receives_non_utf8(tmp_path: Path) -> None:
+    # Covers the *receive* side of `open_git_annex()`: git-annex keeps the
+    # filename's extension in the key it derives, so a bad byte placed in the
+    # extension comes back out over the pipe.
+    repo = tmp_path / "repo"
+    make_repo_with_bad_name(repo, annex=True)
+    name = os.fsdecode(b"file.t\xffxt")
+    p = await open_git_annex(
+        "examinekey", "--batch", "--migrate-to-backend=MD5E", path=repo
+    )
+    try:
+        await p.send(f"MD5-s7--0123456789abcdef0123456789abcdef {name}\n")
+        key = (await p.receive()).strip()
+    finally:
+        await p.aclose()
+    assert key == "MD5E-s7--0123456789abcdef0123456789abcdef" + name[len("file") :]
+    assert os.fsencode(key).endswith(b".t\xffxt")

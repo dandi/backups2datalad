@@ -24,7 +24,13 @@ from ghrepo import GHRepo
 from pydantic import BaseModel
 from zarr_checksum.tree import ZarrChecksumTree
 
-from .aioutil import areadcmd, aruncmd, stream_lines_command, stream_null_command
+from .aioutil import (
+    ERRORS,
+    ENCODING,
+    areadcmd,
+    aruncmd,
+    stream_null_command,
+)
 from .config import BackupConfig, Remote
 from .consts import DEFAULT_BRANCH, GIT_OPTIONS
 from .logging import log
@@ -353,7 +359,7 @@ class AsyncDataset:
                     raise RuntimeError(f"Annex object not found at {annex_object_path}")
             else:
                 # Not annexed, return the content directly
-                return symlink_target.encode("utf-8")
+                return symlink_target.encode(ENCODING, ERRORS)
         except subprocess.CalledProcessError as e:
             # Re-raise with more context
             raise RuntimeError(
@@ -478,7 +484,7 @@ class AsyncDataset:
                 return
             except subprocess.CalledProcessError as e:
                 lockfile = self.pathobj / ".git" / "index.lock"
-                output = e.stdout.decode("utf-8") if e.stdout else ""
+                output = e.stdout.decode(ENCODING, ERRORS) if e.stdout else ""
                 if lockfile.exists() and str(lockfile) in output:
                     r = await aruncmd(
                         "fuser",
@@ -494,7 +500,7 @@ class AsyncDataset:
                         self.pathobj,
                         operation_desc,
                         r.returncode,
-                        textwrap.indent(r.stdout.decode("utf-8"), "> "),
+                        textwrap.indent(r.stdout.decode(ENCODING, ERRORS), "> "),
                     )
                 else:
                     log.error(
@@ -560,7 +566,9 @@ class AsyncDataset:
             self.ds.repo.precommit()
 
             async def _do_remove_batch() -> None:
-                with tempfile.NamedTemporaryFile(mode="w") as fp:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding=ENCODING, errors=ERRORS
+                ) as fp:
                     for p in pathlist:
                         print(p, end="\0", file=fp)
                     fp.flush()
@@ -604,26 +612,36 @@ class AsyncDataset:
         return list(filedict.values())
 
     async def aiter_annexed_files(self) -> AsyncGenerator[AnnexedFile, None]:
+        # `--format` rather than `--json`, because git-annex's JSON output
+        # replaces bytes that aren't valid UTF-8 with U+FFFD, while `git
+        # ls-tree` emits them verbatim.  The two spellings of the same path
+        # then don't compare equal, which `get_file_stats()` needs them to.
+        # `${file}` comes last because it is the only field that can contain a
+        # space; `\000` separates records because it is the only byte a path
+        # cannot contain.
         async with aclosing(
-            stream_lines_command(
+            stream_null_command(
                 "git",
                 *GIT_OPTIONS,
                 "annex",
                 "find",
                 "--include=*",
-                "--json",
+                r"--format=${backend} ${bytesize} ${key} ${file}\000",
                 cwd=self.pathobj,
             )
         ) as p:
-            async for line in p:
+            async for record in p:
                 try:
-                    data = AnnexedFile.model_validate_json(line)
+                    backend, bytesize, key, fname = record.split(" ", 3)
+                    data = AnnexedFile(
+                        backend=backend, bytesize=int(bytesize), key=key, file=fname
+                    )
                 except Exception:
                     log.exception(
                         "Error parsing `git-annex find` output for %s: bad"
-                        " output line %r",
+                        " output record %r",
                         self.path,
-                        line,
+                        record,
                     )
                     raise
                 else:
@@ -892,7 +910,7 @@ class AsyncDataset:
             "-z",
             # apparently must be the last argument!
             "--index-info",
-            input=f"160000 commit {commit_hash}\t{path}\0".encode(),
+            input=f"160000 commit {commit_hash}\t{path}\0".encode(ENCODING, ERRORS),
         )
 
     async def populate_up_to_date(self) -> bool:
