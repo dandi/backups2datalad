@@ -143,6 +143,16 @@ class Downloader:
         return self.ds.pathobj
 
     async def __aenter__(self) -> Downloader:
+        # Sample the keys missing from the backup remote before any asset is
+        # registered, so that "Not in backup remote" means "missing when this
+        # run started" rather than depending on which asset reaches the check
+        # first.  Costs one `findkeys` per Dandiset per run, even on a no-op,
+        # but only when a backup remote is configured; with none it is a
+        # `None` short-circuit rather than a subprocess.
+        remote = self.config.dandisets.remote
+        await self.annex.get_keys_missing_from(
+            remote.name if remote is not None else None
+        )
         return self
 
     async def __aexit__(
@@ -162,13 +172,6 @@ class Downloader:
     async def asset_loop(self, aia: AsyncIterator[RemoteAsset | None]) -> None:
         now = datetime.now(timezone.utc)
         downloading = True
-        # Sample the backup remote before registering anything, so that "Not
-        # in backup remote" reports the keys that were already missing when
-        # this run started rather than ones this run has just created.
-        remote = self.config.dandisets.remote
-        await self.annex.get_keys_missing_from(
-            remote.name if remote is not None else None
-        )
         async with self.download_sender:
             async for asset in aia:
                 if asset is None:
