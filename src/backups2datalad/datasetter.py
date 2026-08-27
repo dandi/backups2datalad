@@ -22,7 +22,6 @@ from dandi.exceptions import NotFoundError
 from datalad.api import clone
 from ghrepo import GHRepo
 from humanize import naturalsize
-from linesep import split_terminated
 from packaging.version import Version as PkgVersion
 
 from .adandi import AsyncDandiClient, RemoteDandiset, RemoteZarrAsset
@@ -38,6 +37,7 @@ from .util import (
     assets_eq,
     fromisoformat,
     quantify,
+    split_terminated,
     update_dandiset_metadata,
 )
 from .zarr import ZarrLink, sync_zarr

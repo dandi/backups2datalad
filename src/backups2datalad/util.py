@@ -226,6 +226,18 @@ def fromisoformat(date_string: str) -> datetime:
     return datetime.fromisoformat(date_string)
 
 
+def split_terminated(s: str, sep: str) -> list[str]:
+    """
+    Split ``s`` into the entries terminated by ``sep``.  A trailing ``sep``
+    does not produce an empty final entry; a final entry without one is
+    returned as-is.
+    """
+    entries = s.split(sep)
+    if entries[-1] == "":
+        entries.pop()
+    return entries
+
+
 def quantify(qty: int, singular: str, plural: str | None = None) -> str:
     if qty == 1:
         return f"{qty} {singular}"
