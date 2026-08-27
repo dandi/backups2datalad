@@ -162,6 +162,13 @@ class Downloader:
     async def asset_loop(self, aia: AsyncIterator[RemoteAsset | None]) -> None:
         now = datetime.now(timezone.utc)
         downloading = True
+        # Sample the backup remote before registering anything, so that "Not
+        # in backup remote" reports the keys that were already missing when
+        # this run started rather than ones this run has just created.
+        remote = self.config.dandisets.remote
+        await self.annex.get_keys_missing_from(
+            remote.name if remote is not None else None
+        )
         async with self.download_sender:
             async for asset in aia:
                 if asset is None:

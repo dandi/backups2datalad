@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import subprocess
 
@@ -172,3 +173,82 @@ async def test_get_keys_missing_from_is_cached(tmp_path: Path) -> None:
         assert await annex.get_keys_missing_from("backup") == set()
     async with AsyncAnnex(repo, digest_type="MD5") as annex2:
         assert await annex2.get_keys_missing_from("backup") != set()
+
+
+@pytest.mark.ai_generated
+async def test_get_keys_missing_from_unknown_remote(tmp_path: Path) -> None:
+    # A repository predating `remote` being added to the configuration makes
+    # git-annex exit nonzero; reporting "nothing is missing" would be the
+    # exact opposite of the truth, so this must raise rather than be cached.
+    repo = tmp_path / "repo"
+    make_repo(repo)
+    async with AsyncAnnex(repo, digest_type="MD5") as annex:
+        with pytest.raises(subprocess.CalledProcessError):
+            await annex.get_keys_missing_from("nosuchremote")
+        assert "nosuchremote" not in annex.missing_from
+
+
+@pytest.mark.ai_generated
+async def test_get_keys_missing_from_untrusted_only(tmp_path: Path) -> None:
+    # A key whose only location is an untrusted repository: `whereis` reports
+    # it as failed, but `--copies=1` matches it, so unlike the `whereis`-based
+    # code this replaced we do report it.
+    repo = tmp_path / "repo"
+    make_repo(repo)
+    for name in ["backup", "elsewhere"]:
+        d = tmp_path / name
+        d.mkdir()
+        subprocess.run(
+            [
+                "git",
+                "annex",
+                "initremote",
+                name,
+                "type=directory",
+                f"directory={d}",
+                "encryption=none",
+            ],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+    subprocess.run(
+        ["git", "annex", "untrust", "elsewhere"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    (repo / "u.dat").write_bytes(b"untrusted-only content")
+    subprocess.run(
+        ["git", "annex", "add", "u.dat"], cwd=repo, check=True, capture_output=True
+    )
+    key = subprocess.run(
+        ["git", "annex", "lookupkey", "u.dat"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "annex", "copy", "--to=elsewhere", "u.dat"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "annex", "drop", "--force", "u.dat"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    whereis = subprocess.run(
+        ["git", "annex", "whereis", "--json", "--key", key],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(whereis.stdout)["success"] is False
+
+    async with AsyncAnnex(repo, digest_type="MD5") as annex:
+        assert key in await annex.get_keys_missing_from("backup")

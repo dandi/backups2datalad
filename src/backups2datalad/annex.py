@@ -108,7 +108,11 @@ class AsyncAnnex:
         accumulates enough of those to make its output tens of megabytes.
 
         The result is computed on first use and cached for the lifetime of
-        this object, i.e. for one Dandiset or Zarr sync.
+        this object, i.e. for one Dandiset or Zarr sync.  A failed lookup —
+        most plausibly a repository that predates ``remote`` being added to
+        the configuration, for which git-annex exits nonzero with "there is
+        no available git remote named ..." — raises rather than being cached
+        as "nothing is missing".
         """
         if remote is None:
             return set()
@@ -132,6 +136,7 @@ class AsyncAnnex:
                         "--in",
                         remote,
                         cwd=self.repo,
+                        check=True,
                     )
                 ) as p:
                     async for key in p:

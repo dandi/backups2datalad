@@ -238,7 +238,9 @@ class ZarrSyncer:
                                 to_delete.add(str(entry))
                                 self.report.updated += 1
                 await self.prune_deleted(to_delete)
-                missing = await self.annex.get_keys_missing_from(self.backup_remote)
+                missing: set[str] = set()
+                if to_update:
+                    missing = await self.annex.get_keys_missing_from(self.backup_remote)
                 for entry in to_update:
                     key = await self.annex.mkkey(
                         entry.name, entry.size, entry.md5_digest
