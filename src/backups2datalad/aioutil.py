@@ -335,7 +335,7 @@ async def stream_lines_command(
     )
     if check and (rc := p.returncode) is not None and rc != 0:
         raise subprocess.CalledProcessError(rc, argstrs)
-    ### TODO: Raise an exception if p.returncode is nonzero?
+    ### TODO: Should `check` be the default?
 
 
 @asynccontextmanager
