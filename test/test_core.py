@@ -18,6 +18,7 @@ from backups2datalad.adataset import AssetsState, AsyncDataset
 from backups2datalad.config import BackupConfig
 from backups2datalad.consts import DEFAULT_BRANCH
 from backups2datalad.datasetter import DandiDatasetter
+from backups2datalad.procedures.cfg_dandiset import COMMIT_MESSAGE as POLICY_COMMIT_MESSAGE
 from backups2datalad.procedures.cfg_dandiset import SIZE_LIMIT_ENVVAR
 
 log = logging.getLogger("test_backups2datalad.test_core")
@@ -241,7 +242,7 @@ async def test_2(
         "\n"
         f"{dandiset_id}:\n"
         " - [backups2datalad] 5 files added\n"
-        " - Instruct annex to add text files to Git\n"
+        f" - {POLICY_COMMIT_MESSAGE}\n"
         " - [DATALAD] new dataset"
     )
 
