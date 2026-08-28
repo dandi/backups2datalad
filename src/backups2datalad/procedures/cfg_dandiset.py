@@ -64,7 +64,11 @@ SIZE_LIMIT_ENVVAR = "BACKUPS2DATALAD_TEXT_SIZE_LIMIT"
 BLOCK_START = "### BEGIN dandiset default policy (backups2datalad)"
 BLOCK_END = "### END dandiset default policy (backups2datalad)"
 
-COMMIT_MESSAGE = "[backups2datalad] Set .gitattributes to dandiset default policy"
+# Deliberately without a "[backups2datalad]" marker: that marker identifies the
+# commits that record a backup state (`mkrelease()` greps for it when looking
+# for the commit to tag a published version at), and a configuration commit is
+# not one of those.
+COMMIT_MESSAGE = "Set .gitattributes to the dandiset default policy (backups2datalad)"
 
 GITATTRIBUTES = ".gitattributes"
 

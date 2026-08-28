@@ -129,6 +129,9 @@ async def test_create_sets_policy(tmp_path: Path) -> None:
     # The procedure's commit must not stray from the requested commit date:
     assert repo.get_commit_date("HEAD") == "2021-06-01T12:34:56+00:00"
     assert repo.get_commit_subject("HEAD") == COMMIT_MESSAGE
+    # Configuring the dataset is not a backup state, so the commit must not
+    # carry the "[backups2datalad]" marker that identifies those:
+    assert repo.get_backup_commits() == []
     # A second call is a no-op:
     commits = repo.get_commit_count()
     assert not await ds.ensure_installed("Test dataset")
@@ -169,6 +172,7 @@ async def test_migrate_text2git_dataset(tmp_path: Path) -> None:
     assert gitattributes_policy(tmp_path) == policy_lines()
     assert TEXT2GIT_LINE not in (tmp_path / ".gitattributes").read_text().splitlines()
     assert repo.get_commit_subject("HEAD") == COMMIT_MESSAGE
+    assert repo.get_backup_commits() == []
     assert repo.parent_is_ancestor("HEAD", old_head)
     # The reconfiguration must not move the mirror's timeline into the present:
     assert repo.get_commit_date("HEAD") == old_date
