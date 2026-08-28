@@ -28,6 +28,9 @@ from .aioutil import areadcmd, aruncmd, stream_lines_command, stream_null_comman
 from .config import BackupConfig, Remote
 from .consts import DEFAULT_BRANCH, GIT_OPTIONS
 from .logging import log
+from .procedures import PROCEDURES_DIR
+from .procedures.cfg_dandiset import COMMIT_MESSAGE as POLICY_COMMIT_MESSAGE
+from .procedures.cfg_dandiset import SIZE_LIMIT_ENVVAR, apply_policy, get_size_limit
 from .util import custom_commit_env, exp_wait, fromisoformat, is_meta_file, key2hash
 
 EMBARGO_STATUS_KEY = "dandi.dandiset.embargo-status"
@@ -62,14 +65,26 @@ class AsyncDataset:
         commit_date: datetime | None = None,
         backup_remote: Remote | None = None,
         backend: str = "SHA256E",
-        cfg_proc: str | None = "text2git",
+        cfg_proc: str | None = "dandiset",
         embargo_status: EmbargoStatus = EmbargoStatus.OPEN,
     ) -> bool:
         # Returns True if the dataset was freshly created
         if self.ds.is_installed():
+            if cfg_proc is not None:
+                # The dataset was created by an earlier run, possibly under an
+                # older policy; bring its .gitattributes up to date so that
+                # future commits abide by the current one.
+                await self.ensure_gitattributes_policy()
             return False
         log.info("Creating dataset for %s", desc)
-        argv = ["datalad", "-c", f"datalad.repo.backend={backend}", "create"]
+        argv = [
+            "datalad",
+            "-c",
+            f"datalad.repo.backend={backend}",
+            "-c",
+            f"datalad.locations.extra-procedures={PROCEDURES_DIR}",
+            "create",
+        ]
         if cfg_proc is not None:
             argv.append("-c")
             argv.append(cfg_proc)
@@ -79,6 +94,7 @@ class AsyncDataset:
             env={
                 **custom_commit_env(commit_date),
                 "GIT_CONFIG_PARAMETERS": f"'init.defaultBranch={DEFAULT_BRANCH}'",
+                SIZE_LIMIT_ENVVAR: get_size_limit(),
             },
         )
         if embargo_status is not EmbargoStatus.OPEN:
@@ -108,6 +124,32 @@ class AsyncDataset:
                 "(not metadata=distribution-restrictions=*)",
             )
         log.debug("Dataset for %s created", desc)
+        return True
+
+    async def ensure_gitattributes_policy(
+        self, commit_date: datetime | None = None
+    ) -> bool:
+        """
+        Ensure that ``.gitattributes`` carries an up-to-date `cfg_dandiset`
+        policy block, committing it if it changed.  Returns `True` if a commit
+        was made.
+
+        Unless ``commit_date`` is given, the commit is dated the same as the
+        current HEAD, so that reconfiguring a long-standing mirror does not
+        move its timeline into the present.
+        """
+        if not apply_policy(self.pathobj):
+            return False
+        log.info("Updating .gitattributes policy in %s", self.path)
+        if commit_date is None:
+            commit_date = await self.get_last_commit_date()
+        await self.call_git("add", ".gitattributes")
+        await self.commit(
+            message=POLICY_COMMIT_MESSAGE,
+            commit_date=commit_date,
+            paths=[".gitattributes"],
+            check_dirty=False,
+        )
         return True
 
     async def ensure_dandi_provider(self, api_url: str) -> None:

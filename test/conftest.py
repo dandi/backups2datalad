@@ -42,11 +42,12 @@ from dandischema.models import DigestType
 from datalad.api import Dataset
 from datalad.tests.utils_pytest import assert_repo_status
 import pytest
-from test_util import find_filepaths
+from test_util import find_filepaths, gitattributes_policy
 import zarr
 
 from backups2datalad.adandi import AsyncDandiClient, RemoteDandiset, RemoteZarrAsset
 from backups2datalad.adataset import AsyncDataset
+from backups2datalad.procedures.cfg_dandiset import policy_lines
 from backups2datalad.util import is_meta_file
 from backups2datalad.zarr import CHECKSUM_FILE
 
@@ -393,6 +394,7 @@ class SampleDandiset(_UpstreamSampleDandiset):
         # Returns a tuple of (blob assets populate manifest, Zarr populate manifest)
         assert backup_ds.is_installed()
         assert_repo_status(backup_ds.path)
+        assert gitattributes_policy(backup_ds.pathobj) == policy_lines()
         backup_files = {
             f
             for f in backup_ds.repo.get_files()
