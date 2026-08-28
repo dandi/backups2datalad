@@ -242,7 +242,7 @@ async def test_2(
         "\n"
         f"{dandiset_id}:\n"
         " - [backups2datalad] 5 files added\n"
-        " - Instruct annex to add text files to Git\n"
+        " - Configure annex.largefiles policy\n"
         " - [DATALAD] new dataset"
     )
 
@@ -459,18 +459,33 @@ async def test_gitattributes_policy_migration(
     (dspath / ".gitattributes").write_text(TEXT2GIT)
     await ds.save("Restore legacy .gitattributes")
     repo = GitRepo(dspath)
-    commits_before = int(repo.readcmd("rev-list", "--count", "HEAD"))
-    commit_date = await ds.get_last_commit_date()
+    before = repo.get_commitish_hash("HEAD")
+    before_date = repo.get_commit_date("HEAD")
 
-    # The Dandiset has not been modified on the server, so nothing is synced,
+    # The Dandiset has not been modified on the server, so it is not synced,
     # but the policy is applied all the same:
     await di.update_from_backup([dandiset_id])
     assert (dspath / ".gitattributes").read_text() == set_policy(TEXT2GIT)
-    assert int(repo.readcmd("rev-list", "--count", "HEAD")) == commits_before + 1
-    # ... without introducing a jump in commit timestamps:
-    assert await ds.get_last_commit_date() == commit_date
     assert_repo_status(ds.path)
+    policy_commits = policy_commits_since(repo, before)
+    assert len(policy_commits) == 1
+    # ... using the date of the commit it is applied on top of, so as not to
+    # introduce a jump in commit timestamps:
+    assert repo.get_commit_date(policy_commits[0]) == before_date
 
-    # A further run makes no further commits:
+    # A further run applies the policy again but makes no further commit:
+    head = repo.get_commitish_hash("HEAD")
     await di.update_from_backup([dandiset_id])
-    assert int(repo.readcmd("rev-list", "--count", "HEAD")) == commits_before + 1
+    assert policy_commits_since(repo, head) == []
+
+
+def policy_commits_since(repo: GitRepo, commitish: str) -> list[str]:
+    """Hashes of the commits made by the `dandi_text2git` procedure since
+    ``commitish``"""
+    return [
+        line.split(" ", 1)[0]
+        for line in repo.readcmd(
+            "log", "--format=%H %s", f"{commitish}..HEAD"
+        ).splitlines()
+        if line.split(" ", 1)[1:] == ["Configure annex.largefiles policy"]
+    ]
