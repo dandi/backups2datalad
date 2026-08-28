@@ -11,8 +11,10 @@ import json
 from pathlib import Path
 import subprocess
 
+from asyncclick.testing import CliRunner
 import pytest
 
+from backups2datalad.__main__ import main
 from backups2datalad.adataset import AsyncDataset
 from backups2datalad.gitattributes import (
     LARGEFILES_EXPRESSION,
@@ -136,3 +138,115 @@ async def test_policy_commit_is_not_a_backup_commit(tmp_path: Path) -> None:
     ).stdout.splitlines()
     assert "Configure annex.largefiles policy" in subjects
     assert not [s for s in subjects if "[backups2datalad]" in s]
+
+
+@pytest.mark.ai_generated
+async def test_load_metadata_json_annexed(tmp_path: Path) -> None:
+    """
+    A large enough `.dandi/assets.json` is annexed, and its content then has to
+    be fetched before it can be read.
+    """
+    ds = AsyncDataset(tmp_path / "ds")
+    assert await ds.ensure_installed("test dataset")
+    filepath = ds.pathobj / ".dandi" / "assets.json"
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    metadata = [{"path": "sub-01/sub-01_ecephys.nwb"}]
+    filepath.write_text(json.dumps(metadata))
+    # `--force-large` annexes the file regardless of its size, saving the test
+    # from having to write out something over the limit:
+    await ds.call_annex("add", "--force-large", ".dandi/assets.json")
+    await ds.commit("Add an annexed assets.json", check_dirty=False)
+    assert filepath.is_symlink()
+
+    # Drop the content, having first copied it somewhere it can be fetched
+    # back from:
+    (tmp_path / "store").mkdir()
+    await ds.call_annex(
+        "initremote",
+        "store",
+        "type=directory",
+        f"directory={tmp_path / 'store'}",
+        "encryption=none",
+    )
+    await ds.call_annex("copy", "--to=store", ".dandi/assets.json")
+    await ds.call_annex("drop", ".dandi/assets.json")
+    assert not filepath.exists()
+
+    assert load_metadata_json(filepath) == metadata
+
+
+@pytest.mark.ai_generated
+async def test_check_largefiles_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DANDI_API_KEY", "dummy")
+    root = tmp_path / "dandisets"
+    await AsyncDataset(root).ensure_installed("superdataset")
+    ds = AsyncDataset(root / "000001")
+    assert await ds.ensure_installed("Dandiset 000001")
+    (ds.pathobj / "big.txt").write_text("This is test text.\n" * 600_000)
+    # Add the file the way the old policy would have: straight into Git
+    await ds.call_git("-c", "annex.largefiles=nothing", "add", "big.txt")
+    await ds.commit("Add a large text file to Git", check_dirty=False)
+
+    # A Dandiset that complies with the policy, and so is not reported at all:
+    assert await AsyncDataset(root / "000002").ensure_installed("Dandiset 000002")
+
+    # A Dandiset with an annexed text file that the policy would put in Git:
+    ds3 = AsyncDataset(root / "000003")
+    assert await ds3.ensure_installed("Dandiset 000003")
+    (ds3.pathobj / "small.txt").write_text("This is test text.\n")
+    await ds3.call_annex("add", "--force-large", "small.txt")
+    await ds3.commit("Annex a small text file", check_dirty=False)
+
+    r = await CliRunner().invoke(
+        main, ["-B", str(tmp_path), "-l", "WARNING", "check-largefiles"]
+    )
+    assert r.exit_code == 0, r.output
+    assert "000001" in r.output
+    assert "big.txt" in r.output
+    # Nothing is stored on the wrong side in 000002, so it gets no row:
+    assert "000002" not in r.output
+    # 000003 has nothing in Git to report as the largest:
+    assert "000003" in r.output
+
+    # A single Dandiset can be named on the command line:
+    r = await CliRunner().invoke(
+        main, ["-B", str(tmp_path), "-l", "WARNING", "check-largefiles", "000001"]
+    )
+    assert r.exit_code == 0, r.output
+    assert "1 Dandiset checked" in r.output
+
+    # ... and Dandisets can be excluded:
+    r = await CliRunner().invoke(
+        main,
+        ["-B", str(tmp_path), "-l", "WARNING", "check-largefiles", "-e", "00000[13]"],
+    )
+    assert r.exit_code == 0, r.output
+    assert "1 Dandiset checked" in r.output
+    assert "big.txt" not in r.output
+
+    r = await CliRunner().invoke(
+        main, ["-B", str(tmp_path), "-l", "WARNING", "check-largefiles", "--json"]
+    )
+    assert r.exit_code == 0, r.output
+    lines = r.output.splitlines()
+    report = json.loads("\n".join(lines[lines.index("[") :]))
+    assert [
+        (
+            d["dandiset"],
+            [f["path"] for f in d["to_annex"]],
+            [f["path"] for f in d["maybe_to_git"]],
+        )
+        for d in report
+    ] == [
+        ("000001", ["big.txt"], []),
+        ("000002", [], []),
+        ("000003", [], ["small.txt"]),
+    ]
+
+    r = await CliRunner().invoke(
+        main, ["-B", str(tmp_path), "check-largefiles", "--limit", "bogus"]
+    )
+    assert r.exit_code != 0
+    assert "Invalid size specification" in r.output
