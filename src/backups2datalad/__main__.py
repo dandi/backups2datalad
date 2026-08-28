@@ -612,7 +612,10 @@ def impact_to_dict(impact: LargefilesImpact) -> dict[str, Any]:
 
 def print_largefiles_report(impacts: list[LargefilesImpact], limit: int) -> None:
     print(f"Reporting against a size limit of {naturalsize(limit)}\n")
-    header = f"{'DANDISET':10} {'TO ANNEX':>9} {'SIZE':>10} {'TO GIT?':>8}  LARGEST IN GIT"
+    header = (
+        f"{'DANDISET':10} {'TO ANNEX':>9} {'SIZE':>10} {'TO GIT?':>8}"
+        "  LARGEST IN GIT"
+    )
     print(header)
     print("-" * len(header))
     for impact in impacts:

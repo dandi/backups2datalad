@@ -28,7 +28,11 @@ from backups2datalad.gitattributes import apply_policy
 ds = require_dataset(sys.argv[1], check_installed=True, purpose="configuration")
 
 if apply_policy(ds.pathobj):
+    # The `[backups2datalad]` prefix that the tool's other commits carry is
+    # deliberately omitted: it marks the commits that back up a Dandiset's
+    # assets, and this one is dataset configuration, made at creation time as
+    # well as when an existing mirror is brought up to the current policy.
     ds.save(
         ds.pathobj / ".gitattributes",
-        message="[backups2datalad] Configure annex.largefiles policy",
+        message="Configure annex.largefiles policy",
     )

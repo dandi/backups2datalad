@@ -115,3 +115,24 @@ def test_load_metadata_json(tmp_path: Path) -> None:
     assert load_metadata_json(filepath) == []
     filepath.write_text(json.dumps([{"path": "foo.txt"}]))
     assert load_metadata_json(filepath) == [{"path": "foo.txt"}]
+
+
+@pytest.mark.ai_generated
+async def test_policy_commit_is_not_a_backup_commit(tmp_path: Path) -> None:
+    """
+    The `[backups2datalad]` prefix marks the commits that back up a Dandiset's
+    assets, and the test suite pairs those commits with the contents of
+    `.dandi/assets.json`.  The commit that configures the policy has no
+    `assets.json`, so it must not carry the prefix.
+    """
+    ds = AsyncDataset(tmp_path)
+    assert await ds.ensure_installed("test dataset")
+    subjects = subprocess.run(
+        ["git", "log", "--format=%s"],
+        cwd=tmp_path,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout.splitlines()
+    assert "Configure annex.largefiles policy" in subjects
+    assert not [s for s in subjects if "[backups2datalad]" in s]
