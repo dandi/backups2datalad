@@ -436,8 +436,7 @@ async def test_large_text_asset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Text files above the size limit have to end up in git-annex rather than
-    # in Git, while the metadata we maintain ourselves stays in Git regardless
-    # of its size.
+    # in Git.
     monkeypatch.setenv(SIZE_LIMIT_ENVVAR, "1kb")
     di = DandiDatasetter(
         dandi_client=new_dandiset.client,
@@ -465,8 +464,3 @@ async def test_large_text_asset(
     ok_file_under_git(ds.path, "small.txt")
     assert ds.repo.is_under_annex(["large.txt"]) == [True]
     assert (ds.pathobj / "large.txt").is_symlink()
-    # `.dandi/assets.json` is well over the limit by now, yet it must remain
-    # readable from a plain `git clone`:
-    assert (ds.pathobj / ".dandi" / "assets.json").stat().st_size > 1000
-    ok_file_under_git(ds.path, ".dandi/assets.json")
-    ok_file_under_git(ds.path, dandiset_metadata_file)

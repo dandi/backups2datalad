@@ -6,9 +6,10 @@ Dandiset mirrors.
 This replaces DataLad's ``cfg_text2git`` procedure, which puts *all* text files
 into Git; some Dandisets contain text files that are far too large for that
 (they bloat the Git repository and are rejected by GitHub), so we cap the size
-of what goes into Git and let git-annex take everything above the cap.  The
-metadata files that backups2datalad itself maintains (``dandiset.yaml``,
-``.dandi/``, ``.git*``) are always kept in Git, no matter their size.
+of what goes into Git and let git-annex take everything above the cap.  That
+goes for every file in the mirror, the metadata we maintain ourselves
+(``dandiset.yaml``, ``.dandi/``) included: if it is big or binary, it belongs
+in git-annex.
 
 The policy is written to ``.gitattributes`` as a block delimited by marker
 comments::
@@ -39,6 +40,11 @@ The size limit can be given on the command line or via the
 backups2datalad passes it down to the procedure); it defaults to `10MiB`, the
 same limit that backups2datalad applies when deciding whether to hand an asset
 to git-annex.
+
+The commit is made with whatever git identity and dates the environment
+provides: keeping a mirror's timeline from jumping into the present is
+backups2datalad's business, and it sets ``GIT_AUTHOR_*`` accordingly around
+running this (see `AsyncDataset.ensure_installed()`).
 
 This module is deliberately restricted to the standard library: DataLad
 executes it as a plain script (outside of any package context), and
@@ -124,11 +130,6 @@ def policy_lines(size_limit: str | None = None) -> list[str]:
         # (i.e. text files up to the limit) goes into Git.
         "* annex.largefiles="
         f"((mimeencoding=binary)and(largerthan=0))or(largerthan={limit})",
-        # ... except for the files that we maintain ourselves, which have to
-        # remain readable from a bare clone regardless of their size:
-        "**/.git* annex.largefiles=nothing",
-        "/dandiset.yaml annex.largefiles=nothing",
-        ".dandi/** annex.largefiles=nothing",
         BLOCK_END,
     ]
 
@@ -186,48 +187,31 @@ def apply_policy(dspath: str | Path, size_limit: str | None = None) -> bool:
     """
     path = Path(dspath) / GITATTRIBUTES
     try:
+        # Reading in text mode translates CRLF to LF, so a file written with
+        # DOS line endings still compares equal to the LF-only policy we build
+        # here; writing with newline="\n" keeps it that way.
         current = path.read_text()
     except FileNotFoundError:
         current = ""
     new = new_gitattributes(current, size_limit)
     if new == current:
         return False
-    path.write_text(new)
+    path.write_text(new, newline="\n")
     return True
-
-
-def readgit(dspath: Path, *args: str) -> str:
-    return subprocess.run(
-        ["git", "-C", str(dspath), *args],
-        stdout=subprocess.PIPE,
-        text=True,
-        check=True,
-    ).stdout.strip()
 
 
 def commit_policy(dspath: Path) -> None:
     """
     Commit an updated ``.gitattributes``.
 
-    Unless the caller set ``GIT_AUTHOR_DATE``, the commit is given the same
-    author (and author date) as the current HEAD, so that reconfiguring an
-    existing mirror does not make its timeline jump into the present.
+    The commit takes its identity and dates from the environment; the caller
+    sets ``GIT_AUTHOR_*`` when it cares (as backups2datalad does, so that
+    configuring a mirror does not move its timeline into the present).
     """
-    env = dict(os.environ)
-    try:
-        author = readgit(dspath, "show", "-s", "--format=%an%x00%ae%x00%aI", "HEAD")
-    except subprocess.CalledProcessError:
-        pass  # No commits yet
-    else:
-        name, email, date = author.split("\0")
-        env.setdefault("GIT_AUTHOR_NAME", name)
-        env.setdefault("GIT_AUTHOR_EMAIL", email)
-        env.setdefault("GIT_AUTHOR_DATE", date)
     subprocess.run(["git", "-C", str(dspath), "add", GITATTRIBUTES], check=True)
     subprocess.run(
         ["git", "-C", str(dspath), "commit", "-m", COMMIT_MESSAGE, "--", GITATTRIBUTES],
         check=True,
-        env=env,
     )
 
 

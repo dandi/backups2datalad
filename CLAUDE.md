@@ -149,9 +149,10 @@ replacement for DataLad's `cfg_text2git`, which put *all* text files into Git
 regardless of size):
 
 - Text files up to `BACKUPS2DATALAD_TEXT_SIZE_LIMIT` (default `10MiB`) go into
-  Git; binary files and anything above the limit go to git-annex.
-- `dandiset.yaml`, `.dandi/**` and `.git*` are always kept in Git.
-- The rules are written as a block delimited by `### BEGIN dandiset default
+  Git; binary files and anything above the limit go to git-annex.  This holds
+  for the metadata we maintain (`dandiset.yaml`, `.dandi/`) as well -- there
+  are no exceptions to the rule.
+- The rule is written as a block delimited by `### BEGIN dandiset default
   policy (backups2datalad)` / `### END ...` markers; only that block is
   managed, and rules after it override the policy.
 
@@ -163,9 +164,12 @@ Key points:
   `datalad.locations.extra-procedures`) to `datalad create`, and reapplies the
   policy via `AsyncDataset.ensure_gitattributes_policy()` on already-existing
   datasets, so mirrors made under the old policy are migrated on the next
-  backup run.  The migration commit is dated the same as the then-current HEAD
-  so that a mirror's timeline does not jump into the present.  Zarr datasets pass
-  `cfg_proc=None` and are not affected.
+  backup run.  Dating the commits is the caller's job (the procedure just
+  commits with the ambient `GIT_*` environment): `ensure_installed()` passes
+  `custom_commit_env(commit_date)` down to `datalad create`, and
+  `ensure_gitattributes_policy()` dates the migration commit the same as the
+  then-current HEAD so that a mirror's timeline does not jump into the
+  present.  Zarr datasets pass `cfg_proc=None` and are not affected.
 - `Syncer`/`asyncer.py` uses the same limit (`size_limit_bytes()`) when
   deciding whether to register an asset with git-annex instead of downloading
   it into Git.

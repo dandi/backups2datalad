@@ -243,9 +243,9 @@ policy to the mirror's `.gitattributes`:
 - everything else — binary files, and text files above the limit — goes to
   git-annex
 
-- the metadata that `backups2datalad` maintains itself (`dandiset.yaml`,
-  `.dandi/`, `.git*`) is always kept in Git, whatever its size, so that it
-  remains readable from a plain `git clone`
+The rule applies to every file in the mirror, the metadata `backups2datalad`
+maintains itself (`dandiset.yaml`, `.dandi/`) included: if it is big or binary,
+it belongs in git-annex.
 
 The size limit can be changed by setting the `BACKUPS2DATALAD_TEXT_SIZE_LIMIT`
 environment variable to a git-annex size specification (e.g. `100MB`);
@@ -259,9 +259,11 @@ by `backups2datalad`; rules placed after the block override the policy and are
 left alone.  Every run of `update-from-backup` reapplies the policy to the
 mirrors it touches, so mirrors created under an older policy (DataLad's
 `cfg_text2git`, which put *all* text files into Git) are updated the next time
-they are backed up.  The reconfiguration is committed with the same date as
-the mirror's then-current HEAD, so it does not move the mirror's timeline into
-the present.
+they are backed up.  `backups2datalad` commits the reconfiguration with the
+same date as the mirror's then-current HEAD, so it does not move the mirror's
+timeline into the present.  (The procedure itself just commits with whatever
+git identity and dates the environment gives it, so a hand-run of it is dated
+now.)
 
 The procedure can also be run by hand on a mirror:
 
