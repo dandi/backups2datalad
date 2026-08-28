@@ -18,38 +18,48 @@ import re
 
 from identify.identify import tags_from_filename
 
-#: Size at which even a text file is put into git-annex rather than Git.
-#:
-#: The value is a git-annex size specification, as used by ``largerthan``.
-#: git-annex matches unit names case-insensitively but does not recognize
-#: single-letter abbreviations, so the unit is spelled out; hand-written
-#: ``.gitattributes`` files in the backup that say ``largerthan=10m`` are
-#: rewritten to this by the ``cfg_dandi_text2git`` procedure.
-TEXT_SIZE_LIMIT = "10MiB"
+#: Size at which even a text file is put into git-annex rather than Git, as a
+#: git-annex size specification (i.e., 10 MB, not 10 MiB; see `SIZE_UNITS`)
+TEXT_SIZE_LIMIT = "10m"
 
-#: Size units understood by git-annex, as a mapping from lowercased unit name
-#: to the number of bytes therein
+#: Size units understood by git-annex, as a mapping from lowercased unit name to
+#: the number of bytes therein.  Unsuffixed units are decimal; the ``i`` forms
+#: are binary.  Matched against the output of ``git annex matchexpression`` by
+#: ``test_parse_size_matches_git_annex``.
 SIZE_UNITS = {
+    "": 1,
     "b": 1,
     "byte": 1,
     "bytes": 1,
+    "k": 1000,
     "kb": 1000,
+    "kilobyte": 1000,
+    "m": 1000**2,
     "mb": 1000**2,
+    "megabyte": 1000**2,
+    "g": 1000**3,
     "gb": 1000**3,
+    "gigabyte": 1000**3,
+    "t": 1000**4,
     "tb": 1000**4,
+    "terabyte": 1000**4,
     "kib": 1024,
+    "kibibyte": 1024,
     "mib": 1024**2,
+    "mebibyte": 1024**2,
     "gib": 1024**3,
+    "gibibyte": 1024**3,
     "tib": 1024**4,
+    "tebibyte": 1024**4,
 }
 
 
 def parse_size(size: str) -> int:
     """
-    Convert a git-annex size specification (e.g., ``"10MiB"``) to a number of
+    Convert a git-annex size specification (e.g., ``"10m"``) to a number of
     bytes.  Raises `ValueError` for a specification git-annex would not accept.
     """
-    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([A-Za-z]+)\s*", size)
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([A-Za-z]*)\s*", size)
     if m is None or (mult := SIZE_UNITS.get(m[2].lower())) is None:
         raise ValueError(f"Invalid size specification: {size!r}")
     return round(float(m[1]) * mult)

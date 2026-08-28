@@ -241,12 +241,12 @@ by the `annex.largefiles` setting in the mirror's `.gitattributes`, which
 `backups2datalad` manages via the `cfg_dandi_text2git` procedure (a fixed-up
 version of DataLad's `text2git`):
 
-    * annex.largefiles=(((mimeencoding=binary)and(largerthan=0))or(largerthan=10MiB))
+    * annex.largefiles=(((mimeencoding=binary)and(largerthan=0))or(largerthan=10m))
     **/.git* annex.largefiles=nothing
 
 That is, text files are stored in Git, while binary files and files larger than
-10 MiB — including Dandiset metadata such as `.dandi/assets.json` — are stored
-in git-annex.  Only Git's own files are exempt, as they can never be annexed.
+10 MB — including Dandiset metadata such as `.dandi/assets.json` — are stored in
+git-annex.  Only Git's own files are exempt, as they can never be annexed.
 
 The procedure is applied when a mirror is created and, for mirrors created
 under an older policy, on every `update-from-backup` run, which commits the

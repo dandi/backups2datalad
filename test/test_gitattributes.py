@@ -9,6 +9,7 @@ import pytest
 
 from backups2datalad.gitattributes import (
     LARGEFILES_EXPRESSION,
+    SIZE_UNITS,
     TEXT_SIZE_LIMIT,
     TEXT_SIZE_LIMIT_BYTES,
     apply_policy,
@@ -126,12 +127,15 @@ def test_policy_takes_effect(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "size,expected",
     [
+        ("10m", 10000000),
+        ("10M", 10000000),
+        ("10MB", 10000000),
         ("10MiB", 10485760),
         ("10mib", 10485760),
-        ("10MB", 10000000),
         ("1kB", 1000),
         ("1KiB", 1024),
         ("512 bytes", 512),
+        ("512", 512),
         ("1.5MiB", 1572864),
     ],
 )
@@ -140,12 +144,96 @@ def test_parse_size(size: str, expected: int) -> None:
 
 
 @pytest.mark.ai_generated
-@pytest.mark.parametrize("size", ["10", "10m", "10 lightyears", "", "MiB"])
+@pytest.mark.parametrize("size", ["10 lightyears", "", "MiB", "-1m", "1.2.3m"])
 def test_parse_size_invalid(size: str) -> None:
-    # git-annex does not accept single-letter unit abbreviations, so neither do
-    # we; this is what makes the `largerthan=10m` in hand-edited files suspect.
     with pytest.raises(ValueError):
         parse_size(size)
+
+
+@pytest.fixture(scope="module")
+def annex_repo(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A git-annex repository for running `git annex matchexpression` in"""
+    dspath = tmp_path_factory.mktemp("matchexpression")
+    subprocess.run(["git", "init", "-q"], cwd=dspath, check=True)
+    subprocess.run(
+        ["git", "annex", "init", "test"],
+        cwd=dspath,
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+    return dspath
+
+
+def matchexpression(
+    dspath: Path, expression: str, size: int, mimeencoding: str = "us-ascii"
+) -> bool:
+    """Ask git-annex whether ``expression`` matches a file of the given size"""
+    r = subprocess.run(
+        [
+            "git",
+            "annex",
+            "matchexpression",
+            "--largefiles",
+            expression,
+            "--file=file.txt",
+            f"--size={size}",
+            f"--mimeencoding={mimeencoding}",
+        ],
+        cwd=dspath,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if r.stderr.strip():
+        # git-annex reports a malformed expression (e.g., an unrecognized size
+        # unit) on stderr and exits nonzero, which is not the same as "no match"
+        raise ValueError(f"git-annex rejected {expression!r}: {r.stderr.strip()}")
+    return r.returncode == 0
+
+
+@pytest.mark.ai_generated
+@pytest.mark.parametrize("unit,multiplier", sorted(SIZE_UNITS.items()))
+def test_parse_size_matches_git_annex(
+    annex_repo: Path, unit: str, multiplier: int
+) -> None:
+    """
+    Check `parse_size()` against git-annex itself: `TEXT_SIZE_LIMIT` and the
+    `--limit` option of `check-largefiles` are only meaningful if we agree with
+    git-annex on what a size specification means.
+    """
+    spec = f"1{unit}"
+    assert parse_size(spec) == multiplier
+    expression = f"largerthan={spec}"
+    assert not matchexpression(annex_repo, expression, multiplier)
+    assert matchexpression(annex_repo, expression, multiplier + 1)
+
+
+@pytest.mark.ai_generated
+@pytest.mark.parametrize(
+    "size,mimeencoding,annexed",
+    [
+        # Text files go into Git, up to the size limit:
+        (0, "us-ascii", False),
+        (TEXT_SIZE_LIMIT_BYTES, "us-ascii", False),
+        (TEXT_SIZE_LIMIT_BYTES + 1, "us-ascii", True),
+        (TEXT_SIZE_LIMIT_BYTES, "utf-8", False),
+        # Binary files are annexed no matter how small ...
+        (1, "binary", True),
+        (TEXT_SIZE_LIMIT_BYTES + 1, "binary", True),
+        # ... but an empty file is not a large file:
+        (0, "binary", False),
+    ],
+)
+def test_policy_expression_matches(
+    annex_repo: Path, size: int, mimeencoding: str, annexed: bool
+) -> None:
+    """
+    Check with git-annex itself that the policy annexes what we think it does.
+    """
+    assert (
+        matchexpression(annex_repo, LARGEFILES_EXPRESSION, size, mimeencoding)
+        is annexed
+    )
 
 
 @pytest.mark.ai_generated

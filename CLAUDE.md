@@ -189,7 +189,7 @@ Dandisets with huge text assets committed directly to Git, so the tool ships its
 own procedure instead:
 
 ```
-* annex.largefiles=(((mimeencoding=binary)and(largerthan=0))or(largerthan=10MiB))
+* annex.largefiles=(((mimeencoding=binary)and(largerthan=0))or(largerthan=10m))
 **/.git* annex.largefiles=nothing
 ```
 
