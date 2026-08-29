@@ -225,6 +225,7 @@ async def test_zarr_datasets_are_not_touched(tmp_path: Path) -> None:
     ds = AsyncDataset(tmp_path)
     assert await ds.ensure_installed("Test Zarr", backend="MD5E", cfg_proc=None)
     assert BLOCK_START not in (tmp_path / ".gitattributes").read_text()
+    assert annex_config(tmp_path, DOTFILES_CONFIG) == ""
     assert not await ds.ensure_installed("Test Zarr", backend="MD5E", cfg_proc=None)
     assert BLOCK_START not in (tmp_path / ".gitattributes").read_text()
 
