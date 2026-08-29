@@ -155,6 +155,12 @@ regardless of size):
 - The rule is written as a block delimited by `### BEGIN dandiset default
   policy (backups2datalad)` / `### END ...` markers; only that block is
   managed, and rules after it override the policy.
+- `annex.dotfiles=true` is set alongside it (`ensure_dotfiles()`, recorded via
+  `git annex config` in the `git-annex` branch).  It is load-bearing: git-annex
+  otherwise adds dotfiles and dot-directory content to Git regardless of
+  `annex.largefiles`, so `.dandi/assets.json` would never be annexed.  No
+  `.gitattributes` rule can override that -- 000026 has carried such a
+  workaround since 2022 and its 67 MiB `assets.json` is still in Git.
 
 Key points:
 
@@ -162,12 +168,12 @@ Key points:
   `AsyncDataset` imports `apply_policy()` from it.
 - `AsyncDataset.ensure_installed()` passes `-c dandiset` (plus
   `datalad.locations.extra-procedures`) to `datalad create`, and reapplies the
-  policy via `AsyncDataset.ensure_gitattributes_policy()` on already-existing
+  policy via `AsyncDataset.ensure_dandiset_policy()` on already-existing
   datasets, so mirrors made under the old policy are migrated on the next
   backup run.  Dating the commits is the caller's job (the procedure just
   commits with the ambient `GIT_*` environment): `ensure_installed()` passes
   `custom_commit_env(commit_date)` down to `datalad create`, and
-  `ensure_gitattributes_policy()` dates the migration commit the same as the
+  `ensure_dandiset_policy()` dates the migration commit the same as the
   then-current HEAD so that a mirror's timeline does not jump into the
   present.  Zarr datasets pass `cfg_proc=None` and are not affected.
 - `Syncer`/`asyncer.py` uses the same limit (`size_limit_bytes()`) when

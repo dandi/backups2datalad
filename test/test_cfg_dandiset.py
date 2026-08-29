@@ -13,6 +13,7 @@ from backups2datalad.procedures.cfg_dandiset import (
     BLOCK_START,
     COMMIT_MESSAGE,
     DEFAULT_SIZE_LIMIT,
+    DOTFILES_CONFIG,
     SIZE_LIMIT_ENVVAR,
     apply_policy,
     new_gitattributes,
@@ -20,6 +21,11 @@ from backups2datalad.procedures.cfg_dandiset import (
     policy_lines,
     size_limit_bytes,
 )
+
+
+def annex_config(dspath: Path, key: str) -> str:
+    return GitRepo(dspath).readcmd("annex", "config", "--get", key)
+
 
 TEXT2GIT_LINE = "* annex.largefiles=((mimeencoding=binary)and(largerthan=0))"
 
@@ -132,6 +138,8 @@ async def test_create_sets_policy(tmp_path: Path) -> None:
     # Configuring the dataset is not a backup state, so the commit must not
     # carry the "[backups2datalad]" marker that identifies those:
     assert repo.get_backup_commits() == []
+    # Without this, the size rule would not reach `.dandi/`:
+    assert annex_config(tmp_path, DOTFILES_CONFIG) == "true"
     # A second call is a no-op:
     commits = repo.get_commit_count()
     assert not await ds.ensure_installed("Test dataset")
@@ -162,6 +170,7 @@ async def test_migrate_text2git_dataset(tmp_path: Path) -> None:
     attrs = (tmp_path / ".gitattributes").read_text()
     assert TEXT2GIT_LINE in attrs.splitlines()
     assert BLOCK_START not in attrs
+    assert annex_config(tmp_path, DOTFILES_CONFIG) == ""
     repo = GitRepo(tmp_path)
     old_head = repo.get_commitish_hash("HEAD")
     old_date = repo.get_commit_date("HEAD")
@@ -173,6 +182,7 @@ async def test_migrate_text2git_dataset(tmp_path: Path) -> None:
     assert TEXT2GIT_LINE not in (tmp_path / ".gitattributes").read_text().splitlines()
     assert repo.get_commit_subject("HEAD") == COMMIT_MESSAGE
     assert repo.get_backup_commits() == []
+    assert annex_config(tmp_path, DOTFILES_CONFIG) == "true"
     assert repo.parent_is_ancestor("HEAD", old_head)
     # The reconfiguration must not move the mirror's timeline into the present:
     assert repo.get_commit_date("HEAD") == old_date
@@ -217,3 +227,38 @@ async def test_zarr_datasets_are_not_touched(tmp_path: Path) -> None:
     assert BLOCK_START not in (tmp_path / ".gitattributes").read_text()
     assert not await ds.ensure_installed("Test Zarr", backend="MD5E", cfg_proc=None)
     assert BLOCK_START not in (tmp_path / ".gitattributes").read_text()
+
+
+@pytest.mark.anyio
+@pytest.mark.ai_generated
+async def test_large_files_under_dandi_are_annexed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The whole point of `annex.dotfiles`: without it git-annex puts dotfiles
+    # and dot-directory content into Git however large they are, so the one
+    # file in these mirrors that outgrows the limit -- `.dandi/assets.json` --
+    # would stay in Git.  No `.gitattributes` rule can express this.
+    monkeypatch.setenv(SIZE_LIMIT_ENVVAR, "1kb")
+    ds = AsyncDataset(tmp_path)
+    assert await ds.ensure_installed("Test dataset")
+    assert annex_config(tmp_path, DOTFILES_CONFIG) == "true"
+
+    big = "x" * 2000
+    small = "y" * 100
+    for path, contents in [
+        (".dandi/assets.json", big),
+        (".dandi/assets-state.json", small),
+        ("asset.json", big),
+        ("dandiset.yaml", small),
+    ]:
+        p = tmp_path / path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(contents)
+        await ds.add(path)
+
+    # Over the limit -> git-annex, whether or not it is under a dot-directory:
+    assert (tmp_path / ".dandi" / "assets.json").is_symlink()
+    assert (tmp_path / "asset.json").is_symlink()
+    # Under it -> still Git:
+    assert not (tmp_path / ".dandi" / "assets-state.json").is_symlink()
+    assert not (tmp_path / "dandiset.yaml").is_symlink()

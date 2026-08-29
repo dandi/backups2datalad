@@ -247,6 +247,14 @@ The rule applies to every file in the mirror, the metadata `backups2datalad`
 maintains itself (`dandiset.yaml`, `.dandi/`) included: if it is big or binary,
 it belongs in git-annex.
 
+Reaching `.dandi/` takes a second setting, `annex.dotfiles=true`, which the
+procedure records with `git annex config` (i.e. in the `git-annex` branch, so
+it travels to every clone).  Without it git-annex adds dotfiles and
+dot-directory content to Git *whatever* `annex.largefiles` says, and
+`.dandi/assets.json` -- the one file in these mirrors that does outgrow the
+limit, up to ~94 MiB today -- would stay in Git.  No `.gitattributes` rule can
+express this on its own.
+
 The size limit can be changed by setting the `BACKUPS2DATALAD_TEXT_SIZE_LIMIT`
 environment variable to a git-annex size specification (e.g. `100MB`);
 `backups2datalad` uses it both for the `.gitattributes` policy and when
@@ -264,6 +272,10 @@ same date as the mirror's then-current HEAD, so it does not move the mirror's
 timeline into the present.  (The procedure itself just commits with whatever
 git identity and dates the environment gives it, so a hand-run of it is dated
 now.)
+
+Note that a mirror where `.dandi/assets.json` has moved into git-annex no
+longer carries that file's content in a plain `git clone`; it has to be
+fetched from the special remote like any other annexed file.
 
 The procedure can also be run by hand on a mirror:
 

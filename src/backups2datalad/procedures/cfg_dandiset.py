@@ -11,6 +11,22 @@ goes for every file in the mirror, the metadata we maintain ourselves
 (``dandiset.yaml``, ``.dandi/``) included: if it is big or binary, it belongs
 in git-annex.
 
+Two things are needed for that, because ``.gitattributes`` alone cannot express
+it:
+
+1. the ``annex.largefiles`` rule below, and
+2. ``annex.dotfiles=true``.
+
+Without (2), git-annex adds dotfiles and anything under a dot-directory to Git
+*whatever* ``annex.largefiles`` says, so ``.dandi/assets.json`` -- the one file
+in these mirrors that actually does grow past the limit -- would stay in Git.
+No ``.gitattributes`` rule can override that: a rule on ``.dandi/**``, one in a
+nested ``.dandi/.gitattributes``, and even ``annex.largefiles=anything`` on the
+exact path all lose to it (000026 has carried such a workaround since 2022, and
+its 67 MiB ``assets.json`` has been in Git the whole time).  The setting is
+made with ``git annex config``, which records it in the ``git-annex`` branch so
+that it travels to every clone.
+
 The policy is written to ``.gitattributes`` as a block delimited by marker
 comments::
 
@@ -66,6 +82,10 @@ DEFAULT_SIZE_LIMIT = "10MiB"
 
 #: Environment variable overriding `DEFAULT_SIZE_LIMIT`
 SIZE_LIMIT_ENVVAR = "BACKUPS2DATALAD_TEXT_SIZE_LIMIT"
+
+#: git-annex config (stored in the git-annex branch) that lets the rule above
+#: apply to dotfiles and dot-directories as well
+DOTFILES_CONFIG = "annex.dotfiles"
 
 BLOCK_START = "### BEGIN dandiset default policy (backups2datalad)"
 BLOCK_END = "### END dandiset default policy (backups2datalad)"
@@ -200,6 +220,32 @@ def apply_policy(dspath: str | Path, size_limit: str | None = None) -> bool:
     return True
 
 
+def ensure_dotfiles(dspath: str | Path) -> bool:
+    """
+    Ensure ``annex.dotfiles`` is on, so that the size rule reaches
+    ``.dandi/`` and friends.  Returns `True` if it had to be set.
+
+    Nothing is committed on the branch by this: ``git annex config`` records
+    the setting in the ``git-annex`` branch.
+    """
+    argv = ["git", "-C", str(dspath), "annex", "config"]
+    try:
+        current = subprocess.run(
+            [*argv, "--get", DOTFILES_CONFIG],
+            stdout=subprocess.PIPE, text=True, check=True,
+        ).stdout.strip()
+    except subprocess.CalledProcessError:
+        # Not an annex repo (or too old a git-annex); nothing to configure
+        return False
+    if current == "true":
+        return False
+    subprocess.run(
+        [*argv, "--set", DOTFILES_CONFIG, "true"],
+        stdout=subprocess.DEVNULL, check=True,
+    )
+    return True
+
+
 def commit_policy(dspath: Path) -> None:
     """
     Commit an updated ``.gitattributes``.
@@ -250,6 +296,7 @@ def main(argv: list[str] | None = None) -> int:
     size_limit = (
         args.size_limit if args.size_limit is not None else args.size_limit_arg
     )
+    ensure_dotfiles(args.dataset)
     if apply_policy(args.dataset, size_limit) and not args.no_commit:
         commit_policy(args.dataset)
     return 0

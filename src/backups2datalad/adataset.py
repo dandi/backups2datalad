@@ -30,7 +30,12 @@ from .consts import DEFAULT_BRANCH, GIT_OPTIONS
 from .logging import log
 from .procedures import PROCEDURES_DIR
 from .procedures.cfg_dandiset import COMMIT_MESSAGE as POLICY_COMMIT_MESSAGE
-from .procedures.cfg_dandiset import SIZE_LIMIT_ENVVAR, apply_policy, get_size_limit
+from .procedures.cfg_dandiset import (
+    SIZE_LIMIT_ENVVAR,
+    apply_policy,
+    ensure_dotfiles,
+    get_size_limit,
+)
 from .util import custom_commit_env, exp_wait, fromisoformat, is_meta_file, key2hash
 
 EMBARGO_STATUS_KEY = "dandi.dandiset.embargo-status"
@@ -72,9 +77,9 @@ class AsyncDataset:
         if self.ds.is_installed():
             if cfg_proc is not None:
                 # The dataset was created by an earlier run, possibly under an
-                # older policy; bring its .gitattributes up to date so that
-                # future commits abide by the current one.
-                await self.ensure_gitattributes_policy()
+                # older policy; bring it up to date so that future commits
+                # abide by the current one.
+                await self.ensure_dandiset_policy()
             return False
         log.info("Creating dataset for %s", desc)
         argv = [
@@ -126,18 +131,21 @@ class AsyncDataset:
         log.debug("Dataset for %s created", desc)
         return True
 
-    async def ensure_gitattributes_policy(
+    async def ensure_dandiset_policy(
         self, commit_date: datetime | None = None
     ) -> bool:
         """
-        Ensure that ``.gitattributes`` carries an up-to-date `cfg_dandiset`
-        policy block, committing it if it changed.  Returns `True` if a commit
-        was made.
+        Ensure the dataset carries an up-to-date `cfg_dandiset` policy: the
+        ``.gitattributes`` block (committed if it changed) and
+        ``annex.dotfiles``, without which the size rule would not reach
+        ``.dandi/``.  Returns `True` if a commit was made.
 
         Unless ``commit_date`` is given, the commit is dated the same as the
         current HEAD, so that reconfiguring a long-standing mirror does not
         move its timeline into the present.
         """
+        if await run_sync(ensure_dotfiles, self.pathobj):
+            log.info("Enabled %s in %s", "annex.dotfiles", self.path)
         if not apply_policy(self.pathobj):
             return False
         log.info("Updating .gitattributes policy in %s", self.path)

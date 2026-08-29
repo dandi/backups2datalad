@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import logging
 from pathlib import Path
 
@@ -464,3 +465,16 @@ async def test_large_text_asset(
     ok_file_under_git(ds.path, "small.txt")
     assert ds.repo.is_under_annex(["large.txt"]) == [True]
     assert (ds.pathobj / "large.txt").is_symlink()
+    # `.dandi/assets.json` is over the limit too, and `annex.dotfiles` is what
+    # lets the rule reach it:
+    assert (ds.pathobj / ".dandi" / "assets.json").stat().st_size > 1000
+    assert (ds.pathobj / ".dandi" / "assets.json").is_symlink()
+
+    # The next run has to cope with an annexed assets.json: it reads the file
+    # to work out what changed, then rewrites it.
+    log.info("test_large_text_asset: Syncing again")
+    await di.update_from_backup([dandiset_id])
+    assert_repo_status(ds.path)
+    assert (ds.pathobj / ".dandi" / "assets.json").is_symlink()
+    with (ds.pathobj / ".dandi" / "assets.json").open() as fp:
+        assert {a["path"] for a in json.load(fp)} == {"small.txt", "large.txt"}
