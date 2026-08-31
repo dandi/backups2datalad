@@ -19,7 +19,9 @@ from backups2datalad.adataset import AssetsState, AsyncDataset
 from backups2datalad.config import BackupConfig
 from backups2datalad.consts import DEFAULT_BRANCH
 from backups2datalad.datasetter import DandiDatasetter
-from backups2datalad.procedures.cfg_dandiset import COMMIT_MESSAGE as POLICY_COMMIT_MESSAGE
+from backups2datalad.procedures.cfg_dandiset import (
+    COMMIT_MESSAGE as POLICY_COMMIT_MESSAGE,
+)
 from backups2datalad.procedures.cfg_dandiset import SIZE_LIMIT_ENVVAR
 
 log = logging.getLogger("test_backups2datalad.test_core")
@@ -142,6 +144,11 @@ async def test_1(
         commit_authors
     )
 
+    # Assert that tag-merge commits preserve the prior draft branch date so
+    # that detection of new changes since the release still works correctly.
+    for mc in repo.get_merge_commits(DEFAULT_BRANCH):
+        assert repo.get_commit_date(mc) == repo.get_commit_date(f"{mc}^1")
+
     for c in repo.get_backup_commits():
         assert repo.get_asset_files(c) == {
             asset["path"] for asset in repo.get_assets_json(c)
@@ -229,6 +236,9 @@ async def test_2(
         assert repo.get_asset_files(c) == {
             asset["path"] for asset in repo.get_assets_json(c)
         }
+
+    for mc in repo.get_merge_commits(DEFAULT_BRANCH):
+        assert repo.get_commit_date(mc) == repo.get_commit_date(f"{mc}^1")
 
     commits = superrepo.readcmd("rev-list", "HEAD").splitlines()
     assert superrepo.get_commit_message(commits[0]) == (
@@ -333,6 +343,9 @@ async def test_3(
     for c, (v, _) in zip(reversed(our_commits), versions):
         assert repo.get_commitish_hash(f"{v.identifier}^") == c
     assert our_commits[0] == repo.get_commitish_hash(versions[-1][0].identifier)
+
+    for mc in repo.get_merge_commits(DEFAULT_BRANCH):
+        assert repo.get_commit_date(mc) == repo.get_commit_date(f"{mc}^1")
 
     for c in repo.get_backup_commits():
         assert repo.get_asset_files(c) == {
