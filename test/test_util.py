@@ -106,6 +106,10 @@ class GitRepo:
         assert isinstance(assets, list)
         return assets
 
+    def get_merge_commits(self, branch: str) -> list[str]:
+        out = self.readcmd("log", "--merges", "--format=%H", branch)
+        return out.splitlines() if out else []
+
     def get_commit_count(self) -> int:
         return int(self.readcmd("rev-list", "--count", "HEAD"))
 

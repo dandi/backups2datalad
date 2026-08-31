@@ -36,6 +36,7 @@ from .syncer import Syncer
 from .util import (
     AssetTracker,
     assets_eq,
+    custom_commit_env,
     fromisoformat,
     quantify,
     update_dandiset_metadata,
@@ -406,6 +407,7 @@ class DandiDatasetter(AsyncResource):
                 assert m, f"Could not parse `git describe` output: {description!r}"
                 merge = PkgVersion(latest) > PkgVersion(m["tag"])
             if merge:
+                prior_date = await ds.get_last_commit_date()
                 await ds.call_git(
                     "merge",
                     "-s",
@@ -414,6 +416,7 @@ class DandiDatasetter(AsyncResource):
                     f"Merge '{latest}' into drafts branch (no differences in"
                     " content merged)",
                     latest,
+                    env=custom_commit_env(prior_date),
                 )
             if push and (changed or merge):
                 await ds.push(
