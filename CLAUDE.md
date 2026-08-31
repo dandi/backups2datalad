@@ -141,6 +141,45 @@ Zarr files within embargoed Dandisets receive special handling to maintain priva
 - `Syncer.update_zarr_repos_privacy()` in `syncer.py` - Batch updating Zarr repository privacy
 - `sync_zarr()` in `zarr.py` - Creating Zarr repos with embargo-aware privacy
 
+## Git vs. git-annex Content Policy
+
+Dandiset mirrors get their `.gitattributes` from the `cfg_dandiset` DataLad
+procedure in `src/backups2datalad/procedures/cfg_dandiset.py` (a fixed-up
+replacement for DataLad's `cfg_text2git`, which put *all* text files into Git
+regardless of size):
+
+- Text files up to `BACKUPS2DATALAD_TEXT_SIZE_LIMIT` (default `10MiB`) go into
+  Git; binary files and anything above the limit go to git-annex.  This holds
+  for the metadata we maintain (`dandiset.yaml`, `.dandi/`) as well -- there
+  are no exceptions to the rule.
+- The rule is written as a block delimited by `### BEGIN dandiset default
+  policy (backups2datalad)` / `### END ...` markers; only that block is
+  managed, and rules after it override the policy.
+- `annex.dotfiles=true` is set alongside it (`ensure_dotfiles()`, recorded via
+  `git annex config` in the `git-annex` branch).  It is load-bearing: git-annex
+  otherwise adds dotfiles and dot-directory content to Git regardless of
+  `annex.largefiles`, so `.dandi/assets.json` would never be annexed.  No
+  `.gitattributes` rule can override that -- 000026 has carried such a
+  workaround since 2022 and its 67 MiB `assets.json` is still in Git.
+
+Key points:
+
+- The module is stdlib-only: DataLad runs it as a plain script, and
+  `AsyncDataset` imports `apply_policy()` from it.
+- `AsyncDataset.ensure_installed()` passes `-c dandiset` (plus
+  `datalad.locations.extra-procedures`) to `datalad create`, and reapplies the
+  policy via `AsyncDataset.ensure_dandiset_policy()` on already-existing
+  datasets, so mirrors made under the old policy are migrated on the next
+  backup run.  Dating the commits is the caller's job (the procedure just
+  commits with the ambient `GIT_*` environment): `ensure_installed()` passes
+  `custom_commit_env(commit_date)` down to `datalad create`, and
+  `ensure_dandiset_policy()` dates the migration commit the same as the
+  then-current HEAD so that a mirror's timeline does not jump into the
+  present.  Zarr datasets pass `cfg_proc=None` and are not affected.
+- `Syncer`/`asyncer.py` uses the same limit (`size_limit_bytes()`) when
+  deciding whether to register an asset with git-annex instead of downloading
+  it into Git.
+
 ## Main Workflow
 
 1. Configuration is loaded from a YAML file

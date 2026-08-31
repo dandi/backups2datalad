@@ -34,6 +34,7 @@ from .config import BackupConfig, ZarrMode
 from .consts import GIT_OPTIONS, USER_AGENT
 from .logging import PrefixedLogger, log
 from .manager import Manager
+from .procedures.cfg_dandiset import size_limit_bytes
 from .util import (
     AssetTracker,
     UnexpectedChangeError,
@@ -287,8 +288,13 @@ class Downloader:
                     self.report.updated += 1
             if to_update:
                 await self.ds.remove(blob.path)
-                if blob.is_binary():
-                    blob.log.info("File is binary; registering key with git-annex")
+                # Text files above the size limit are annexed as well; cf. the
+                # `.gitattributes` policy set by `cfg_dandiset`.
+                if blob.is_binary() or blob.asset.size > size_limit_bytes():
+                    blob.log.info(
+                        "File is binary or too large for Git;"
+                        " registering key with git-annex"
+                    )
                     key = await self.annex.mkkey(
                         PurePosixPath(blob.path).name,
                         blob.asset.size,
@@ -309,11 +315,6 @@ class Downloader:
                         blob.log.info("Not in backup remote %r", remote.name)
                     self.tracker.finish_asset(blob.path)
                     self.report.registered += 1
-                elif blob.asset.size > (10 << 20):
-                    raise RuntimeError(
-                        f"{blob.path} identified as text but is"
-                        f" {blob.asset.size} bytes!"
-                    )
                 else:
                     await self.ensure_addurl()
                     url = blob.asset.base_download_url

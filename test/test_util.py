@@ -10,6 +10,7 @@ from typing import Any
 
 from dandi.utils import find_files
 
+from backups2datalad.procedures.cfg_dandiset import BLOCK_END, BLOCK_START
 from backups2datalad.util import is_meta_file
 
 
@@ -107,6 +108,18 @@ class GitRepo:
 
     def get_commit_count(self) -> int:
         return int(self.readcmd("rev-list", "--count", "HEAD"))
+
+
+def gitattributes_policy(dspath: Path) -> list[str]:
+    """
+    Return the lines (markers included) of the `cfg_dandiset` policy block in
+    the ``.gitattributes`` of the dataset at ``dspath``
+    """
+    lines = (dspath / ".gitattributes").read_text().splitlines()
+    assert BLOCK_START in lines, f"No policy block in {dspath}/.gitattributes"
+    start = lines.index(BLOCK_START)
+    assert BLOCK_END in lines[start:], f"Unterminated policy block in {dspath}"
+    return lines[start : lines.index(BLOCK_END, start) + 1]
 
 
 def find_filepaths(dirpath: Path) -> Iterator[Path]:

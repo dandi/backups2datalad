@@ -228,3 +228,58 @@ subcommand.
 The primary mirroring subcommands are `update-from-backup`, `populate`, and
 `populate-zarrs`; the other subcommands are for minor/maintenance tasks and
 usually do not need to be run.
+
+
+What Goes into Git and What Goes into git-annex
+-----------------------------------------------
+
+Dandiset mirrors are created with the `cfg_dandiset` DataLad procedure that
+ships with this package (see
+`src/backups2datalad/procedures/cfg_dandiset.py`), which writes the following
+policy to the mirror's `.gitattributes`:
+
+- text files up to a size limit (10 MiB by default) are committed to Git
+
+- everything else — binary files, and text files above the limit — goes to
+  git-annex
+
+The rule applies to every file in the mirror, the metadata `backups2datalad`
+maintains itself (`dandiset.yaml`, `.dandi/`) included: if it is big or binary,
+it belongs in git-annex.
+
+Reaching `.dandi/` takes a second setting, `annex.dotfiles=true`, which the
+procedure records with `git annex config` (i.e. in the `git-annex` branch, so
+it travels to every clone).  Without it git-annex adds dotfiles and
+dot-directory content to Git *whatever* `annex.largefiles` says, and
+`.dandi/assets.json` -- the one file in these mirrors that does outgrow the
+limit, up to ~94 MiB today -- would stay in Git.  No `.gitattributes` rule can
+express this on its own.
+
+The size limit can be changed by setting the `BACKUPS2DATALAD_TEXT_SIZE_LIMIT`
+environment variable to a git-annex size specification (e.g. `100MB`);
+`backups2datalad` uses it both for the `.gitattributes` policy and when
+deciding whether to hand an asset to git-annex.
+
+The policy is delimited in `.gitattributes` by `### BEGIN dandiset default
+policy (backups2datalad)` / `### END dandiset default policy
+(backups2datalad)` marker lines.  Only what is between the markers is managed
+by `backups2datalad`; rules placed after the block override the policy and are
+left alone.  Every run of `update-from-backup` reapplies the policy to the
+mirrors it touches, so mirrors created under an older policy (DataLad's
+`cfg_text2git`, which put *all* text files into Git) are updated the next time
+they are backed up.  `backups2datalad` commits the reconfiguration with the
+same date as the mirror's then-current HEAD, so it does not move the mirror's
+timeline into the present.  (The procedure itself just commits with whatever
+git identity and dates the environment gives it, so a hand-run of it is dated
+now.)
+
+Note that a mirror where `.dandi/assets.json` has moved into git-annex no
+longer carries that file's content in a plain `git clone`; it has to be
+fetched from the special remote like any other annexed file.
+
+The procedure can also be run by hand on a mirror:
+
+    python -m backups2datalad.procedures.cfg_dandiset path/to/mirror [SIZE-LIMIT]
+
+It is idempotent: if the mirror's policy is already up to date, nothing is
+changed and nothing is committed.

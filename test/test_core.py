@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import logging
 from pathlib import Path
 
@@ -18,6 +19,8 @@ from backups2datalad.adataset import AssetsState, AsyncDataset
 from backups2datalad.config import BackupConfig
 from backups2datalad.consts import DEFAULT_BRANCH
 from backups2datalad.datasetter import DandiDatasetter
+from backups2datalad.procedures.cfg_dandiset import COMMIT_MESSAGE as POLICY_COMMIT_MESSAGE
+from backups2datalad.procedures.cfg_dandiset import SIZE_LIMIT_ENVVAR
 
 log = logging.getLogger("test_backups2datalad.test_core")
 
@@ -240,7 +243,7 @@ async def test_2(
         "\n"
         f"{dandiset_id}:\n"
         " - [backups2datalad] 5 files added\n"
-        " - Instruct annex to add text files to Git\n"
+        f" - {POLICY_COMMIT_MESSAGE}\n"
         " - [DATALAD] new dataset"
     )
 
@@ -424,3 +427,54 @@ async def test_custom_commit_date(tmp_path: Path) -> None:
     repo = GitRepo(tmp_path)
     assert repo.get_commit_date("HEAD") == "2021-06-01T12:34:56+00:00"
     assert repo.get_commit_author("HEAD") == "DANDI User <info@dandiarchive.org>"
+
+
+@pytest.mark.ai_generated
+async def test_large_text_asset(
+    docker_archive: Archive,
+    new_dandiset: SampleDandiset,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Text files above the size limit have to end up in git-annex rather than
+    # in Git.
+    monkeypatch.setenv(SIZE_LIMIT_ENVVAR, "1kb")
+    di = DandiDatasetter(
+        dandi_client=new_dandiset.client,
+        config=BackupConfig(
+            backup_root=tmp_path,
+            dandi_instance=docker_archive.instance_id,
+            s3bucket=docker_archive.s3bucket,
+            s3endpoint=docker_archive.s3endpoint,
+            content_url_regex=(
+                f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/"
+            ),
+            enable_tags=True,
+        ),
+    )
+    new_dandiset.add_text("small.txt", "a" * 500)
+    new_dandiset.add_text("large.txt", "b" * 2000)
+    await new_dandiset.upload()
+    dandiset_id = new_dandiset.dandiset_id
+    log.info("test_large_text_asset: Syncing test dandiset")
+    await di.update_from_backup([dandiset_id])
+
+    ds = Dataset(tmp_path / "dandisets" / dandiset_id)
+    assert_repo_status(ds.path)
+    assert "or(largerthan=1kb)" in (ds.pathobj / ".gitattributes").read_text()
+    ok_file_under_git(ds.path, "small.txt")
+    assert ds.repo.is_under_annex(["large.txt"]) == [True]
+    assert (ds.pathobj / "large.txt").is_symlink()
+    # `.dandi/assets.json` is over the limit too, and `annex.dotfiles` is what
+    # lets the rule reach it:
+    assert (ds.pathobj / ".dandi" / "assets.json").stat().st_size > 1000
+    assert (ds.pathobj / ".dandi" / "assets.json").is_symlink()
+
+    # The next run has to cope with an annexed assets.json: it reads the file
+    # to work out what changed, then rewrites it.
+    log.info("test_large_text_asset: Syncing again")
+    await di.update_from_backup([dandiset_id])
+    assert_repo_status(ds.path)
+    assert (ds.pathobj / ".dandi" / "assets.json").is_symlink()
+    with (ds.pathobj / ".dandi" / "assets.json").open() as fp:
+        assert {a["path"] for a in json.load(fp)} == {"small.txt", "large.txt"}
