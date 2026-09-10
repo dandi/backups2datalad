@@ -23,7 +23,7 @@ from .adandi import AsyncDandiClient
 from .adataset import AsyncDataset
 from .aioutil import pool_amap, stream_lines_command
 from .config import BackupConfig, Mode, ZarrMode
-from .consts import GIT_OPTIONS
+from .consts import DEFAULT_QUIESCENT_PERIOD, GIT_OPTIONS
 from .datasetter import DandiDatasetter
 from .logging import log
 from .register_s3 import register_s3urls
@@ -176,6 +176,19 @@ def print_logfile(
     ),
 )
 @click.option(
+    "--quiescent-period",
+    type=click.FloatRange(min=0),
+    default=None,
+    metavar="SECONDS",
+    help=(
+        "Skip Dandisets whose 'modified' timestamp is less than this many"
+        " seconds in the past, as they are likely still being changed.  Set to"
+        " 0 to disable.  [default:"
+        f" {DEFAULT_QUIESCENT_PERIOD:g}, unless different value set via config"
+        " file]"
+    ),
+)
+@click.option(
     "--tags/--no-tags",
     default=None,
     help="Enable/disable creation of tags for releases  [default: enabled]",
@@ -221,6 +234,7 @@ async def update_from_backup(
     mode: Mode | None,
     zarr_mode: ZarrMode | None,
     force_push: tuple[str, ...],
+    quiescent_period: float | None,
 ) -> None:
     """
     Create & update local mirrors of Dandisets and the Zarrs within them.
@@ -245,6 +259,8 @@ async def update_from_backup(
             datasetter.config.zarr_mode = zarr_mode
         if gc_assets is not None:
             datasetter.config.gc_assets = gc_assets
+        if quiescent_period is not None:
+            datasetter.config.quiescent_period = quiescent_period
         if force_push:
             datasetter.config.force_push = set(force_push)
             if datasetter.config.force_push:

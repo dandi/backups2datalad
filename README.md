@@ -140,6 +140,18 @@ Before running `backups2datalad`, the following setup must be performed:
           `update-from-backup` subcommand, which overrides any value given in
           the configuration file.
 
+    - `quiescent_period` *(number)* — Skip (until a later run) any Dandiset
+      whose "modified" timestamp on the server is fewer than this many seconds
+      in the past, on the grounds that it is probably still being changed —
+      e.g., a mass upload or delete of assets is in progress, in which case the
+      asset listing paged through by the mirroring code would not agree with
+      the assets it later queries.  Defaults to 30.  Set to 0 to disable the
+      check.
+
+        - This option can also be set via the `--quiescent-period` option of
+          the `update-from-backup` subcommand, which overrides any value given
+          in the configuration file.
+
     - `mode` — Specify how to decide whether to back up a Dandiset.  Possible
       values are:
 

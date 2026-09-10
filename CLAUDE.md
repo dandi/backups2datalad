@@ -192,6 +192,31 @@ Key points:
    - Optionally pushes changes to GitHub organizations (with appropriate privacy settings)
    - Creates tags for published versions
 
+## Quiescent Period
+
+A Dandiset that was modified on the server a moment ago is likely still being
+changed -- a mass upload or delete of assets is in flight -- and mirroring it
+mid-flight makes the asset listing we paginate through disagree with the assets
+we later query (see issue #119, where 1059 assets vanished between the listing
+and the `assets.json` comparison, tripping `UnexpectedChangeError`).
+
+`DandiDatasetter.update_dandiset()` therefore skips any Dandiset whose
+`version.modified` is fewer than `BackupConfig.quiescent_period` seconds in the
+past, before the local dataset is even created; the next run picks it up.
+
+- Default: `DEFAULT_QUIESCENT_PERIOD` (30 s) in `consts.py`.
+- Settable per-run via `--quiescent-period SECONDS` on `update-from-backup`, or
+  via `quiescent_period` in the config file.  `0` disables the check.
+- The arithmetic lives in `util.quiescence_wait()`, which returns how many more
+  seconds must elapse (non-positive means quiescent).  A `modified` in the
+  future -- a local clock lagging the server's -- lengthens the wait, erring
+  towards skipping.
+- The config field uses `default_factory` so that the constant is read at
+  instantiation time; `test/conftest.py`'s autouse `no_quiescent_period` fixture
+  patches it to `0` for the suite, since sample Dandisets are created and backed
+  up within seconds of each other.  Tests exercising the gate itself
+  (`test/test_quiescence.py`) pass `quiescent_period` explicitly.
+
 ## Testing
 
 The project uses pytest for testing, with fixtures for:

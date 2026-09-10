@@ -9,7 +9,12 @@ import anyio
 from dandi.utils import yaml_dump, yaml_load
 from pydantic import BaseModel, Field, model_validator
 
-from .consts import DEFAULT_GIT_ANNEX_JOBS, DEFAULT_WORKERS, ZARR_LIMIT
+from .consts import (
+    DEFAULT_GIT_ANNEX_JOBS,
+    DEFAULT_QUIESCENT_PERIOD,
+    DEFAULT_WORKERS,
+    ZARR_LIMIT,
+)
 
 
 class Remote(BaseModel):
@@ -65,6 +70,12 @@ class BackupConfig(BaseModel):
     mode: Mode = Mode.TIMESTAMP
     zarr_mode: ZarrMode = ZarrMode.TIMESTAMP
     force_push: set[str] = Field(default_factory=set)  # "dandisets", "zarrs", "all"
+    # `default_factory` rather than `default` so that the constant is
+    # looked up at instantiation time, which lets the test suite disable
+    # the gate wholesale by patching it.
+    quiescent_period: float = Field(
+        default_factory=lambda: DEFAULT_QUIESCENT_PERIOD, ge=0
+    )
 
     @model_validator(mode="after")
     def _validate(self) -> BackupConfig:
