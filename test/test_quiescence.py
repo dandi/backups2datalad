@@ -55,7 +55,7 @@ def uninitializable(monkeypatch: pytest.MonkeyPatch) -> None:
     a server to back it up from.
     """
 
-    async def init_dataset(*args: Any, **kwargs: Any) -> NoReturn:
+    async def init_dataset(*_args: Any, **_kwargs: Any) -> NoReturn:
         raise NotSkipped()
 
     monkeypatch.setattr(DandiDatasetter, "init_dataset", init_dataset)
@@ -107,9 +107,8 @@ async def test_skip_recently_modified_dandiset(
 
 
 @pytest.mark.ai_generated
-async def test_settled_dandiset_is_not_skipped(
-    tmp_path: Path, uninitializable: None
-) -> None:
+@pytest.mark.usefixtures("uninitializable")
+async def test_settled_dandiset_is_not_skipped(tmp_path: Path) -> None:
     di = make_datasetter(tmp_path, quiescent_period=30.0)
     d = mock_dandiset(datetime.now(timezone.utc) - timedelta(seconds=45))
     with pytest.raises(NotSkipped):
@@ -117,9 +116,8 @@ async def test_settled_dandiset_is_not_skipped(
 
 
 @pytest.mark.ai_generated
-async def test_zero_quiescent_period_disables_gate(
-    tmp_path: Path, uninitializable: None
-) -> None:
+@pytest.mark.usefixtures("uninitializable")
+async def test_zero_quiescent_period_disables_gate(tmp_path: Path) -> None:
     """A period of 0 turns the gate off, even for a future timestamp."""
     di = make_datasetter(tmp_path, quiescent_period=0.0)
     d = mock_dandiset(datetime.now(timezone.utc) + timedelta(seconds=10))
