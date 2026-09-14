@@ -1,11 +1,12 @@
 # Plan: surviving GitHub secondary rate limits when creating Zarr repositories
 
-Status: **draft v3 for review** (2026-09-14).  Comment inline on the PR, or
+Status: **draft v4 for review** (2026-09-14).  Comment inline on the PR, or
 edit this file directly.  Nothing below is implemented yet.
 
 v2 folded in three independent reviews (fact-check, design, ops/recovery) of
-v1; v3 applies the maintainer's decisions on dirty datasets and cron locking.
-§12 lists what changed.  Everything cited as `file:line` was
+v1; v3 applied the maintainer's decisions on dirty datasets and cron
+locking; v4 removes every locally invented quota number and makes explicit
+that pushes are never forced.  §12 lists what changed.  Everything cited as `file:line` was
 re-verified against `main` (2e85461) and DataLad `38368d7`.
 
 ## 1. The incident
@@ -137,6 +138,28 @@ between each" POST/PATCH/PUT/DELETE when making many.  The limits are per
 Not documented: how long a content-creation block lasts; whether it carries
 `retry-after`; whether repo creation is one of the "lower limit" endpoints.
 Do not encode 80/500 in logic; log headers and react to them.
+
+### 2.5 How GitHub informs us today, and what that leaves for local constants
+
+* Every REST response carries `x-ratelimit-limit/remaining/used/reset/resource`
+  — the *primary* budget for that resource — and a limit response may carry
+  `retry-after`.  `GET /rate_limit` reports the same primary numbers.
+* We read those headers **for logging only** (`_describe_http_error()`,
+  `aioutil.py:184-199`); nothing acts on them, and the sleep schedule is our
+  own `exp_wait` (§2.3).  DataLad's call does not surface them at all.
+* The *secondary* content-creation limit that hit us publishes nothing beyond
+  the 403/429 itself and, if present, `retry-after`: no header, no endpoint,
+  no quota to read (`x-ratelimit-remaining` is normally still > 0 on such a
+  response).  Its thresholds exist only in prose and change without notice.
+
+So the plan relays GitHub's signals — `retry-after`, `x-ratelimit-reset`,
+and its documented fallback for an unannounced secondary limit (≥ 60 s,
+doubling) — and encodes **no per-hour or per-run budget of its own**.  The
+only local numbers are: how many consecutive rate-limited responses before
+the run gives up on further creations (GitHub: "throw an error after a
+specific number of retries"; the number is ours), the ≥ 1 s spacing between
+mutations (GitHub's), and a timeout for DataLad's untimed POST (ours, not a
+quota).
 
 ## 3. Fragilities this exposes
 
@@ -278,6 +301,14 @@ proposal adds the narrowest one that is coherent — a per-process gate on
 
 ## 6. Proposed changes
 
+In one paragraph: serialise GitHub mutations behind one lock with ≥ 1 s
+spacing; on a rate-limit response sleep for what GitHub says (or its
+documented fallback) and give up on further creations for this run after N
+consecutive ones; wrap DataLad's repo creation in that, passing a real
+description; on every visit push commits the remote lacks (a plain push,
+never forced) and describe repos still undescribed; fix F5; report dirty
+datasets.  Everything else below is diagnostics or cleanup tooling.
+
 Staged into three PRs (§7).  Each item names its blast radius; §7.1 lists
 every behavioural delta for runs that never hit a limit.
 
@@ -302,22 +333,23 @@ every behavioural delta for runs that never hit a limit.
 A small `GitHubGate` object held by `GitHub` (its own module or `aioutil.py`,
 so `adataset.py` can receive it without importing `manager`).  All state is
 touched only from the event loop (never from inside a DataLad thread), so no
-lock is needed for the fields:
+lock is needed for the fields.  It encodes no GitHub quota numbers; it relays
+what GitHub says (§2.5):
 
-* **Cooldown**: `cooldown_until` (monotonic), `hits`, `cumulative_cooldown`.
-  `note_rate_limited(retry_after)` sets `cooldown_until = max(cooldown_until,
-  now + delay)` and increments `hits` only if the previous cooldown had
-  already expired (ten workers failing in the same second are *one*
-  incident).  `hits` resets to 0 after any successful mutation.
-  `delay = max(retry_after or reset-remaining, 60 s × 2**hits)`, capped at
-  **5 min** per sleep (bounds the run's wall time; see §7.4).
-  `wait()` loops until `cooldown_until` has passed (the deadline can move
-  while sleeping).
-* **Breaker**: once `cumulative_cooldown` in the process exceeds **30 min**,
-  the gate trips: every further mutation raises `GitHubRateLimited`
-  immediately, so the run finishes with N failed Zarrs/Dandisets instead of
-  every worker sleeping out its own budget.  GETs are not gated by the
-  breaker (they still observe the cooldown).
+* **Cooldown**: `note_rate_limited(headers)` sets `cooldown_until =
+  max(cooldown_until, now + delay)` with `delay` = `retry-after` if present;
+  else until `x-ratelimit-reset` if `x-ratelimit-remaining` is 0; else
+  GitHub's documented fallback for an unannounced secondary limit: 60 s,
+  doubling per consecutive hit.  A hit that arrives while a cooldown is
+  still running does not escalate (ten workers failing in the same second
+  are *one* incident).  `wait()` loops until `cooldown_until` has passed.
+* **Give-up**: after `GITHUB_RATE_LIMIT_ATTEMPTS` (proposed 5) consecutive
+  rate-limited responses in the process, every further mutation raises
+  `GitHubRateLimited` immediately, so the run ends with N failed Zarrs
+  instead of every worker sleeping in turn.  Any successful mutation resets
+  the counter.  With the doubling fallback, 5 attempts bound the wait at
+  ~31 min; a `retry-after` from GitHub is honoured as given.  GETs observe
+  the cooldown but never the give-up.
 * **Serialisation + spacing**: an `anyio.Lock` plus ≥ 1 s between the *end*
   of one mutation and the start of the next — GitHub's own guidance — for
   repo creation, `edit_repo` and `create_release` alike.  This is what turns
@@ -325,18 +357,14 @@ lock is needed for the fields:
   Lock order is always `zarr_limit` → gate; nothing acquires `zarr_limit`
   under the gate; `backup_zarrs`' `dslock` is taken only after `sync_zarr`
   returns → no deadlock.
-* **Per-run mutation budget** (constant, e.g. 400; env override): once
-  exceeded, `set_*_description` skips with a log line ("deferred, N
-  remaining") and creations raise `GitHubRateLimited`.  This bounds the
-  first-run backlog of C4/C7 (§6 C4 note) and converges over runs.
-* No new YAML keys or CLI flags: constants in `consts.py`, overridable via
-  environment like `BACKUPS2DATALAD_TEXT_SIZE_LIMIT`; effective values are
-  logged once at startup.
+* No new YAML keys or CLI flags: the attempt count and the spacing live in
+  `consts.py`, overridable via environment like
+  `BACKUPS2DATALAD_TEXT_SIZE_LIMIT`; effective values are logged at startup.
 
 Known, accepted limitation: a Zarr sleeping in the cooldown holds its
 `zarr_limit` slot (`zarr.py:512`) and its Dandiset worker, so during a
 cooldown *all* Zarr work in the process stalls.  Restructuring that is out of
-scope; the 5 min / 30 min caps bound it.
+scope; the give-up bounds it.
 
 ### C3 — retry-wrap `create_github_sibling()` (keep DataLad) (`adataset.py`, `zarr.py`, `datasetter.py`)
 
@@ -349,8 +377,8 @@ scope; the 5 min / 30 min caps bound it.
   "blocked from content creation", **and** `requests.HTTPError` with status
   403/429 (this one carries `retry-after`; pass it to the gate).  Any other
   failure is re-raised unchanged.
-* Retry loop: hold the gate's lock across the *whole* loop (one prober), at
-  most ~8 attempts, each sleep computed by the gate; on breaker trip raise
+* Retry loop: hold the gate's lock across the *whole* loop (one prober),
+  each sleep computed by the gate; once the gate has given up, raise
   `GitHubRateLimited`.  Wrap the thread call in `anyio.fail_after(120)` with
   `abandon_on_cancel=True` so a hung `requests.post` (no timeout in DataLad)
   cannot pin the lock or block cancellation.
@@ -362,8 +390,8 @@ scope; the 5 min / 30 min caps bound it.
 * Make the post-creation local config idempotent (F9/S4): set
   `remote.github.pushurl`, `branch.draft.remote/merge` whenever they are
   missing, not only on the creation path.
-* Move the creation call from before the content sync (`zarr.py:543-565`)
-  to just before the push (after commit/gc, `:599-605`), keeping the
+* *Optional, not in the first cut (§9 Q3):* move the creation call from
+  before the content sync (`zarr.py:543-565`) to just before the push (after commit/gc, `:599-605`), keeping the
   embargo-status commit where it is.  Then a rate-limited Zarr has already
   committed its content (never dirty, S3/S5 only arise for cancelled
   siblings) and a cooldown delays only the push/describe tail while content
@@ -374,12 +402,16 @@ scope; the 5 min / 30 min caps bound it.
 This is what fixes S2, S4, S6, S7 and lets a rate-limited run simply be
 re-run for the Zarr side.
 
-* **Push when behind.**  Replace the `made_commit` push gate with
-  `made_commit or behind`, where `behind` is computed locally: resolve the
+* **Push unpushed commits — a plain push, never forced.**  Replace the
+  `made_commit` push gate with `made_commit or unpushed`, computed locally:
+  resolve the
   upstream from `branch.<current>.remote/.merge` (set at `adataset.py:781-782`;
   do not hardcode `draft`); no upstream → warn, don't push; tracking ref
   absent → push; else push iff `git merge-base --is-ancestor HEAD <tracking>`
-  is false (equality alone would misfire when the remote is ahead).  The
+  is false, i.e. HEAD has commits the remote lacks.  If the remote has
+  diverged, the plain push is rejected and the Zarr fails as it does today;
+  `--force` is passed only under `--force-push`, exactly as now (and see
+  §11: that flag currently does not force at all).  The
   git-annex branch is deliberately excluded (it is always ahead —
   `backup_zarrs` runs `annex describe here` after the push,
   `datasetter.py:599-601`).  Caveat G2: a stale tracking ref after a manual
@@ -392,7 +424,9 @@ re-run for the Zarr side.
   `zarr.py:620-623` claiming one is wrong).  First-run backlog: every
   `backup-zarrs` Zarr (F5), every Zarr from before `bb91ccd`, and every
   failed PATCH lacks a cache → one PATCH plus a `get_stats()` walk each,
-  bounded by the C2 budget; measure the population first (§7 step 0).
+  paced at 1/s by the gate — if GitHub objects, the cooldown / give-up
+  applies and the next run continues; measure the population first (§7
+  step 0).
 * **Fix F5.**  `set_zarr_description()` takes the `AsyncDataset` actually on
   disk (the caller has it); keep the id-based form for
   `update_github_metadata()`; assert `ds.ds.is_installed()` so the
@@ -442,9 +476,9 @@ Zarrs never became submodules, so `update-github-metadata`
 `GET /repos` per Dandiset, the burst `b49b356` removed from cron.  Per local
 Zarr: installed? special remotes present? `github` remote + `pushurl` +
 `branch.*` set? repo exists (`git ls-remote --exit-code github`, git-over-SSH,
-not REST)? behind (C4 predicate)? description cache missing/interim? dirty?
+not REST)? unpushed commits (C4 predicate)? description cache missing/interim? dirty?
 With `--fix`: apply C3/C4's idempotent setup, push, describe — all through
-the gate and the per-run budget, so it can be re-run until clean.
+the gate, with `--limit N`, so it can be re-run until clean.
 `--orphans`: page `GET /orgs/{zarr_gh_org}/repos` (`Link` pagination; GETs,
 cooldown-observed) against local dirs and every Dandiset's `.gitmodules`;
 "nothing pushed" = `GET /repos/{o}/{r}/branches` returns `[]` (repo `size` is
@@ -453,7 +487,7 @@ include the local side (`git remote remove github` in `zarr_root/<id>`, or
 drop `refs/remotes/github/*`), otherwise G2.
 
 `update-github-metadata` is left unchanged; it inherits the F5 fix and the
-budget.
+gate.
 
 ### C8 — (deferred) isolate Zarr failures inside a Dandiset sync
 
@@ -486,9 +520,9 @@ fixes nothing after the fact.
    lines give this list directly.
 2. Under `zarr_root` and any `backup-zarrs` partial dir: list Zarrs that are
    not installed (S1), dirty (S3/S5), or have a `github` remote with no
-   tracking ref / behind (S6) / no `dandi.github-description` or an interim
+   tracking ref / unpushed commits (S6) / no `dandi.github-description` or an interim
    one (S7).  Put the counts in the PR — they size the first-run backlog
-   (C4) and decide the budget constant.
+   (C4) and the `--limit` for `reconcile-zarrs`.
 3. Confirm from the log that the DataLad credential and `GITHUB_TOKEN` are the
    same account (or note that they are not).
 
@@ -500,15 +534,15 @@ Gate lock + 1 s spacing around repo creation, `description=` +
 
 ### Step 2 — PR2 (the plan proper)
 
-C1, C2 (cooldown/breaker/budget), C3 (retry, both exception shapes,
-`fail_after`, idempotent config, creation moved after commit), C4 (ancestry
-predicate, describe-when-missing, F5, S2, F7 recovery), C5, C6, tests.
+C1, C2 (cooldown / give-up), C3 (retry, both exception shapes,
+`fail_after`, idempotent config), C4 (unpushed-commits predicate,
+describe-when-missing, F5, S2), C5, C6, tests.
 
 ### Step 3 — PR3 (`reconcile-zarrs`), then run it
 
 `reconcile-zarrs` report → review → `--fix --limit …`, repeated until clean.
 Then the usual cron; a run that hits the content-creation limit now backs off
-collectively, resumes, and if the budget is exhausted fails only the Zarrs it
+collectively, resumes, and if it gives up fails only the Zarrs it
 could not create (and their Dandisets, which then need the manual reset of
 step 0) — which the next run picks up.
 
@@ -524,14 +558,14 @@ step 0) — which the next run picks up.
   now sleeps ≥ 60 s first instead of 1 s; DANDI/S3 unchanged.
 * C4: one `git config` + `git merge-base` per Zarr visit; on the first run,
   a push for every Zarr matching the predicate and a PATCH + `get_stats`
-  walk for every cache-less Zarr (bounded by the budget; population from
+  walk for every cache-less Zarr (paced by the gate; population from
   step 0); `set_zarr_description()` signature; `ensure_installed()` reads
   annex config on every visit; `backup-zarrs` with GitHub stops crashing on
   fresh Zarrs (F5); dirty-dataset errors carry a digest and the run summary a
   `DIRTY` line per dataset (C5).
 * C5: two or three extra GETs per run; startup INFO lines.
 * Unembargo (`update_zarr_repos_privacy`) and `update-github-metadata` PATCH
-  bursts are now paced at ~1/s and budgeted.
+  bursts are now paced at ~1/s.
 
 ### 7.2 Observability (so the next incident is diagnosable from the duct log)
 
@@ -543,10 +577,10 @@ step 0) — which the next run picks up.
 * `COOLDOWN start/end` INFO with duration, waiter count, trigger; `BREAKER
   tripped` WARNING; `/rate_limit` samples (C5).
 * A per-Zarr terminal INFO line with a fixed vocabulary
-  (`outcome=created|pushed|behind-pushed|described|deferred|up-to-date|failed:<class>`).
+  (`outcome=created|pushed|described|up-to-date|failed:<class>`).
 * End-of-run summary at WARNING when anything failed: counts per outcome,
   failed Zarr ids with Dandiset ids and failure class, rate-limit events,
-  total cooldown, breaker state, deferred mutations, and the exit reason
+  total cooldown, whether the gate gave up, and the exit reason
   ("N Dandisets failed, M due to GitHub rate limiting") — today the cause is
   buried in `Job failed on input …` tracebacks (`aioutil.py:221`).
   `GitHubRateLimited` is the dedicated exception class that makes this
@@ -558,16 +592,16 @@ step 0) — which the next run picks up.
 
 Zarr side: nothing sticky for the rate-limited Zarr itself (C3/C4); Zarrs
 cancelled mid-sync (S3/S5) stay dirty and are reported (C5).  Dandiset side:
-a Zarr that fails past the breaker still fails its Dandiset, which is then
-dirty (F8), reported, and reset by hand.  That is why the 30 min budget is
-worth spending rather than failing fast: every failure still costs a manual
-cleanup.
+a Zarr that fails after the gate gives up still fails its Dandiset, which
+is then dirty (F8), reported, and reset by hand.  That is why a few bounded
+retries are worth spending rather than failing fast: every failure still
+costs a manual cleanup.
 
 ### 7.4 Cron
 
 The invocation is already wrapped in an overall `flock` (maintainer), so
 runs cannot overlap; the code base itself has no lock (`__main__.py`,
-`datasetter.py`), which is fine.  The C2 caps therefore bound the run's wall
+`datasetter.py`), which is fine.  The C2 give-up therefore bounds the run's wall
 time so that a sleeping run does not starve the next scheduled one (with
 `flock -n` the next tick is skipped, with a blocking `flock` it is delayed);
 they are not there to prevent overlap.
@@ -582,9 +616,9 @@ they are not there to prevent overlap.
   rather than monkeypatching `anyio.sleep`.
 * Gate: pure unit tests with an injected clock — one incident from ten
   concurrent failures escalates once; cooldown deadline moving while
-  sleeping; `hits` reset after success; breaker trips and later mutations
-  fail fast; budget defers describes; 1 s spacing; no-op when nothing
-  tripped.
+  sleeping; counter reset after success; after N consecutive hits later
+  mutations fail fast; `retry-after` honoured over the fallback; 1 s
+  spacing; no-op when nothing tripped.
 * `create_github_sibling()`: real `AsyncDataset` in `tmp_path`;
   monkeypatch `ds.ds.create_sibling_github` to return an error record with a
   tuple message once, then a fake that does `git remote add github <bare>`;
@@ -595,7 +629,8 @@ they are not there to prevent overlap.
   `AsyncMock`, give the Zarr a local bare `github` remote (real `datalad
   push` → real tracking ref), `manager.gh = MagicMock(edit_repo=AsyncMock())`
   as in `test_zarrbargo.py:27-43`.  First visit pushes; tracking ref deleted
-  → no-change visit pushes; remote ahead → no push; no upstream config → no
+  → no-change visit pushes; remote ahead → no push; diverged → plain push
+  rejected, no `--force`; no upstream config → no
   push + warning; converged → no push and no `edit_repo`; cache
   missing/interim → exactly one PATCH; a dirty Zarr still raises, and the
   message carries the digest (areas, counts, first paths).
@@ -607,7 +642,8 @@ they are not there to prevent overlap.
   (`tmp_home`, `conftest.py:82-105`); the id-based form raises on a
   non-installed path.
 * End-to-end on the docker `new_dandiset` fixture with two Zarrs and a fake
-  creation that fails one Zarr past the budget: the other Zarr converges, a
+  creation that keeps failing one Zarr until the gate gives up: the other
+  Zarr converges, a
   second run converges the failed one, and the Dandiset's failure is
   reported with a `DIRTY` line.  `pool_amap` isolation: Dandiset B completes
   while A is rate-limited.
@@ -619,17 +655,23 @@ they are not there to prevent overlap.
 Decided (v3): dirty datasets remain a hard error, no automated stash / reset /
 clean on this branch — reporting only (C5); F8 likewise; an overall `flock`
 already wraps the invocation, so no cron change is needed.
+Decided (v4): no locally invented quota numbers — sleeps come from GitHub's
+headers or its documented fallback, no per-run mutation budget; pushes are
+plain, `--force` only under `--force-push`.
 
-1. **Dandiset-side push-when-behind.**  Keep `update_dandiset()` untouched on
+1. **Dandiset-side unpushed-commits push.**  Keep `update_dandiset()` untouched on
    this branch (proposed) or apply the C4 predicate there too?
 2. **Interim description for Dandisets.**  `ensure_github_remote()` is the
    same function; passing `description=` there costs nothing, but for a fresh
    Dandiset with no changes the interim string persists until the next
    change.  Pass it (proposed) or leave Dandisets on `some default`?
-3. **Move creation after commit (C3).**  Proposed; it reorders `sync_zarr`
-   but removes the rate-limited-Zarr-is-dirty case entirely.
-4. **Caps.**  5 min per sleep, 30 min cumulative per process, 400
-   mutations per run, 8 creation attempts, `fail_after(120)` — adjust?
+3. **Move creation after commit (C3).**  Optional, left out of the first
+   cut unless wanted: it reorders `sync_zarr` but removes the
+   rate-limited-Zarr-is-dirty case entirely.
+4. **Constants.**  Only two remain ours: the give-up count (proposed 5
+   consecutive rate-limited responses) and `fail_after(120)` for DataLad's
+   untimed POST.  Everything else is relayed from GitHub's headers or its
+   documented fallback (§2.5).
 5. **Orphan repos** (C7): report only, or also `--delete-orphans` behind a
    confirmation?
 
@@ -686,3 +728,10 @@ a hard error, with a dirty-state digest in the error, a `DIRTY` line per
 dataset in the run summary, and the same digest in `reconcile-zarrs` (C5);
 F8 stays manual; §7.4 rewritten — an overall `flock` already exists, so the
 caps only bound run duration; §9 Q1/Q5/Q7 closed.
+v4 (maintainer feedback): §2.5 added — what GitHub actually tells us and
+what that leaves for local constants; C2's cumulative-time breaker and
+per-run mutation budget dropped in favour of relaying GitHub's headers /
+documented fallback and a give-up after N consecutive rate-limited
+responses; "push when behind" renamed and defined as a plain push of commits
+the remote lacks, `--force` only under `--force-push`; creation-after-commit
+made optional; §6 opened with the fix in one paragraph.
