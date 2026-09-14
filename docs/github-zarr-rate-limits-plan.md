@@ -574,8 +574,8 @@ step 0) — which the next run picks up.
   `x-ratelimit-{limit,remaining,used,reset,resource}`,
   `x-github-request-id`, body message, attempt i/N, chosen sleep,
   `cooldown_until` (UTC), cumulative cooldown.
-* `COOLDOWN start/end` INFO with duration, waiter count, trigger; `GAVE-UP
-  tripped` WARNING; `/rate_limit` samples (C5).
+* `COOLDOWN start/end` INFO with duration, waiter count, trigger; `GAVE-UP`
+  WARNING; `/rate_limit` samples (C5).
 * A per-Zarr terminal INFO line with a fixed vocabulary
   (`outcome=created|pushed|described|up-to-date|failed:<class>`).
 * End-of-run summary at WARNING when anything failed: counts per outcome,
