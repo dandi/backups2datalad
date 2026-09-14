@@ -13,7 +13,7 @@ Before running `backups2datalad`, the following setup must be performed:
 
 - `backups2datalad` must be installed in a Python environment using either `pip
   install .` (run from a clone of this repository) or `pip install
-  git+https://github.com/dandi/backups2datalad`.  At least Python 3.10 is
+  git+https://github.com/dandi/backups2datalad`.  At least Python 3.11 is
   required.
 
 - [git-annex](https://git-annex.branchable.com) must be installed.  At least

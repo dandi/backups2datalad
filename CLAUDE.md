@@ -12,7 +12,7 @@ The tool handles both public and embargoed Dandisets. Embargoed Dandisets are mi
 
 ### Prerequisites
 
-- Python 3.10+
+- Python 3.11+
 - git-annex version 10.20240430 or newer
 - DANDI API token (set as environment variable `DANDI_API_KEY`)
 - For pushing to GitHub, a GitHub access token via one of:
