@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from functools import cached_property
 from pathlib import Path
 from re import Pattern
@@ -9,7 +9,12 @@ import anyio
 from dandi.utils import yaml_dump, yaml_load
 from pydantic import BaseModel, Field, model_validator
 
-from .consts import DEFAULT_GIT_ANNEX_JOBS, DEFAULT_WORKERS, ZARR_LIMIT
+from .consts import (
+    DEFAULT_GIT_ANNEX_JOBS,
+    DEFAULT_QUIESCENT_PERIOD,
+    DEFAULT_WORKERS,
+    ZARR_LIMIT,
+)
 
 
 class Remote(BaseModel):
@@ -22,11 +27,6 @@ class ResourceConfig(BaseModel):
     path: Path
     github_org: str | None = None
     remote: Remote | None = None
-
-
-class StrEnum(str, Enum):
-    def __str__(self) -> str:
-        return self.name.lower()
 
 
 class Mode(StrEnum):
@@ -65,6 +65,12 @@ class BackupConfig(BaseModel):
     mode: Mode = Mode.TIMESTAMP
     zarr_mode: ZarrMode = ZarrMode.TIMESTAMP
     force_push: set[str] = Field(default_factory=set)  # "dandisets", "zarrs", "all"
+    # `default_factory` rather than `default` so that the constant is
+    # looked up at instantiation time, which lets the test suite disable
+    # the gate wholesale by patching it.
+    quiescent_period: float = Field(
+        default_factory=lambda: DEFAULT_QUIESCENT_PERIOD, ge=0
+    )
 
     @model_validator(mode="after")
     def _validate(self) -> BackupConfig:

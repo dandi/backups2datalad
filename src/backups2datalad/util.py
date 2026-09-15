@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from difflib import unified_diff
 import json
 import os
@@ -213,17 +213,21 @@ async def update_dandiset_metadata(
     await ds.add(dandiset_metadata_file)
 
 
-def fromisoformat(date_string: str) -> datetime:
+def quiescence_wait(
+    modified: datetime, period: float, now: datetime | None = None
+) -> float:
     """
-    Parse an ISO 8601 date string, handling the 'Z' suffix for UTC.
+    Return the number of seconds that still have to elapse before a resource
+    last changed at ``modified`` will have been left alone for ``period``
+    seconds.  A non-positive result means the resource is already quiescent.
 
-    Python 3.10's datetime.fromisoformat() doesn't support 'Z' suffix,
-    but Python 3.11+ does. This function provides compatibility.
+    Note that ``modified`` comes from the DANDI server while ``now`` defaults
+    to the local clock, so a local clock lagging behind the server's inflates
+    the wait; that errs on the side of skipping, which is what we want.
     """
-    # Replace 'Z' with '+00:00' for Python 3.10 compatibility
-    if date_string.endswith("Z"):
-        date_string = date_string[:-1] + "+00:00"
-    return datetime.fromisoformat(date_string)
+    if now is None:
+        now = datetime.now(timezone.utc)
+    return period - (now - modified).total_seconds()
 
 
 def quantify(qty: int, singular: str, plural: str | None = None) -> str:
