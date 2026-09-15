@@ -47,6 +47,7 @@ import zarr
 
 from backups2datalad.adandi import AsyncDandiClient, RemoteDandiset, RemoteZarrAsset
 from backups2datalad.adataset import AsyncDataset
+import backups2datalad.config
 from backups2datalad.procedures.cfg_dandiset import policy_lines
 from backups2datalad.util import is_meta_file
 from backups2datalad.zarr import CHECKSUM_FILE
@@ -77,6 +78,15 @@ def capture_all_logs(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.DEBUG, logger="dandi")
     caplog.set_level(5, logger="backups2datalad")
     caplog.set_level(logging.DEBUG, logger="test_backups2datalad")
+
+
+@pytest.fixture(autouse=True)
+def no_quiescent_period(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Sample Dandisets are created, uploaded to, and backed up within the same
+    # handful of seconds, so `update_dandiset()`'s quiescent-period gate would
+    # skip every last one of them.  Disable it for the suite at large; the
+    # tests that exercise the gate set `quiescent_period` explicitly.
+    monkeypatch.setattr(backups2datalad.config, "DEFAULT_QUIESCENT_PERIOD", 0.0)
 
 
 @pytest.fixture(autouse=True)

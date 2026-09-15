@@ -44,14 +44,7 @@ from .procedures.cfg_dandiset import (
     ensure_dotfiles,
     get_size_limit,
 )
-from .util import (
-    custom_commit_env,
-    exp_wait,
-    fromisoformat,
-    is_meta_file,
-    key2hash,
-    quantify,
-)
+from .util import custom_commit_env, exp_wait, is_meta_file, key2hash, quantify
 
 EMBARGO_STATUS_KEY = "dandi.dandiset.embargo-status"
 
@@ -1022,7 +1015,7 @@ class AsyncDataset:
 
     async def get_last_commit_date(self) -> datetime:
         ts = await self.read_git("show", "-s", "--format=%aI")
-        return fromisoformat(ts)
+        return datetime.fromisoformat(ts)
 
     def assert_no_duplicates_in_gitmodules(self) -> None:
         filepath = self.pathobj / ".gitmodules"

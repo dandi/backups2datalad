@@ -37,8 +37,8 @@ from .util import (
     AssetTracker,
     assets_eq,
     custom_commit_env,
-    fromisoformat,
     quantify,
+    quiescence_wait,
     update_dandiset_metadata,
 )
 from .zarr import ZarrLink, sync_zarr
@@ -199,6 +199,23 @@ class DandiDatasetter(AsyncResource):
         if dandiset.embargo_status is EmbargoStatus.UNEMBARGOING:
             log.info("Dandiset %s is unembargoing; not syncing", dandiset.identifier)
             return False
+        # A Dandiset that was touched a moment ago is likely still being
+        # changed (e.g., a mass upload or delete of assets is underway), and
+        # the asset listing we page through would then not agree with the
+        # assets we later query.  Leave it be; the next run will catch up.
+        period = self.config.quiescent_period
+        if period > 0:
+            wait = quiescence_wait(dandiset.version.modified, period)
+            if wait > 0:
+                log.info(
+                    "Dandiset %s was modified %.1f seconds ago, within the"
+                    " quiescent period of %.1f seconds; not syncing, will"
+                    " retry on a later run",
+                    dandiset.identifier,
+                    period - wait,
+                    period,
+                )
+                return False
         if ds is None:
             ds = await self.init_dataset(
                 self.config.dandiset_root / dandiset.identifier,
@@ -475,7 +492,7 @@ class DandiDatasetter(AsyncResource):
             ).splitlines()
             for cmt in commits:
                 chash, _, cdate = cmt.partition(" ")
-                ts = fromisoformat(cdate)
+                ts = datetime.fromisoformat(cdate)
                 if ts <= dandiset.version.created:
                     candidates.append(chash)
                     break
@@ -609,7 +626,7 @@ class DandiDatasetter(AsyncResource):
             if ts is None:
                 # Zarr was already up to date; get timestamp from its latest
                 # commit
-                ts = fromisoformat(
+                ts = datetime.fromisoformat(
                     await zds.read_git("show", "-s", "--format=%aI", "HEAD")
                 )
             assert not (ds.pathobj / asset.path).exists()
