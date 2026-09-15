@@ -529,9 +529,7 @@ async def test_sync_zarr_converges_github_state(
     dsdir = zarr_root / "zarr1"
     bare = _make_bare(tmp_path / "bare.git")
 
-    async def fake_create(
-        self: AsyncDataset, owner: str, name: str, *args: Any, **kwargs: Any
-    ) -> bool:
+    async def fake_create(self: AsyncDataset, **_kwargs: Any) -> bool:
         if await self.has_github_remote():
             return False
         _add_github_remote(self, bare)
