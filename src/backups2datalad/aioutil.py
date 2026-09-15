@@ -14,10 +14,12 @@ from dataclasses import dataclass, field
 import logging
 import math
 from pathlib import Path
+import re
 import shlex
 import ssl
 import subprocess
 import textwrap
+import time
 from typing import Any, Generic, TypeVar
 
 import anyio
@@ -26,7 +28,13 @@ from anyio.streams.text import TextReceiveStream
 import httpx
 from linesep import SplitterEmptyError, TerminatedSplitter, get_newline_splitter
 
-from .consts import DEFAULT_WORKERS, GIT_OPTIONS
+from .consts import (
+    DEFAULT_WORKERS,
+    GIT_OPTIONS,
+    GITHUB_MUTATION_SPACING,
+    GITHUB_RATE_LIMIT_ATTEMPTS,
+    GITHUB_RATE_LIMIT_FALLBACK,
+)
 from .logging import log
 from .util import exp_wait
 
@@ -116,20 +124,203 @@ async def open_git_annex(
     return TextProcess(p, stdout, desc, warn_on_fail=warn_on_fail)
 
 
+class GitHubRateLimited(Exception):
+    """
+    Raised for a GitHub mutation once the `GitHubGate` has given up on this
+    process's run after too many consecutive rate-limited responses
+    """
+
+
+_RATE_LIMIT_BODY_RGX = re.compile(
+    r"secondary rate limit|abuse detection|rate limit exceeded"
+    r"|blocked from content creation",
+    flags=re.IGNORECASE,
+)
+
+
+def is_rate_limited(status: int, headers: Mapping[str, str], body: str) -> bool:
+    """
+    Whether an HTTP response is GitHub telling us to slow down: a 429, or a
+    403 that carries `retry-after`, has exhausted the primary quota
+    (`x-ratelimit-remaining: 0`), or reads like a secondary-limit message.
+    Any other 403 is a genuine permission problem and must not be retried as
+    a rate limit.
+    """
+    if status == 429:
+        return True
+    if status != 403:
+        return False
+    hdrs = {k.lower(): v for k, v in headers.items()}
+    return (
+        "retry-after" in hdrs
+        or hdrs.get("x-ratelimit-remaining") == "0"
+        or _RATE_LIMIT_BODY_RGX.search(body) is not None
+    )
+
+
+@dataclass
+class GitHubGate:
+    """
+    Per-process pacing of GitHub API mutations, driven by what GitHub tells
+    us rather than by local quota numbers.
+
+    - Mutations (repo creation, PATCH, POST) are serialised and spaced at
+      least ``spacing`` seconds apart, as GitHub's guidelines ask.
+    - A rate-limited response (`is_rate_limited()`) starts a cooldown shared
+      by every worker: as long as `retry-after` / `x-ratelimit-reset` say,
+      or else ``fallback`` seconds doubling per consecutive hit.  Hits that
+      arrive while a cooldown is already running are the same incident and
+      do not escalate.
+    - After ``attempts`` consecutive rate-limited responses the gate gives up
+      for the rest of the process: further mutations raise
+      `GitHubRateLimited` at once, so the run ends with a clear failure
+      instead of every worker sleeping in turn.  A successful mutation
+      resets the count.
+
+    ``clock`` (monotonic), ``wall`` (epoch, for ``x-ratelimit-reset``) and
+    ``sleep`` are injectable for tests.  All state is only ever touched from
+    the event loop.
+    """
+
+    attempts: int = GITHUB_RATE_LIMIT_ATTEMPTS
+    spacing: float = GITHUB_MUTATION_SPACING
+    fallback: float = GITHUB_RATE_LIMIT_FALLBACK
+    clock: Callable[[], float] = time.monotonic
+    wall: Callable[[], float] = time.time
+    sleep: Callable[[float], Awaitable[None]] = anyio.sleep
+    cooldown_until: float = field(init=False, default=0.0)
+    consecutive: int = field(init=False, default=0)
+    gave_up: bool = field(init=False, default=False)
+    _last_mutation_end: float | None = field(init=False, default=None)
+    _lock: anyio.Lock | None = field(init=False, default=None)
+
+    @property
+    def lock(self) -> anyio.Lock:
+        # Created lazily so that a gate can be constructed outside of an
+        # event loop (e.g. as a dataclass default)
+        if self._lock is None:
+            self._lock = anyio.Lock()
+        return self._lock
+
+    def note_rate_limited(self, headers: Mapping[str, str], what: str) -> None:
+        """
+        Record a rate-limited response described by ``what`` and extend the
+        cooldown accordingly
+        """
+        now = self.clock()
+        hdrs = {k.lower(): v for k, v in headers.items()}
+        if now >= self.cooldown_until:
+            # A fresh hit, not one that raced with an ongoing cooldown
+            self.consecutive += 1
+        retry_after = hdrs.get("retry-after", "").strip()
+        reset = hdrs.get("x-ratelimit-reset", "").strip()
+        if retry_after.isdigit():
+            delay = float(retry_after)
+            source = "retry-after"
+        elif hdrs.get("x-ratelimit-remaining") == "0" and reset.isdigit():
+            delay = max(float(reset) - self.wall(), 1.0)
+            source = "x-ratelimit-reset"
+        else:
+            delay = self.fallback * 2 ** (self.consecutive - 1)
+            source = "fallback"
+        self.cooldown_until = max(self.cooldown_until, now + delay)
+        if self.consecutive > self.attempts:
+            self.gave_up = True
+            log.warning(
+                "GAVE-UP: %d consecutive rate-limited GitHub responses; failing"
+                " all further GitHub mutations in this run.  Last: %s",
+                self.consecutive,
+                what,
+            )
+        else:
+            log.warning(
+                "RATELIMIT: %s; hit %d/%d; cooling down for %.0f s (from %s)",
+                what,
+                self.consecutive,
+                self.attempts,
+                self.cooldown_until - now,
+                source,
+            )
+
+    def note_success(self) -> None:
+        """Record a successful mutation (GETs do not count)"""
+        self.consecutive = 0
+
+    def raise_if_gave_up(self) -> None:
+        if self.gave_up:
+            raise GitHubRateLimited(
+                "GitHub kept rate-limiting us; giving up on further GitHub"
+                " mutations in this run"
+            )
+
+    async def wait(self) -> None:
+        """Sleep out the current cooldown, if any (never escalates)"""
+        while (remaining := self.cooldown_until - self.clock()) > 0:
+            await self.sleep(remaining)
+
+    @asynccontextmanager
+    async def mutation(self) -> AsyncIterator[None]:
+        """
+        Context for one mutating GitHub request: waits for the cooldown (so
+        that only one waiter probes GitHub once it ends) and for the minimum
+        spacing since the previous mutation, and raises `GitHubRateLimited`
+        if the gate has given up.  Not re-entrant: never enter it while
+        already inside one.
+        """
+        self.raise_if_gave_up()
+        async with self.lock:
+            self.raise_if_gave_up()
+            await self.wait()
+            if self._last_mutation_end is not None:
+                pause = self._last_mutation_end + self.spacing - self.clock()
+                if pause > 0:
+                    await self.sleep(pause)
+            try:
+                yield
+            finally:
+                self._last_mutation_end = self.clock()
+
+
 async def arequest(
     client: httpx.AsyncClient,
     method: str,
     url: str,
     retry_on: Container[int] = (),
+    gate: GitHubGate | None = None,
     **kwargs: Any,
 ) -> httpx.Response:
+    """
+    Perform an HTTP request, retrying on transport errors, 5xx responses, and
+    the status codes in ``retry_on`` with exponential backoff.
+
+    If a `GitHubGate` is given (GitHub API calls only), mutating requests are
+    serialised and spaced through it, and a rate-limited response is retried
+    after the cooldown GitHub asked for instead of the local backoff.  Without
+    a gate the behavior is exactly as before, for the DANDI API and S3.
+    """
     waits = exp_wait(attempts=15, base=2)
     # custom timeout if was not specified to wait longer  in hope to overcome
     # https://github.com/dandi/dandisets/issues/298 and alike
     kwargs.setdefault("timeout", 60)
+    mutating = method.upper() not in ("GET", "HEAD")
     while True:
         try:
-            r = await client.request(method, url, follow_redirects=True, **kwargs)
+            if gate is None:
+                r = await client.request(
+                    method, url, follow_redirects=True, **kwargs
+                )
+            elif mutating:
+                # Only the request itself is held under the gate's lock; the
+                # backoff sleeps below happen with it released.
+                async with gate.mutation():
+                    r = await client.request(
+                        method, url, follow_redirects=True, **kwargs
+                    )
+            else:
+                await gate.wait()
+                r = await client.request(
+                    method, url, follow_redirects=True, **kwargs
+                )
             r.raise_for_status()
         except (httpx.HTTPError, ssl.SSLError) as e:
             # For HTTP status errors, capture body + rate-limit/retry headers
@@ -140,6 +331,20 @@ async def arequest(
                 if isinstance(e, httpx.HTTPStatusError)
                 else ""
             )
+            if (
+                gate is not None
+                and isinstance(e, httpx.HTTPStatusError)
+                and is_rate_limited(
+                    e.response.status_code, e.response.headers, e.response.text
+                )
+            ):
+                # The next attempt sleeps out the cooldown (under the lock,
+                # for mutations) or raises GitHubRateLimited once the gate
+                # has given up.
+                gate.note_rate_limited(
+                    e.response.headers, f"{method.upper()} {url}: {err_detail}"
+                )
+                continue
             if isinstance(e, (httpx.RequestError, ssl.SSLError)) or (
                 isinstance(e, httpx.HTTPStatusError)
                 and (
@@ -178,6 +383,8 @@ async def arequest(
                         err_detail,
                     )
                 raise
+        if gate is not None and mutating:
+            gate.note_success()
         return r
 
 
@@ -185,9 +392,13 @@ def _describe_http_error(response: httpx.Response) -> str:
     parts = []
     for hdr in (
         "retry-after",
+        "x-ratelimit-limit",
         "x-ratelimit-remaining",
+        "x-ratelimit-used",
         "x-ratelimit-reset",
         "x-ratelimit-resource",
+        # needed when asking GitHub support about a rate-limit block
+        "x-github-request-id",
     ):
         value = response.headers.get(hdr)
         if value is not None:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import AsyncGenerator, Iterable, Sequence
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
 from contextlib import aclosing
 from dataclasses import InitVar, dataclass, field, replace
 from datetime import datetime
@@ -22,11 +22,19 @@ from datalad.api import Dataset
 from datalad.runner.exception import CommandError
 from ghrepo import GHRepo
 from pydantic import BaseModel
+import requests
 from zarr_checksum.tree import ZarrChecksumTree
 
-from .aioutil import areadcmd, aruncmd, stream_lines_command, stream_null_command
+from .aioutil import (
+    GitHubGate,
+    areadcmd,
+    aruncmd,
+    is_rate_limited,
+    stream_lines_command,
+    stream_null_command,
+)
 from .config import BackupConfig, Remote
-from .consts import DEFAULT_BRANCH, GIT_OPTIONS
+from .consts import DEFAULT_BRANCH, GIT_OPTIONS, GITHUB_CREATE_TIMEOUT
 from .logging import log
 from .procedures import PROCEDURES_DIR
 from .procedures.cfg_dandiset import COMMIT_MESSAGE as POLICY_COMMIT_MESSAGE
@@ -36,7 +44,14 @@ from .procedures.cfg_dandiset import (
     ensure_dotfiles,
     get_size_limit,
 )
-from .util import custom_commit_env, exp_wait, fromisoformat, is_meta_file, key2hash
+from .util import (
+    custom_commit_env,
+    exp_wait,
+    fromisoformat,
+    is_meta_file,
+    key2hash,
+    quantify,
+)
 
 EMBARGO_STATUS_KEY = "dandi.dandiset.embargo-status"
 
@@ -248,18 +263,33 @@ class AsyncDataset:
         await run_sync(reregister_keys)
         await self.call_git("remote", "remove", "datalad")
 
-    async def is_dirty(self) -> bool:
-        return (
-            await self.read_git(
-                "status",
-                "--porcelain",
-                # Forcibly use default values for these options in case they
-                # were overridden by user's gitconfig:
-                "--untracked-files=normal",
-                "--ignore-submodules=none",
-            )
-            != ""
+    async def _status_porcelain(self) -> str:
+        return await self.read_git(
+            "status",
+            "--porcelain",
+            # Forcibly use default values for these options in case they
+            # were overridden by user's gitconfig:
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
         )
+
+    async def is_dirty(self) -> bool:
+        return await self._status_porcelain() != ""
+
+    async def describe_dirt(self, limit: int = 10) -> str:
+        """
+        Summarize what makes the dataset dirty, for error messages: the
+        number of dirty paths and the first ``limit`` lines of
+        ``git status --porcelain``, so that the log alone tells an operator
+        what needs cleaning up.
+        """
+        lines = (await self._status_porcelain()).splitlines()
+        if not lines:
+            return "clean"
+        desc = f"{quantify(len(lines), 'dirty path')}:\n" + "\n".join(lines[:limit])
+        if len(lines) > limit:
+            desc += f"\n... and {len(lines) - limit} more"
+        return desc
 
     async def has_changes(
         self, paths: Sequence[str | Path] = (), cached: bool = False
@@ -755,39 +785,160 @@ class AsyncDataset:
         backup_remote: Remote | None,
         *,
         existing: str = "reconfigure",
+        description: str | None = None,
+        gate: GitHubGate | None = None,
     ) -> bool:
-        # Returns True iff sibling was created
+        """
+        Ensure the dataset has a ``github`` sibling at ``owner/name``,
+        creating the repository via DataLad if the sibling is missing.
+        Returns True iff the sibling was created.
+
+        Repository creation is a content-creating GitHub call and the one
+        most exposed to GitHub's secondary rate limit; with a ``gate`` it is
+        serialised with the process's other mutations and retried after the
+        cooldown GitHub asks for (a rate-limited creation did not create
+        anything, so retrying is safe; a crash between creation and sibling
+        configuration is healed by ``existing="reconfigure"``).
+        """
+        config = [
+            ("remote.github.pushurl", f"git@github.com:{owner}/{name}"),
+            (f"branch.{DEFAULT_BRANCH}.remote", "github"),
+            (f"branch.{DEFAULT_BRANCH}.merge", f"refs/heads/{DEFAULT_BRANCH}"),
+        ]
         if not await self.has_github_remote():
             log.info("Creating GitHub sibling for %s under %s", name, owner)
             private = await self.get_embargo_status() is EmbargoStatus.EMBARGOED
             # Use SSH for private repos to avoid authentication prompts
             access_protocol = "ssh" if private else "https"
-            await anyio.to_thread.run_sync(
-                partial(
-                    self.ds.create_sibling_github,
-                    reponame=name,
-                    existing=existing,
-                    name="github",
-                    access_protocol=access_protocol,
-                    github_organization=owner,
-                    publish_depends=(
-                        backup_remote.name if backup_remote is not None else None
-                    ),
-                    private=private,
-                )
+            create = partial(
+                self.ds.create_sibling_github,
+                reponame=name,
+                existing=existing,
+                name="github",
+                access_protocol=access_protocol,
+                github_organization=owner,
+                publish_depends=(
+                    backup_remote.name if backup_remote is not None else None
+                ),
+                private=private,
+                # DataLad would otherwise literally use "some default"
+                description=description,
+                # Inspect the result records ourselves instead of having
+                # DataLad print them to stdout and raise on the first error
+                result_renderer="disabled",
+                on_failure="ignore",
+                return_type="list",
             )
-            for key, value in [
-                ("remote.github.pushurl", f"git@github.com:{owner}/{name}"),
-                (f"branch.{DEFAULT_BRANCH}.remote", "github"),
-                (f"branch.{DEFAULT_BRANCH}.merge", f"refs/heads/{DEFAULT_BRANCH}"),
-            ]:
+            desc = f"{owner}/{name}"
+            if gate is None:
+                if (hit := await self._create_sibling_once(create, desc)) is not None:
+                    raise RuntimeError(hit[1])
+            else:
+                async with gate.mutation():
+                    while True:
+                        hit = await self._create_sibling_once(create, desc)
+                        if hit is None:
+                            gate.note_success()
+                            break
+                        gate.note_rate_limited(*hit)
+                        gate.raise_if_gave_up()
+                        await gate.wait()
+            for key, value in config:
                 await self.set_repo_config(key, value)
             return True
         else:
             log.debug("GitHub remote already exists for %s", name)
             # Check if existing URL needs fixing
             await self.fix_github_remote_url_for_embargo()
+            # A run cancelled between DataLad configuring the sibling and us
+            # adding our own settings leaves them missing for good otherwise
+            for key, value in config:
+                if await self.get_repo_config(key) is None:
+                    log.info("Restoring missing config %s for %s", key, name)
+                    await self.set_repo_config(key, value)
             return False
+
+    async def _create_sibling_once(
+        self, create: Callable[[], Any], desc: str
+    ) -> tuple[Mapping[str, str], str] | None:
+        """
+        Run DataLad's ``create_sibling_github`` once in a worker thread.
+        Returns None on success; on a rate-limited response returns the
+        response headers (if any) and a description of the failure for
+        `GitHubGate.note_rate_limited()`; raises for anything else.
+
+        DataLad reports a 403 as an error result record (message text only)
+        but lets a 429 -- and any error on the ``existing="reconfigure"``
+        lookup -- escape as `requests.HTTPError`, so both shapes are handled.
+        """
+        try:
+            with anyio.fail_after(GITHUB_CREATE_TIMEOUT):
+                # DataLad's request has no timeout; do not let a hung thread
+                # hold up the caller (or the gate's lock) indefinitely
+                results = await run_sync(create, abandon_on_cancel=True)
+        except TimeoutError:
+            raise RuntimeError(
+                f"Creating GitHub sibling {desc} did not finish within"
+                f" {GITHUB_CREATE_TIMEOUT} s"
+            )
+        except requests.HTTPError as e:
+            resp = e.response
+            if resp is not None and is_rate_limited(
+                resp.status_code, resp.headers, resp.text
+            ):
+                return (
+                    resp.headers,
+                    f"HTTP {resp.status_code} creating GitHub sibling {desc}:"
+                    f" {textwrap.shorten(resp.text, width=200)}",
+                )
+            raise
+        for res in results:
+            status = res.get("status")
+            msg = format_result_message(res)
+            if status in ("ok", "notneeded"):
+                log.debug("create_sibling_github(%s) %s: %s", status, desc, msg)
+            elif is_rate_limited(403, {}, msg):
+                return ({}, f"create_sibling_github({status}) {desc}: {msg}")
+            else:
+                raise RuntimeError(f"create_sibling_github({status}) {desc}: {msg}")
+        return None
+
+    async def has_unpushed_commits(self) -> bool:
+        """
+        Whether ``HEAD`` has commits that its upstream (remote-tracking)
+        branch lacks -- i.e. whether a plain push is due.  Returns False,
+        with a warning, when no upstream is configured.
+        """
+        branch = await self.read_git("rev-parse", "--abbrev-ref", "HEAD")
+        remote = await self.get_repo_config(f"branch.{branch}.remote")
+        merge = await self.get_repo_config(f"branch.{branch}.merge")
+        if remote is None or merge is None:
+            log.warning(
+                "%s: branch %r has no upstream configured; cannot tell whether"
+                " it needs pushing",
+                self.path,
+                branch,
+            )
+            return False
+        tracking = f"refs/remotes/{remote}/{merge.removeprefix('refs/heads/')}"
+        try:
+            await self.read_git(
+                "rev-parse", "--verify", "--quiet", tracking, quiet_rcs=[1]
+            )
+        except subprocess.CalledProcessError as e:
+            if e.returncode == 1:
+                # Never pushed
+                return True
+            raise
+        try:
+            await self.call_git(
+                "merge-base", "--is-ancestor", "HEAD", tracking, quiet_rcs=[1]
+            )
+        except subprocess.CalledProcessError as e:
+            if e.returncode == 1:
+                return True
+            raise
+        return False
 
     async def get_remote_url(self) -> str:
         upstream = await self.get_repo_config(f"branch.{DEFAULT_BRANCH}.remote")
@@ -1000,3 +1151,18 @@ class AnnexedFile(BaseModel):
     key: str
     # keyname: str
     # mtime: Literal["unknown"] | ???
+
+
+def format_result_message(res: Mapping[str, Any]) -> str:
+    """
+    Render the ``message`` of a DataLad result record, which may be a plain
+    string or a ``(format, *args)`` tuple
+    """
+    msg = res.get("message", "")
+    if isinstance(msg, tuple):
+        fmt, *args = msg
+        try:
+            return str(fmt) % tuple(args)
+        except (TypeError, ValueError):
+            return " ".join(str(m) for m in msg)
+    return str(msg)

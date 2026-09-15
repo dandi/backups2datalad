@@ -1,7 +1,26 @@
 # Plan: surviving GitHub secondary rate limits when creating Zarr repositories
 
-Status: **draft v4 for review** (2026-09-14).  Comment inline on the PR, or
-edit this file directly.  Nothing below is implemented yet.
+Status: **v4, implemented in part** (2026-09-15).  Comment inline on the PR, or
+edit this file directly.
+
+Implementation status (agreed by three independent senior-developer reviews
+as the minimal, non-refactoring cut):
+
+* **Done in this PR**: C1 (rate-limit-aware `arequest()`, opt-in via a
+  `GitHubGate`), C2 (one per-process gate: cooldown from GitHub's headers or
+  its documented fallback, ≥ 1 s spacing, give-up after
+  `GITHUB_RATE_LIMIT_ATTEMPTS` consecutive hits), C3 (retry-wrapped
+  `create_github_sibling()`, both DataLad failure shapes, `description=`,
+  idempotent sibling config), C4 (push unpushed commits, describe when never
+  described, F5 fix), C6 (`create_release` through the gate), and the
+  dirty-dataset digest from C5.
+* **Deliberately not done**: cache seeding / interim text (a fresh Zarr is
+  described on the visit that creates it; "cache missing" is the whole
+  predicate), the cumulative-time breaker and per-run mutation budget (no
+  local quota numbers), `/rate_limit` sampling, the identity check, the
+  end-of-run summary, idempotent `initremote`, creation-after-commit, C7
+  `reconcile-zarrs`, C8.  Debris that only a reconcile pass can reach (§3.5,
+  G1/G2) remains a follow-up.
 
 v2 folded in three independent reviews (fact-check, design, ops/recovery) of
 v1; v3 applied the maintainer's decisions on dirty datasets and cron

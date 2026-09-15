@@ -11,7 +11,7 @@ from humanize import naturalsize
 
 from .adandi import RemoteDandiset
 from .adataset import AsyncDataset, DatasetStats
-from .aioutil import arequest
+from .aioutil import GitHubGate, arequest
 from .config import BackupConfig
 from .consts import USER_AGENT
 from .logging import PrefixedLogger, log
@@ -103,14 +103,25 @@ class Manager(AsyncResource):
         size = naturalsize(stats.size)
         return f"{quantify(stats.files, 'file')}, {size}, {desc}"
 
-    async def set_zarr_description(self, zarr_id: str, stats: DatasetStats) -> None:
+    async def set_zarr_description(
+        self, zarr_id: str, stats: DatasetStats, ds: AsyncDataset | None = None
+    ) -> None:
         assert self.config.zarr_gh_org is not None
         assert self.gh is not None
         assert self.config.zarr_root is not None
+        if ds is None:
+            ds = AsyncDataset(self.config.zarr_root / zarr_id)
+        if not ds.ds.is_installed():
+            # Without a repository DataLad would silently hand us the global
+            # config for the description cache, so refuse instead.
+            raise RuntimeError(
+                f"Zarr {zarr_id}: no dataset at {ds.path}; cannot record its"
+                " GitHub description"
+            )
         size = naturalsize(stats.size)
         await self._set_github_description(
             GHRepo(self.config.zarr_gh_org, zarr_id),
-            AsyncDataset(self.config.zarr_root / zarr_id),
+            ds,
             description=f"{quantify(stats.files, 'file')}, {size}",
         )
 
@@ -119,6 +130,9 @@ class Manager(AsyncResource):
 class GitHub(AsyncResource):
     token: InitVar[str]
     client: httpx.AsyncClient = field(init=False)
+    # Paces all GitHub mutations made by this process and reacts to GitHub's
+    # rate-limit responses; also handed to `create_github_sibling()`
+    gate: GitHubGate = field(init=False, default_factory=GitHubGate)
 
     def __post_init__(self, token: str) -> None:
         self.client = httpx.AsyncClient(
@@ -135,7 +149,9 @@ class GitHub(AsyncResource):
         # under bursty parallel access, even when the primary 5000/hr budget
         # is far from exhausted.  edit_repo already retries on 403 for the
         # same reason.
-        r = await arequest(self.client, "GET", repo.api_url, retry_on=[403])
+        r = await arequest(
+            self.client, "GET", repo.api_url, retry_on=[403], gate=self.gate
+        )
         data = r.json()
         assert isinstance(data, dict), f"Expected dict, got {type(data)}"
         assert all(
@@ -150,11 +166,20 @@ class GitHub(AsyncResource):
         # Retry on 404's in case we're calling this right after
         # create_github_sibling(), when the repo may not yet exist
         await arequest(
-            self.client, "PATCH", repo.api_url, json=kwargs, retry_on=[403, 404]
+            self.client,
+            "PATCH",
+            repo.api_url,
+            json=kwargs,
+            retry_on=[403, 404],
+            gate=self.gate,
         )
 
     async def create_release(self, repo: GHRepo, tag: str) -> None:
         log.debug("Creating GitHub release %s for %s", tag, repo)
         await arequest(
-            self.client, "POST", f"{repo.api_url}/releases", json={"tag_name": tag}
+            self.client,
+            "POST",
+            f"{repo.api_url}/releases",
+            json={"tag_name": tag},
+            gate=self.gate,
         )

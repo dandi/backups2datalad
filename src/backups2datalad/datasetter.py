@@ -179,10 +179,13 @@ class DandiDatasetter(AsyncResource):
 
     async def ensure_github_remote(self, ds: AsyncDataset, dandiset_id: str) -> None:
         if self.config.gh_org is not None:
+            gh = self.manager.gh
             if await ds.create_github_sibling(
                 owner=self.config.gh_org,
                 name=dandiset_id,
                 backup_remote=self.config.dandisets.remote,
+                description=f"Dandiset {dandiset_id}",
+                gate=gh.gate if gh is not None else None,
             ):
                 await self.manager.edit_github_repo(
                     GHRepo(self.config.gh_org, dandiset_id),
@@ -271,7 +274,10 @@ class DandiDatasetter(AsyncResource):
         # - true iff any changes were committed to the repository
         manager.log.info("Syncing")
         if await ds.is_dirty():
-            raise RuntimeError(f"Dirty {dandiset}; clean or save before running")
+            raise RuntimeError(
+                f"Dirty {dandiset}; clean or save before running;"
+                f" {await ds.describe_dirt()}"
+            )
 
         # Fix any URL mismatches between embargo status and current URLs
         if await ds.fix_github_remote_url_for_embargo():

@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from backups2datalad.adataset import AsyncDataset
-from backups2datalad.aioutil import areadcmd
+from backups2datalad.aioutil import GitHubGate, areadcmd
 from backups2datalad.config import BackupConfig, Remote, ResourceConfig
 from backups2datalad.datasetter import DandiDatasetter
 from backups2datalad.manager import Manager
@@ -39,7 +39,9 @@ class MockManager:
         self.edit_repo_calls.append((repo, kwargs))
         await self.gh.edit_repo(repo, **kwargs)
 
-    async def set_zarr_description(self, zarr_id: str, stats: Any) -> None:
+    async def set_zarr_description(
+        self, zarr_id: str, stats: Any, ds: AsyncDataset | None = None
+    ) -> None:
         pass
 
 
@@ -252,20 +254,26 @@ async def test_sync_zarr_with_embargo_status(tmp_path: Path) -> None:
     manager = MagicMock(spec=Manager)
     manager.config = config
     manager.log = MagicMock()
+    manager.gh = MagicMock()
+    manager.gh.gate = GitHubGate()
 
     # Mock the AsyncDataset methods we'll use
     mock_ds = AsyncMock(spec=AsyncDataset)
     mock_ds.pathobj = tmp_path / "zarr"
     mock_ds.is_dirty = AsyncMock(return_value=False)
     mock_ds.has_github_remote = AsyncMock(return_value=False)
+    mock_ds.has_unpushed_commits = AsyncMock(return_value=False)
     mock_ds.set_embargo_status = AsyncMock()
     mock_ds.create_github_sibling = AsyncMock()
     mock_ds.ensure_installed = AsyncMock(return_value=True)
     mock_ds.call_annex = AsyncMock()
     mock_ds.save = AsyncMock()
 
-    # Patch AsyncDataset creation
-    with patch("backups2datalad.zarr.AsyncDataset", return_value=mock_ds):
+    # Patch AsyncDataset creation and the actual content sync
+    with (
+        patch("backups2datalad.zarr.AsyncDataset", return_value=mock_ds),
+        patch("backups2datalad.zarr.ZarrSyncer.run", new=AsyncMock()),
+    ):
         # Test with embargoed status
         zarr_path = tmp_path / "zarr_path"
         zarr_path.mkdir()
@@ -291,7 +299,11 @@ async def test_sync_zarr_with_embargo_status(tmp_path: Path) -> None:
             owner="test-zarr-org",
             name="test-zarr-123",
             backup_remote=config.zarrs.remote if config.zarrs else None,
+            description="Zarr test-zarr-123 of Dandiset 000001",
+            gate=manager.gh.gate,
         )
+        # Nothing to push: no commit was made and nothing is unpushed
+        mock_ds.push.assert_not_called()
 
 
 async def test_datasetter_zarr_embargo_propagation(tmp_path: Path) -> None:
