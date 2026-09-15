@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from functools import cached_property
 from pathlib import Path
 from re import Pattern
@@ -27,11 +27,6 @@ class ResourceConfig(BaseModel):
     path: Path
     github_org: str | None = None
     remote: Remote | None = None
-
-
-class StrEnum(str, Enum):
-    def __str__(self) -> str:
-        return self.name.lower()
 
 
 class Mode(StrEnum):

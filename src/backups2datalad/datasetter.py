@@ -37,7 +37,6 @@ from .util import (
     AssetTracker,
     assets_eq,
     custom_commit_env,
-    fromisoformat,
     quantify,
     quiescence_wait,
     update_dandiset_metadata,
@@ -487,7 +486,7 @@ class DandiDatasetter(AsyncResource):
             ).splitlines()
             for cmt in commits:
                 chash, _, cdate = cmt.partition(" ")
-                ts = fromisoformat(cdate)
+                ts = datetime.fromisoformat(cdate)
                 if ts <= dandiset.version.created:
                     candidates.append(chash)
                     break
@@ -621,7 +620,7 @@ class DandiDatasetter(AsyncResource):
             if ts is None:
                 # Zarr was already up to date; get timestamp from its latest
                 # commit
-                ts = fromisoformat(
+                ts = datetime.fromisoformat(
                     await zds.read_git("show", "-s", "--format=%aI", "HEAD")
                 )
             assert not (ds.pathobj / asset.path).exists()
