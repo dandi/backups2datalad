@@ -41,7 +41,8 @@ MAX_ZARR_SYNCS = 5
 # `retry-after` / `x-ratelimit-reset` headers or, failing those, from its
 # documented fallback of "at least one minute", doubling.
 
-# Consecutive rate-limited responses after which further GitHub mutations in
+# How many consecutive rate-limited GitHub responses are slept out and
+# retried; on the next one the gate gives up and further GitHub mutations in
 # this process fail fast instead of sleeping
 GITHUB_RATE_LIMIT_ATTEMPTS = 5
 

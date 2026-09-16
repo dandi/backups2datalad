@@ -865,15 +865,18 @@ class AsyncDataset:
         lookup -- escape as `requests.HTTPError`, so both shapes are handled.
         """
         try:
-            with anyio.fail_after(GITHUB_CREATE_TIMEOUT):
-                # DataLad's request has no timeout; do not let a hung thread
-                # hold up the caller (or the gate's lock) indefinitely
+            # DataLad's request has no timeout; do not let a hung thread hold
+            # up the caller (or the gate's lock) indefinitely.  An abandoned
+            # thread may still finish creating/configuring the sibling on its
+            # own -- outside the gate -- which `existing="reconfigure"` and
+            # the config restore above absorb on the next visit.
+            with anyio.move_on_after(GITHUB_CREATE_TIMEOUT) as scope:
                 results = await run_sync(create, abandon_on_cancel=True)
-        except TimeoutError:
-            raise RuntimeError(
-                f"Creating GitHub sibling {desc} did not finish within"
-                f" {GITHUB_CREATE_TIMEOUT} s"
-            )
+            if scope.cancelled_caught:
+                raise RuntimeError(
+                    f"Creating GitHub sibling {desc} did not finish within"
+                    f" {GITHUB_CREATE_TIMEOUT} s"
+                )
         except requests.HTTPError as e:
             resp = e.response
             if resp is not None and is_rate_limited(

@@ -19,6 +19,7 @@ from zarr_checksum.tree import ZarrChecksumTree
 
 from .adandi import RemoteZarrAsset
 from .adataset import AsyncDataset
+from .aioutil import GitHubRateLimited
 from .annex import AsyncAnnex
 from .config import BackupConfig, ZarrMode
 from .consts import MAX_ZARR_SYNCS
@@ -637,5 +638,11 @@ async def sync_zarr(
                 or ds.ds.config.get("dandi.github-description", None) is None
             ):
                 stats = await ds.get_stats(config=manager.config)
-                await manager.set_zarr_description(asset.zarr, stats, ds=ds)
+                try:
+                    await manager.set_zarr_description(asset.zarr, stats, ds=ds)
+                except GitHubRateLimited as e:
+                    # The content is committed and pushed; a description is
+                    # not worth failing the Zarr (and its Dandiset) over.
+                    # The cache stays unset, so the next visit retries.
+                    manager.log.warning("Not updating GitHub description: %s", e)
             link.commit_hash = await ds.get_commit_hash()

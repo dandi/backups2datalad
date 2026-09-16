@@ -265,10 +265,39 @@ backups2datalad update-from-backup --force-push dandisets --force-push zarrs
 **Warning**: Force-pushing overwrites remote Git history! Use with caution.
 
 Implementation:
-- `AsyncDataset.push()` accepts `force` parameter in `adataset.py:362`
+- `AsyncDataset.push()` accepts a `force` parameter (`adataset.py`)
 - `BackupConfig.force_push` stores which repositories to force-push
 - Helper methods `should_force_push_dandisets()` and `should_force_push_zarrs()` in `config.py`
-- Push call sites in `datasetter.py:240`, `datasetter.py:396`, and `zarr.py:597` check config
+- The three push call sites (`DandiDatasetter.update_dandiset()`,
+  `DandiDatasetter.tag_releases()`, `sync_zarr()`) check the config
+
+Known gap: `push()` passes a bool where DataLad's `push` expects
+`force="gitpush"`/`"all"`, so the flag currently does not force anything
+(see `docs/github-zarr-rate-limits-plan.md` §11).
+
+## GitHub Rate Limits
+
+All GitHub API mutations (repo creation, `PATCH`, releases) go through one
+`GitHubGate` per process (`aioutil.py`, held by `GitHub.gate` in `manager.py`):
+serialised ≥ 1 s apart, with a cooldown shared by every worker whenever GitHub
+answers 429, or 403 with `retry-after` / `x-ratelimit-remaining: 0` / a
+secondary-limit message.  The cooldown is whatever GitHub says (`retry-after`,
+else `x-ratelimit-reset`), else GitHub's documented fallback of a minute
+doubling per consecutive hit; after `GITHUB_RATE_LIMIT_ATTEMPTS` slept-out
+hits the gate gives up and mutations raise `GitHubRateLimited`.  Constants
+live in `consts.py`; there are no config/CLI knobs.  `arequest(gate=...)` is
+opt-in -- without a gate (DANDI API, S3) it behaves as before.
+
+`AsyncDataset.create_github_sibling()` still uses DataLad's
+`create_sibling_github` but inspects its result records itself, passes a real
+`description=`, and retries a rate-limited creation through the gate.
+`sync_zarr()` converges on every visit: it pushes whenever HEAD has commits
+the `github` sibling lacks (`has_unpushed_commits()`, a plain push) and
+records the description whenever the `dandi.github-description` cache is
+missing; `Manager.set_zarr_description(..., ds=)` must be given the dataset
+actually on disk.  Dirty datasets remain a hard error whose message carries
+`describe_dirt()`.  Design and review trail:
+`docs/github-zarr-rate-limits-plan.md`.
 
 ## Important Environment Variables
 

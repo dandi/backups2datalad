@@ -171,11 +171,12 @@ class GitHubGate:
       or else ``fallback`` seconds doubling per consecutive hit.  Hits that
       arrive while a cooldown is already running are the same incident and
       do not escalate.
-    - After ``attempts`` consecutive rate-limited responses the gate gives up
-      for the rest of the process: further mutations raise
-      `GitHubRateLimited` at once, so the run ends with a clear failure
-      instead of every worker sleeping in turn.  A successful mutation
-      resets the count.
+    - ``attempts`` consecutive rate-limited responses are each slept out and
+      retried; on the next one the gate gives up for the rest of the process:
+      further mutations raise `GitHubRateLimited` at once, and reads fall
+      back to `arequest`'s ordinary (bounded) retry policy, so the run ends
+      with a clear failure instead of every worker sleeping in turn.  A
+      successful mutation resets the count; reads never reset it.
 
     ``clock`` (monotonic), ``wall`` (epoch, for ``x-ratelimit-reset``) and
     ``sleep`` are injectable for tests.  All state is only ever touched from
@@ -215,7 +216,8 @@ class GitHubGate:
         retry_after = hdrs.get("retry-after", "").strip()
         reset = hdrs.get("x-ratelimit-reset", "").strip()
         if retry_after.isdigit():
-            delay = float(retry_after)
+            # GitHub may say 0; never spin
+            delay = max(float(retry_after), 1.0)
             source = "retry-after"
         elif hdrs.get("x-ratelimit-remaining") == "0" and reset.isdigit():
             delay = max(float(reset) - self.wall(), 1.0)
@@ -234,7 +236,8 @@ class GitHubGate:
             )
         else:
             log.warning(
-                "RATELIMIT: %s; hit %d/%d; cooling down for %.0f s (from %s)",
+                "RATELIMIT: %s; consecutive hit %d (giving up after %d);"
+                " cooling down for %.0f s (from %s)",
                 what,
                 self.consecutive,
                 self.attempts,
@@ -338,13 +341,18 @@ async def arequest(
                     e.response.status_code, e.response.headers, e.response.text
                 )
             ):
-                # The next attempt sleeps out the cooldown (under the lock,
-                # for mutations) or raises GitHubRateLimited once the gate
-                # has given up.
                 gate.note_rate_limited(
                     e.response.headers, f"{method.upper()} {url}: {err_detail}"
                 )
-                continue
+                if not gate.gave_up:
+                    # The next attempt sleeps out the cooldown (under the
+                    # lock, for mutations)
+                    continue
+                if mutating:
+                    gate.raise_if_gave_up()
+                # Once the gate has given up, a rate-limited read is handled
+                # like any other error below, so it stays bounded by
+                # `retry_on` + `exp_wait` instead of looping on the cooldown.
             if isinstance(e, (httpx.RequestError, ssl.SSLError)) or (
                 isinstance(e, httpx.HTTPStatusError)
                 and (

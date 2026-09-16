@@ -381,5 +381,53 @@ async def test_github_gate_gives_up_and_spaces_mutations() -> None:
     with pytest.raises(GitHubRateLimited):
         async with gate.mutation():
             pass
-    # Reads still observe the cooldown but are never refused
+    # Reads still sleep out the cooldown but are not refused by the gate
+    slept_before = len(clock.slept)
     await gate.wait()
+    assert clock.slept[slept_before:] == [240.0]
+    assert not clock.slept[slept_before + 1 :]
+
+
+@pytest.mark.ai_generated
+async def test_arequest_get_stays_bounded_after_give_up() -> None:
+    """
+    A read that keeps being rate-limited is retried through the gate only
+    until the gate gives up; then it falls back to the ordinary handling
+    (here: not in ``retry_on``, so it raises) instead of looping forever.
+    """
+    counter: dict[str, int] = {"count": 0}
+    handler_cls = _make_handler(
+        [(403, _RATE_LIMIT_BODY, {"Retry-After": "0"})], counter
+    )
+    clock = FakeClock()
+    gate = make_gate(clock, attempts=2)
+    with _serve(handler_cls) as base_url:
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(httpx.HTTPStatusError):
+                await arequest(client, "GET", f"{base_url}/repos/x/y", gate=gate)
+    assert counter["count"] == 3, "two slept-out hits, then the third gives up"
+    assert clock.slept == [1.0, 1.0], "Retry-After: 0 is clamped to 1 s"
+    assert gate.gave_up
+
+
+@pytest.mark.ai_generated
+async def test_arequest_mutation_raises_once_gate_gave_up() -> None:
+    counter: dict[str, int] = {"count": 0}
+    handler_cls = _make_handler(
+        [(429, _RATE_LIMIT_BODY, {"Retry-After": "5"})], counter
+    )
+    clock = FakeClock()
+    gate = make_gate(clock, attempts=1)
+    with _serve(handler_cls) as base_url:
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(GitHubRateLimited):
+                await arequest(
+                    client,
+                    "PATCH",
+                    f"{base_url}/repos/x/y",
+                    json={},
+                    retry_on=[403],
+                    gate=gate,
+                )
+    assert counter["count"] == 2
+    assert clock.slept == [5.0]
