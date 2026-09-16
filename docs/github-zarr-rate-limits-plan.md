@@ -539,7 +539,7 @@ fixes nothing after the fact.
 2. Under `zarr_root` and any `backup-zarrs` partial dir: list Zarrs that are
    not installed (S1), dirty (S3/S5), or have a `github` remote with no
    tracking ref / unpushed commits (S6) / no `dandi.github-description`
-   one (S7).  Put the counts in the PR — they size the first-run backlog
+   (S7).  Put the counts in the PR — they size the first-run backlog
    (C4) and the `--limit` for `reconcile-zarrs`.
 3. Confirm from the log that the DataLad credential and `GITHUB_TOKEN` are the
    same account (or note that they are not).
