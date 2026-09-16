@@ -19,6 +19,7 @@ from zarr_checksum.tree import ZarrChecksumTree
 
 from .adandi import RemoteZarrAsset
 from .adataset import AsyncDataset
+from .aioutil import GitHubRateLimited
 from .annex import AsyncAnnex
 from .config import BackupConfig, ZarrMode
 from .consts import MAX_ZARR_SYNCS
@@ -557,7 +558,11 @@ async def sync_zarr(
                     check_dirty=False,
                 )
             await ds.create_github_sibling(
-                owner=zgh, name=asset.zarr, backup_remote=manager.config.zarrs.remote
+                owner=zgh,
+                name=asset.zarr,
+                backup_remote=manager.config.zarrs.remote,
+                description=f"Zarr {asset.zarr} of Dandiset {asset.dandiset_id}",
+                gate=manager.gh.gate if manager.gh is not None else None,
             )
             manager.log.debug(
                 "Created GitHub sibling with privacy %s",
@@ -566,7 +571,7 @@ async def sync_zarr(
         if await ds.is_dirty():
             raise RuntimeError(
                 f"Zarr {asset.zarr} in Dandiset {asset.dandiset_id} is dirty;"
-                " clean or save before running"
+                f" clean or save before running; {await ds.describe_dirt()}"
             )
         async with AsyncAnnex(dsdir, digest_type="MD5") as annex:
             if (r := manager.config.zarrs.remote) is not None:
@@ -603,27 +608,41 @@ async def sync_zarr(
             manager.log.debug("Running `git gc`")
             await ds.gc()
             manager.log.debug("Finished running `git gc`")
-            if manager.config.zarr_gh_org is not None:
-                manager.log.debug("Pushing to GitHub")
-                await ds.push(
-                    to="github",
-                    jobs=manager.config.jobs,
-                    data="nothing",
-                    force=manager.config.should_force_push_zarrs(),
-                )
-                manager.log.debug("Finished pushing to GitHub")
             if link is not None:
                 link.timestamp = commit_ts
         else:
             manager.log.info("no changes; not committing")
+        if manager.config.zarr_gh_org is not None and (
+            made_commit or await ds.has_unpushed_commits()
+        ):
+            # Also push what an earlier run committed but never pushed (e.g.
+            # because it was cancelled after a rate-limited sibling creation);
+            # a plain push, forced only when --force-push asks for it
+            manager.log.debug("Pushing to GitHub")
+            await ds.push(
+                to="github",
+                jobs=manager.config.jobs,
+                data="nothing",
+                force=manager.config.should_force_push_zarrs(),
+            )
+            manager.log.debug("Finished pushing to GitHub")
         if link is not None:
-            # Mirror the dandiset-side gate (datasetter.update_dandiset): only
-            # refresh the GitHub description when we actually changed
-            # something or the user asked for FORCE mode, so a no-op cron
-            # doesn't fan out into one `GET /repos/...` per zarr.
+            # Only refresh the GitHub description when we changed something,
+            # the user asked for FORCE mode, or it was never recorded (e.g. an
+            # earlier run failed before getting here); `set_zarr_description`
+            # then PATCHes only if the description actually differs, so a
+            # no-op cron makes no GitHub API calls per zarr.
             if manager.gh is not None and (
-                made_commit or manager.config.zarr_mode is ZarrMode.FORCE
+                made_commit
+                or manager.config.zarr_mode is ZarrMode.FORCE
+                or ds.ds.config.get("dandi.github-description", None) is None
             ):
                 stats = await ds.get_stats(config=manager.config)
-                await manager.set_zarr_description(asset.zarr, stats)
+                try:
+                    await manager.set_zarr_description(asset.zarr, stats, ds=ds)
+                except GitHubRateLimited as e:
+                    # The content is committed and pushed; a description is
+                    # not worth failing the Zarr (and its Dandiset) over.
+                    # The cache stays unset, so the next visit retries.
+                    manager.log.warning("Not updating GitHub description: %s", e)
             link.commit_hash = await ds.get_commit_hash()
