@@ -1,13 +1,12 @@
 """
-Tests for the checks that keep a mirror left dirty by an interrupted run from
-being skipped -- and therefore never reported -- on every subsequent run.
+Tests for the state comparison that keeps a mirror left dirty by an interrupted
+run from being skipped -- and therefore never reported -- on every subsequent
+run.
 
-`set_assets_state()` writes and stages the new timestamp well before the commit
-that seals it, so a run cut short in between leaves a working-tree
-`.dandi/assets-state.json` claiming a backup that was never committed.  Gating
-on that copy made `update_dandiset()` take the "not modified since last backup"
-branch and skip `sync_dataset()`, which is where the only dirtiness check used
-to live.
+A run cut short between writing `.dandi/assets-state.json` and committing it
+leaves a working-tree copy claiming a backup that was never made.  Going by
+that copy, `update_dandiset()` took its "not modified since last backup" branch
+and skipped `sync_dataset()`, which is where the dirtiness check lives.
 """
 
 from __future__ import annotations
@@ -157,46 +156,42 @@ async def test_committed_state_without_any_commits(tmp_path: Path) -> None:
     assert await AsyncDataset(path).get_committed_assets_state() is None
 
 
-# --- AsyncDataset.has_changes(cached=True) ----------------------------------
+# --- AsyncDataset.get_backup_state() ----------------------------------------
 
 
 @pytest.mark.ai_generated
-async def test_staged_check_on_clean_mirror(tmp_path: Path) -> None:
+async def test_backup_state_is_the_older_of_the_two(tmp_path: Path) -> None:
     ds = make_mirror(tmp_path / "000571")
-    assert await ds.has_changes(cached=True) is False
-    assert await ds.is_dirty() is False
+    write_state(ds.pathobj, MODIFIED)
+    git(ds.pathobj, "add", str(AssetsState.PATH))
+    state = await ds.get_backup_state()
+    assert state is not None and state.timestamp == BACKED_UP
 
 
 @pytest.mark.ai_generated
-async def test_staged_check_sees_pruned_assets(tmp_path: Path) -> None:
-    """What `prune_deleted()` leaves behind when the commit never happens."""
+async def test_backup_state_of_a_clean_mirror(tmp_path: Path) -> None:
     ds = make_mirror(tmp_path / "000571")
-    git(ds.pathobj, "rm", "-q", "-f", "sub-c02/events.tsv")
-    assert await ds.has_changes(cached=True) is True
+    state = await ds.get_backup_state()
+    assert state is not None and state.timestamp == BACKED_UP
 
 
 @pytest.mark.ai_generated
-async def test_staged_check_ignores_unstaged_and_untracked(tmp_path: Path) -> None:
-    """
-    The cheap check deliberately does not stat the working tree; the full
-    `is_dirty()` on the sync path is what covers this.
-    """
+async def test_backup_state_without_a_state_file(tmp_path: Path) -> None:
+    """Missing on either side means "sync", not "skip"."""
     ds = make_mirror(tmp_path / "000571")
-    (ds.pathobj / "dandiset.yaml").write_text("identifier: DANDI:000571 (edited)\n")
-    (ds.pathobj / "stray.txt").write_text("not ours\n")
-    assert await ds.has_changes(cached=True) is False
-    assert await ds.is_dirty() is True
+    (ds.pathobj / AssetsState.PATH).unlink()
+    assert await ds.get_backup_state() is None
 
 
 # --- update_dandiset() ------------------------------------------------------
 
 
 @pytest.mark.ai_generated
-@pytest.mark.usefixtures("no_sync")
 async def test_interrupted_run_is_reported_not_skipped(tmp_path: Path) -> None:
     """
-    The regression: a mirror left mid-sync, with the state file already
-    bumped to the server's timestamp, used to be skipped without a word.
+    The regression, end to end: a mirror left mid-sync with the state file
+    already bumped to the server's timestamp used to be skipped without a
+    word.  It must reach `sync_dataset()` and be reported there.
     """
     ds = make_mirror(tmp_path / "000571")
     git(ds.pathobj, "rm", "-q", "-f", "sub-c02/events.tsv")
@@ -214,19 +209,15 @@ async def test_interrupted_run_is_reported_not_skipped(tmp_path: Path) -> None:
 
 
 @pytest.mark.ai_generated
-@pytest.mark.usefixtures("no_sync")
-async def test_unstaged_state_bump_reaches_the_sync_path(tmp_path: Path) -> None:
+async def test_unstaged_state_bump_is_reported(tmp_path: Path) -> None:
     """
-    A run killed between writing the state file and staging it leaves nothing
-    in the index, so the cheap check passes; gating on HEAD still routes the
-    Dandiset to `sync_dataset()`, whose `is_dirty()` catches it.
+    A run killed before it could stage the state file leaves nothing in the
+    index, and is caught just the same.
     """
     ds = make_mirror(tmp_path / "000571")
     write_state(ds.pathobj, MODIFIED)
-    assert await ds.has_changes(cached=True) is False
-    assert await ds.is_dirty() is True
     di = make_datasetter(tmp_path)
-    with pytest.raises(SyncCalled):
+    with pytest.raises(RuntimeError, match="Dirty Dandiset 000571/draft"):
         await di.update_dandiset(mock_dandiset(), ds)
 
 
