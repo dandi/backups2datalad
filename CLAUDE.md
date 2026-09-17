@@ -217,6 +217,55 @@ past, before the local dataset is even created; the next run picks it up.
   up within seconds of each other.  Tests exercising the gate itself
   (`test/test_quiescence.py`) pass `quiescent_period` explicitly.
 
+## Dirty Mirrors
+
+A mirror left uncommitted by an interrupted run used to be able to hide
+itself.  `AsyncDataset.set_assets_state()` writes `.dandi/assets-state.json`
+and stages it well before the commit that seals it, and in the "listing
+consumed" branch it writes the server's `version.modified` verbatim
+(`asyncer.py`).  A run cut short between there and `sync_dataset()`'s final
+commit therefore left a working-tree state file claiming a backup that was
+never committed -- alongside the staged deletions from `prune_deleted()` and a
+staged `dandiset.yaml`.  `update_dandiset()` read that file, concluded the
+backup was current, skipped `sync_dataset()`, and with it the only dirtiness
+check there was; the Dandiset then went unmentioned in every subsequent run's
+log and never failed one, so no one was told (see 000571, which sat this way
+from 2026-09-10).
+
+`update_dandiset()` now, per Dandiset and before the timestamp shortcut:
+
+- Raises on `AsyncDataset.has_changes(cached=True)` -- `git diff --quiet
+  --cached`, index against `HEAD`.  Everything this program writes it stages
+  (`git annex add`, `git rm`, `git add`), so an interrupted run always leaves
+  its work there.  The check does not stat the working tree, which makes it
+  ~8 ms on a 50k-file mirror against ~70 ms (warm; far worse cold) for the full
+  `git status`, i.e. cheap enough to ask of all ~1400 mirrors on every run.
+- Gates on `AsyncDataset.get_committed_assets_state()` (the state in `HEAD`,
+  one `git cat-file`, ~2 ms) rather than `get_assets_state()` (the working-tree
+  copy).  An uncommitted bump then cannot make a mirror look current: the gate
+  sees the committed timestamp, calls `sync_dataset()`, and the full
+  `is_dirty()` there reports it.  This also covers the variant where the run
+  died before `git add`, which leaves nothing staged.
+
+The full `git status` stays where it was, on the sync path, and
+`describe_dirt()` is what puts the offending paths in the error message.  A
+missing or unborn `HEAD:.dandi/assets-state.json` yields `None`, which makes
+the caller sync rather than skip.
+
+Two notes for anyone extending this:
+
+- `git` stores commit dates in whole seconds while the state file carries
+  microseconds, so comparing `state.timestamp` against
+  `get_last_commit_date()` needs a sub-second tolerance.  Reading the blob
+  from `HEAD` avoids the question, which is why it is done that way.
+- Once a mirror is in this state, a full sync would also hit
+  `dump_asset_metadata()`'s garbage-collection error: `prune_deleted()`
+  removed the files without rewriting `assets.json`, so their metadata is left
+  with neither a local file nor a server asset and `prune_metadata()` reports
+  it.  That error has no threshold -- one entry raises unless `gc_assets` is
+  set -- and, unlike ordinary deletions (which `get_deleted()` handles by
+  popping the metadata first), it means the two records disagree.
+
 ## Testing
 
 The project uses pytest for testing, with fixtures for:

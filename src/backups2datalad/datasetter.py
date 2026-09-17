@@ -226,7 +226,26 @@ class DandiDatasetter(AsyncResource):
         if dandiset.embargo_status is EmbargoStatus.EMBARGOED:
             await ds.ensure_dandi_provider(self.dandi_client.api_url)
         dmanager = self.manager.with_sublogger(f"Dandiset {dandiset.identifier}")
-        state = ds.get_assets_state()
+        # Everything this program writes to a mirror it stages (`git annex
+        # add`, `git rm`, `git add`), so a run cut short always leaves its work
+        # in the index.  Look for that here, before the timestamp shortcut
+        # below gets a chance to declare the backup up to date and skip
+        # `sync_dataset()` -- and with it the only dirtiness check there used
+        # to be.  `git diff --cached` compares the index against HEAD without
+        # stat'ing the working tree, so this costs a few milliseconds even on
+        # the largest mirrors; the full `git status` stays on the sync path.
+        if await ds.has_changes(cached=True):
+            raise RuntimeError(
+                f"Dirty {dandiset}; uncommitted work is staged in the mirror;"
+                f" clean or save before running; {await ds.describe_dirt()}"
+            )
+        # Take the recorded state from HEAD rather than from the working tree:
+        # `set_assets_state()` writes and stages the new timestamp well before
+        # the commit that seals it, so a run cut short in between leaves a
+        # working-tree copy claiming a backup that was never committed.
+        # Gating on that copy made such a Dandiset look up to date, so it was
+        # skipped -- silently, forever -- instead of being reported as dirty.
+        state = await ds.get_committed_assets_state()
         if (
             dmanager.config.mode is Mode.FORCE
             or state is None

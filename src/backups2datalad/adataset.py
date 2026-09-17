@@ -1033,11 +1033,38 @@ class AsyncDataset:
         assert not dupped, f"Duplicates found in {filepath}: {dupped}"
 
     def get_assets_state(self) -> AssetsState | None:
+        """
+        The `AssetsState` in the working tree.  `set_assets_state()` writes
+        this well before the commit that seals it, so it can describe a backup
+        that was never committed; to decide whether a mirror is up to date,
+        use `get_committed_assets_state()` instead.
+        """
         try:
             with (self.pathobj / AssetsState.PATH).open() as fp:
                 return AssetsState.model_validate(json.load(fp))
         except FileNotFoundError:
             return None
+
+    async def get_committed_assets_state(self) -> AssetsState | None:
+        """
+        The `AssetsState` recorded in ``HEAD``, i.e. the state of the last
+        backup that was actually committed.  `None` if ``HEAD`` does not have
+        the file (or if there is no ``HEAD`` yet), which is also the answer
+        that makes a caller sync rather than skip.
+        """
+        try:
+            blob = await self.read_git(
+                "cat-file",
+                "blob",
+                f"HEAD:{AssetsState.PATH.as_posix()}",
+                quiet_rcs=[128],
+            )
+        except subprocess.CalledProcessError as e:
+            if e.returncode == 128:
+                return None
+            else:
+                raise
+        return AssetsState.model_validate(json.loads(blob))
 
     async def set_assets_state(self, state: AssetsState) -> None:
         path = self.pathobj / AssetsState.PATH
