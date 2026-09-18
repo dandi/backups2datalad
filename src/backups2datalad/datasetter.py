@@ -226,7 +226,11 @@ class DandiDatasetter(AsyncResource):
         if dandiset.embargo_status is EmbargoStatus.EMBARGOED:
             await ds.ensure_dandi_provider(self.dandi_client.api_url)
         dmanager = self.manager.with_sublogger(f"Dandiset {dandiset.identifier}")
-        state = ds.get_assets_state()
+        # Ask how far the last backup actually got rather than what the
+        # working tree claims: a state file written by a run that never
+        # committed used to make a mirror look up to date, so it was skipped
+        # here -- and the dirtiness check in `sync_dataset()` never ran.
+        state = await ds.get_backup_state()
         if (
             dmanager.config.mode is Mode.FORCE
             or state is None

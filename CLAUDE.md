@@ -217,6 +217,59 @@ past, before the local dataset is even created; the next run picks it up.
   up within seconds of each other.  Tests exercising the gate itself
   (`test/test_quiescence.py`) pass `quiescent_period` explicitly.
 
+## Dirty Mirrors
+
+A mirror left uncommitted by an interrupted run used to be able to hide
+itself.  `AsyncDataset.set_assets_state()` writes `.dandi/assets-state.json`
+and stages it before the commit that seals it, and in the "listing consumed"
+branch it writes the server's `version.modified` verbatim (`asyncer.py`).  A
+run cut short between there and `sync_dataset()`'s final commit therefore left
+a working-tree state file claiming a backup that was never committed --
+alongside the staged deletions from `prune_deleted()` and a staged
+`dandiset.yaml`.  `update_dandiset()` read that file, concluded the backup was
+current, skipped `sync_dataset()`, and with it the only dirtiness check there
+is; the Dandiset then went unmentioned in every subsequent run's log and never
+failed one, so no one was told (see 000571, which sat this way from
+2026-09-10).  The window that produces this state is also the only one in
+which the state file already holds `version.modified`, so the failure reliably
+conceals itself.
+
+`update_dandiset()` now gates on `AsyncDataset.get_backup_state()`, which is
+the **older** of the states recorded in the working tree and in `HEAD` (`None`
+-- sync, do not skip -- if either is missing).  An uncommitted bump therefore
+cannot make a mirror look current: the gate sees the committed timestamp, the
+Dandiset looks stale, `sync_dataset()` runs, and the `is_dirty()` there reports
+it with `describe_dirt()`.
+
+Deliberately, no dirtiness check runs on the skip path: `git status` is ~70 ms
+warm on a 50k-file mirror (far worse cold) and even `git diff --cached` is
+~8 ms, neither of which is worth paying for ~1400 mirrors every run.
+`get_backup_state()` costs one `git cat-file` (~2 ms); the working-tree read is
+a plain file read.
+
+What this deliberately does *not* catch: staged or unstaged junk on a mirror
+whose recorded state is current on both sides, since nothing then makes it look
+stale.  Everything an interrupted sync leaves behind does make it look stale,
+because the sync writes the state last.  For the rest there is
+`tools/find-INVISIBLE-changed.sh` on drogon, a fleet-wide sweep
+(`git diff-index --cached --quiet HEAD` per mirror, ~12 s for all of them).
+
+Two notes for anyone extending this:
+
+- Comparing the state timestamp against `get_last_commit_date()` instead is
+  tempting -- commit author dates are DANDI timestamps (`custom_commit_env()`)
+  and `sync_dataset()`'s final commit is dated `version.modified` -- but `git`
+  stores commit dates in whole seconds while the state file carries
+  microseconds, so that comparison needs a sub-second tolerance or it flags
+  every mirror.  Reading the blob from `HEAD` avoids the question.
+- Once a mirror is in this state, a full sync would also hit
+  `dump_asset_metadata()`'s garbage-collection error: `prune_deleted()` removed
+  the files without rewriting `assets.json`, so their metadata is left with
+  neither a local file nor a server asset and `prune_metadata()` reports it.
+  That error has no threshold -- one entry raises unless `gc_assets` is set --
+  and, unlike ordinary deletions (which `get_deleted()` handles by popping the
+  metadata first), it means the two records disagree.
+
 ## Testing
 
 The project uses pytest for testing, with fixtures for:

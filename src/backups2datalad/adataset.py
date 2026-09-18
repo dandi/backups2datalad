@@ -1033,11 +1033,44 @@ class AsyncDataset:
         assert not dupped, f"Duplicates found in {filepath}: {dupped}"
 
     def get_assets_state(self) -> AssetsState | None:
+        """The `AssetsState` in the working tree, committed or not."""
         try:
             with (self.pathobj / AssetsState.PATH).open() as fp:
                 return AssetsState.model_validate(json.load(fp))
         except FileNotFoundError:
             return None
+
+    async def get_committed_assets_state(self) -> AssetsState | None:
+        """
+        The `AssetsState` recorded in ``HEAD``.  `None` if ``HEAD`` does not
+        have the file, or if there is no ``HEAD`` yet.
+        """
+        try:
+            blob = await self.read_git(
+                "cat-file",
+                "blob",
+                f"HEAD:{AssetsState.PATH.as_posix()}",
+                quiet_rcs=[128],
+            )
+        except subprocess.CalledProcessError as e:
+            if e.returncode == 128:
+                return None
+            else:
+                raise
+        return AssetsState.model_validate(json.loads(blob))
+
+    async def get_backup_state(self) -> AssetsState | None:
+        """
+        How far the last backup got, taken as the older of the states recorded
+        in the working tree and in ``HEAD``, so that a state written but not
+        yet committed cannot make the dataset look more up to date than it is.
+        `None` -- sync, do not skip -- if either is missing.
+        """
+        working = self.get_assets_state()
+        committed = await self.get_committed_assets_state()
+        if working is None or committed is None:
+            return None
+        return working if working.timestamp <= committed.timestamp else committed
 
     async def set_assets_state(self, state: AssetsState) -> None:
         path = self.pathobj / AssetsState.PATH
