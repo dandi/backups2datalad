@@ -30,19 +30,8 @@ ZARR_ID = "0596fd61-17af-484f-aa1d-a6052949a950"
 
 
 def git(path: Path, *args: str) -> None:
-    subprocess.run(
-        [
-            "git",
-            "-c",
-            "user.name=Tester",
-            "-c",
-            "user.email=tester@example.com",
-            *args,
-        ],
-        cwd=path,
-        check=True,
-        capture_output=True,
-    )
+    # Identity comes from conftest's autouse `tmp_home`
+    subprocess.run(["git", *args], cwd=path, check=True, capture_output=True)
 
 
 def register_submodule(ds: Path, path: str, url: str) -> None:
