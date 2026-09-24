@@ -375,11 +375,6 @@ class Downloader:
     async def assert_zarr_mirror_is_new(
         self, asset: RemoteZarrAsset, zarr_dspath: Path
     ) -> None:
-        """
-        Raise `MirrorMissingError` if the Dandiset mirror already has this
-        Zarr as a submodule even though the Zarr mirror is not installed at
-        ``zarr_dspath``.  (`sync_zarr()` checks GitHub.)
-        """
         url = await self.ds.get_repo_config(
             f"submodule.{asset.path}.url", file=".gitmodules"
         )

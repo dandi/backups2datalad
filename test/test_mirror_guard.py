@@ -1,13 +1,4 @@
-"""
-Tests for refusing to create a Dandiset or Zarr mirror from scratch when one
-already exists elsewhere -- registered in the superdataset (or, for a Zarr, in
-its Dandiset), or present on GitHub -- but is not installed where we look.
-
-Creating it anyway starts a second, unrelated history under the same name: new
-datalad-id, a one-commit history, and a push that collides with the real
-repository.  This is what happens to an uninstalled submodule in a fresh clone
-of the superdataset, or to a mirror directory removed by hand.
-"""
+"""Refusing to create a mirror that exists already but is not installed"""
 
 from __future__ import annotations
 
@@ -204,23 +195,53 @@ async def test_zarr_already_on_github_is_not_recreated(tmp_path: Path) -> None:
 # --- GitHub.repo_exists() -----------------------------------------------------
 
 
-@pytest.mark.ai_generated
-@pytest.mark.parametrize(
-    "status,expected", [(200, True), (404, False)], ids=["exists", "missing"]
-)
-async def test_repo_exists(status: int, expected: bool) -> None:
+async def mock_github(
+    status: int, headers: dict[str, str] | None = None, token: str = "dummy"
+) -> tuple[GitHub, list[httpx.Request]]:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(status, json={"full_name": "dandisets/000026"})
+        return httpx.Response(status, headers=headers, json={})
 
-    gh = GitHub("dummy")
+    gh = GitHub(token)
     await gh.client.aclose()
     gh.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    try:
+    return gh, requests
+
+
+@pytest.mark.ai_generated
+@pytest.mark.parametrize(
+    "status,headers,expected",
+    [
+        (200, {}, True),
+        (404, {}, False),  # fine-grained or App token: no scopes reported
+        (404, {"x-oauth-scopes": "repo, workflow"}, False),
+    ],
+    ids=["exists", "missing", "missing-classic-token"],
+)
+async def test_repo_exists(
+    status: int, headers: dict[str, str], expected: bool
+) -> None:
+    gh, requests = await mock_github(status, headers)
+    async with gh:
         assert await gh.repo_exists(GHRepo("dandisets", "000026")) is expected
-    finally:
-        await gh.aclose()
-    assert len(requests) == 1
-    assert requests[0].method == "GET"
+    assert [r.method for r in requests] == ["GET"]
+
+
+@pytest.mark.ai_generated
+async def test_repo_exists_distrusts_404_without_private_access() -> None:
+    """A classic token without `repo` gets 404 for private repositories."""
+    gh, _ = await mock_github(404, {"x-oauth-scopes": "public_repo, read:org"})
+    async with gh:
+        with pytest.raises(RuntimeError, match="lacks the 'repo' scope"):
+            await gh.repo_exists(GHRepo("dandisets", "000026"))
+
+
+@pytest.mark.ai_generated
+async def test_repo_exists_needs_a_token() -> None:
+    gh, requests = await mock_github(404, token="")
+    async with gh:
+        with pytest.raises(RuntimeError, match="without a token"):
+            await gh.repo_exists(GHRepo("dandisets", "000026"))
+    assert requests == []

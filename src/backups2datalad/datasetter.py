@@ -182,13 +182,7 @@ class DandiDatasetter(AsyncResource):
     async def assert_dandiset_mirror_is_new(
         self, ds: AsyncDataset, dandiset_id: str
     ) -> None:
-        """
-        Raise `MirrorMissingError` if the mirror of ``dandiset_id``, which is
-        not installed at ``ds``, is known to exist elsewhere: registered in the
-        superdataset (e.g., an uninstalled submodule in a fresh clone, or a
-        directory removed by hand), or already on GitHub.  Only a Dandiset
-        mirrored for the first time may be created from scratch.
-        """
+        """Raise if the Dandiset is in the superdataset or on GitHub already."""
         superds = AsyncDataset(self.config.dandiset_root)
         if superds.ds.is_installed() and (
             url := await superds.get_repo_config(

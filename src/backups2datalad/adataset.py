@@ -89,9 +89,8 @@ class AsyncDataset:
         embargo_status: EmbargoStatus = EmbargoStatus.OPEN,
         before_create: Callable[[], Awaitable[None]] | None = None,
     ) -> bool:
-        # Returns True if the dataset was freshly created.  `before_create` is
-        # awaited only when the dataset is about to be created, so it can veto
-        # that by raising (e.g., when the mirror exists elsewhere already).
+        # Returns True if the dataset was freshly created.  `before_create`
+        # may veto creation by raising.
         if self.ds.is_installed():
             if cfg_proc is not None:
                 # The dataset was created by an earlier run, possibly under an

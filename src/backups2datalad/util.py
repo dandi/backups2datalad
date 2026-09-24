@@ -308,13 +308,7 @@ class UnexpectedChangeError(Exception):
 
 
 class MirrorMissingError(RuntimeError):
-    """
-    Raised instead of creating a mirror from scratch when it is known to exist
-    already -- registered in the superdataset or its Dandiset, or present on
-    GitHub -- but is not installed where we looked for it.  Creating it anyway
-    would start a second, unrelated history under the same name, which the
-    next push would then collide with (or, forced, overwrite).
-    """
+    """A mirror to be created exists already but is not installed locally"""
 
 
 def check_git_annex_version() -> None:
