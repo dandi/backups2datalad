@@ -1,0 +1,9 @@
+# Applied on top of dandi-cli's test docker-compose.yml via COMPOSE_FILE (see
+# conftest.py).  MinIO made quay.io/minio/minio require a login on 2026-09-24;
+# drop this once the dandi release we test against carries
+# https://github.com/dandi/dandi-cli/pull/1927.
+services:
+  minio:
+    image: bitnamilegacy/minio:latest
+    command: !reset []
+    tty: !reset false
