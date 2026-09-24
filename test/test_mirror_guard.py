@@ -234,3 +234,25 @@ async def test_repo_exists_needs_a_token() -> None:
         with pytest.raises(RuntimeError, match="without a token"):
             await gh.repo_exists(GHRepo("dandisets", "000026"))
     assert requests == []
+
+
+@pytest.mark.ai_generated
+@pytest.mark.parametrize("first", ["connect-error", 502], ids=str)
+async def test_repo_exists_retries_what_is_not_an_answer(first: str | int) -> None:
+    """Anything but 404/2xx goes through `get_repo()` and its retries."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            if first == "connect-error":
+                raise httpx.ConnectError("boom", request=request)
+            return httpx.Response(int(first))
+        return httpx.Response(200, json={"full_name": "dandisets/000026"})
+
+    gh = GitHub("dummy")
+    await gh.client.aclose()
+    gh.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    async with gh:
+        assert await gh.repo_exists(GHRepo("dandisets", "000026")) is True
+    assert len(requests) == 2
