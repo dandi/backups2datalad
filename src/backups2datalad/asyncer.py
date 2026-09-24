@@ -37,6 +37,7 @@ from .manager import Manager
 from .procedures.cfg_dandiset import size_limit_bytes
 from .util import (
     AssetTracker,
+    MirrorMissingError,
     UnexpectedChangeError,
     format_errors,
     key2hash,
@@ -355,6 +356,11 @@ class Downloader:
                 timestamp=None,
                 asset_paths=[asset.path],
             )
+            # Claim the Zarr before awaiting anything, so that another asset
+            # of the same Zarr does not start a second sync of it
+            self.zarrs[asset.zarr] = zl
+            if not AsyncDataset(zarr_dspath).ds.is_installed():
+                await self.assert_zarr_mirror_is_new(asset, zarr_dspath)
             self.nursery.start_soon(
                 partial(
                     sync_zarr,
@@ -367,7 +373,22 @@ class Downloader:
                 zarr_dspath,
                 self.manager.with_sublogger(f"Zarr {asset.zarr}"),
             )
-            self.zarrs[asset.zarr] = zl
+
+    async def assert_zarr_mirror_is_new(
+        self, asset: RemoteZarrAsset, zarr_dspath: Path
+    ) -> None:
+        url = await self.ds.get_repo_config(
+            f"submodule.{asset.path}.url", file=".gitmodules"
+        )
+        if url is not None and PurePosixPath(url).name.removesuffix(".git") == (
+            asset.zarr
+        ):
+            raise MirrorMissingError(
+                f"Zarr {asset.zarr} is a submodule of Dandiset"
+                f" {self.dandiset_id} at {asset.path} (url: {url}) but not"
+                f" installed at {zarr_dspath}; clone it there rather than"
+                " having it created anew"
+            )
 
     async def get_annex_hash(self, filepath: Path) -> str:
         # OPT: do not bother checking or talking to annex --

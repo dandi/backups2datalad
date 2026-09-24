@@ -14,6 +14,7 @@ from aiobotocore.config import AioConfig
 from aiobotocore.session import get_session
 from botocore import UNSIGNED
 from dandi.consts import EmbargoStatus
+from ghrepo import GHRepo
 from pydantic import BaseModel
 from zarr_checksum.tree import ZarrChecksumTree
 
@@ -25,7 +26,14 @@ from .config import BackupConfig, ZarrMode
 from .consts import MAX_ZARR_SYNCS
 from .logging import PrefixedLogger
 from .manager import Manager
-from .util import UnexpectedChangeError, is_meta_file, key2hash, maxdatetime, quantify
+from .util import (
+    MirrorMissingError,
+    UnexpectedChangeError,
+    is_meta_file,
+    key2hash,
+    maxdatetime,
+    quantify,
+)
 
 if TYPE_CHECKING:
     from types_aiobotocore_s3.client import S3Client
@@ -519,6 +527,21 @@ async def sync_zarr(
                 f" Dandiset at {asset.path!r} but draft timestamp was not"
                 " updated on server"
             )
+
+        async def assert_mirror_is_new() -> None:
+            assert manager.config.zarrs is not None
+            if (
+                (zgh := manager.config.zarrs.github_org) is not None
+                and manager.gh is not None
+                and await manager.gh.repo_exists(repo := GHRepo(zgh, asset.zarr))
+            ):
+                raise MirrorMissingError(
+                    f"Zarr {asset.zarr} in Dandiset {asset.dandiset_id} is not"
+                    f" installed at {dsdir}, but GitHub repository {repo}"
+                    " exists already; clone it there rather than having it"
+                    " created anew"
+                )
+
         await ds.ensure_installed(
             desc=f"Zarr {asset.zarr}",
             commit_date=asset.created,
@@ -526,6 +549,7 @@ async def sync_zarr(
             backend="MD5E",
             cfg_proc=None,
             embargo_status=embargo_status,
+            before_create=assert_mirror_is_new,
         )
         if not (ds.pathobj / ".dandi" / ".gitattributes").exists():
             manager.log.debug("Excluding .dandi/ from git-annex")

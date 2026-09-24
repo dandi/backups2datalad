@@ -307,6 +307,10 @@ class UnexpectedChangeError(Exception):
     pass
 
 
+class MirrorMissingError(RuntimeError):
+    """A mirror to be created exists already but is not installed locally"""
+
+
 def check_git_annex_version() -> None:
     # Call this function at the start of subcommand functions rather than in
     # `main()` so that it doesn't run if a user does `backups2datalad
