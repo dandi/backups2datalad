@@ -37,6 +37,7 @@ from .manager import Manager
 from .procedures.cfg_dandiset import size_limit_bytes
 from .util import (
     AssetTracker,
+    MirrorMissingError,
     UnexpectedChangeError,
     format_errors,
     key2hash,
@@ -350,6 +351,8 @@ class Downloader:
             )
         else:
             zarr_dspath = self.config.zarr_root / asset.zarr
+            if not AsyncDataset(zarr_dspath).ds.is_installed():
+                await self.assert_zarr_mirror_is_new(asset, zarr_dspath)
             zl = ZarrLink(
                 zarr_dspath=zarr_dspath,
                 timestamp=None,
@@ -368,6 +371,27 @@ class Downloader:
                 self.manager.with_sublogger(f"Zarr {asset.zarr}"),
             )
             self.zarrs[asset.zarr] = zl
+
+    async def assert_zarr_mirror_is_new(
+        self, asset: RemoteZarrAsset, zarr_dspath: Path
+    ) -> None:
+        """
+        Raise `MirrorMissingError` if the Dandiset mirror already has this
+        Zarr as a submodule even though the Zarr mirror is not installed at
+        ``zarr_dspath``.  (`sync_zarr()` checks GitHub.)
+        """
+        url = await self.ds.get_repo_config(
+            f"submodule.{asset.path}.url", file=".gitmodules"
+        )
+        if url is not None and PurePosixPath(url).name.removesuffix(".git") == (
+            asset.zarr
+        ):
+            raise MirrorMissingError(
+                f"Zarr {asset.zarr} is a submodule of Dandiset"
+                f" {self.dandiset_id} at {asset.path} (url: {url}) but not"
+                f" installed at {zarr_dspath}; clone it there rather than"
+                " having it created anew"
+            )
 
     async def get_annex_hash(self, filepath: Path) -> str:
         # OPT: do not bother checking or talking to annex --

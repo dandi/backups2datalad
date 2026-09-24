@@ -159,6 +159,26 @@ class GitHub(AsyncResource):
         ), "Expected all keys to be strings"
         return cast(dict[str, Any], data)
 
+    async def repo_exists(self, repo: GHRepo) -> bool:
+        """
+        Whether ``repo`` exists (as far as our token can see).  A 404 is an
+        answer here, not an error, so it is neither retried nor logged as a
+        failure; anything else goes through `get_repo()` and its retries.
+        """
+        log.debug("Checking whether repository %s exists", repo)
+        await self.gate.wait()
+        try:
+            r = await self.client.get(repo.api_url, timeout=60)
+        except httpx.RequestError:
+            pass
+        else:
+            if r.status_code == 404:
+                return False
+            elif r.is_success:
+                return True
+        await self.get_repo(repo)
+        return True
+
     async def edit_repo(self, repo: GHRepo, **kwargs: Any) -> None:
         log.debug("Editing repository %s", repo)
         # Retry on 403's - very rarely we hit it (may be some race somewhere),

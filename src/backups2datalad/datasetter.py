@@ -35,6 +35,7 @@ from .manager import GitHub, Manager
 from .syncer import Syncer
 from .util import (
     AssetTracker,
+    MirrorMissingError,
     assets_eq,
     custom_commit_env,
     quantify,
@@ -174,8 +175,40 @@ class DandiDatasetter(AsyncResource):
             commit_date=create_time,
             backup_remote=self.config.dandisets.remote,
             embargo_status=embargo_status,
+            before_create=partial(self.assert_dandiset_mirror_is_new, ds, dandiset_id),
         )
         return ds
+
+    async def assert_dandiset_mirror_is_new(
+        self, ds: AsyncDataset, dandiset_id: str
+    ) -> None:
+        """
+        Raise `MirrorMissingError` if the mirror of ``dandiset_id``, which is
+        not installed at ``ds``, is known to exist elsewhere: registered in the
+        superdataset (e.g., an uninstalled submodule in a fresh clone, or a
+        directory removed by hand), or already on GitHub.  Only a Dandiset
+        mirrored for the first time may be created from scratch.
+        """
+        superds = AsyncDataset(self.config.dandiset_root)
+        if superds.ds.is_installed() and (
+            url := await superds.get_repo_config(
+                f"submodule.{dandiset_id}.url", file=".gitmodules"
+            )
+        ):
+            raise MirrorMissingError(
+                f"Dandiset {dandiset_id} is registered in the superdataset at"
+                f" {superds.path} (url: {url}) but not installed at {ds.path};"
+                " install it (e.g., `datalad get -n` it) rather than having"
+                " it created anew"
+            )
+        if self.config.gh_org is not None and (gh := self.manager.gh) is not None:
+            repo = GHRepo(self.config.gh_org, dandiset_id)
+            if await gh.repo_exists(repo):
+                raise MirrorMissingError(
+                    f"Dandiset {dandiset_id} is not installed at {ds.path}, but"
+                    f" GitHub repository {repo} exists already; clone it there"
+                    " rather than having it created anew"
+                )
 
     async def ensure_github_remote(self, ds: AsyncDataset, dandiset_id: str) -> None:
         if self.config.gh_org is not None:

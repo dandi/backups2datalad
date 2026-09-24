@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from contextlib import aclosing
 from dataclasses import InitVar, dataclass, field, replace
 from datetime import datetime
@@ -80,8 +87,11 @@ class AsyncDataset:
         backend: str = "SHA256E",
         cfg_proc: str | None = "dandiset",
         embargo_status: EmbargoStatus = EmbargoStatus.OPEN,
+        before_create: Callable[[], Awaitable[None]] | None = None,
     ) -> bool:
-        # Returns True if the dataset was freshly created
+        # Returns True if the dataset was freshly created.  `before_create` is
+        # awaited only when the dataset is about to be created, so it can veto
+        # that by raising (e.g., when the mirror exists elsewhere already).
         if self.ds.is_installed():
             if cfg_proc is not None:
                 # The dataset was created by an earlier run, possibly under an
@@ -89,6 +99,8 @@ class AsyncDataset:
                 # abide by the current one.
                 await self.ensure_dandiset_policy()
             return False
+        if before_create is not None:
+            await before_create()
         log.info("Creating dataset for %s", desc)
         argv = [
             "datalad",

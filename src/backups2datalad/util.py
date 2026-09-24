@@ -307,6 +307,16 @@ class UnexpectedChangeError(Exception):
     pass
 
 
+class MirrorMissingError(RuntimeError):
+    """
+    Raised instead of creating a mirror from scratch when it is known to exist
+    already -- registered in the superdataset or its Dandiset, or present on
+    GitHub -- but is not installed where we looked for it.  Creating it anyway
+    would start a second, unrelated history under the same name, which the
+    next push would then collide with (or, forced, overwrite).
+    """
+
+
 def check_git_annex_version() -> None:
     # Call this function at the start of subcommand functions rather than in
     # `main()` so that it doesn't run if a user does `backups2datalad
