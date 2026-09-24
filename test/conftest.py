@@ -34,7 +34,7 @@ from typing import Any
 import anyio
 from dandi.consts import dandiset_metadata_file
 from dandi.exceptions import NotFoundError
-from dandi.tests.fixtures import DandiAPI
+from dandi.tests.fixtures import LOCAL_DOCKER_DIR, DandiAPI
 from dandi.tests.fixtures import SampleDandiset as _UpstreamSampleDandiset
 from dandi.tests.fixtures import SampleDandisetFactory
 from dandi.upload import upload
@@ -51,6 +51,18 @@ import backups2datalad.config
 from backups2datalad.procedures.cfg_dandiset import policy_lines
 from backups2datalad.util import is_meta_file
 from backups2datalad.zarr import CHECKSUM_FILE
+
+# MinIO made quay.io/minio/minio require a login on 2026-09-24, so layer our
+# replacement image over upstream's compose file (see the override file).
+os.environ.setdefault(
+    "COMPOSE_FILE",
+    os.pathsep.join(
+        [
+            str(LOCAL_DOCKER_DIR / "docker-compose.yml"),
+            str(Path(__file__).with_name("minio-compose-override.yml")),
+        ]
+    ),
+)
 
 # The S3 endpoint/bucket are not exposed by upstream's `local_dandi_api` -- they
 # are part of the docker-compose stack's minio config, which is implementation
