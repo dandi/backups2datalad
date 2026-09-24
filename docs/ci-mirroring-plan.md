@@ -1,11 +1,14 @@
-# Plan: running the 15-minute mirror update in CI
+# Plan: running the mirror update in CI
 
 Status: **v2 -- draft for discussion** (2026-09-24).  v1 was reviewed inline
 by the maintainer; §10 lists what changed.  Line references are against
 `main` at `90aacaf`.
 
 Goal: move the `backups2datalad-update-cron` invocation (every 15 min on
-drogon) into CI -- GitHub Actions on `dandi/dandisets` first, later Forgejo
+drogon) into CI.  Nothing in the design depends on 15 minutes: that is only
+how often a run is *started* -- a run may take longer (overlaps are
+serialised, §5.1) -- and the schedule is the interim trigger until the DANDI
+archive notifies us of changes itself (§5.5).  Target: CI -- GitHub Actions on `dandi/dandisets` first, later Forgejo
 Actions on `forge.dandiarchive.org` (forgejo+aneksjo, likely on falkor, with
 workers on typhon/drogon).  Each run starts from a fresh checkout of the
 superdataset, installs **only** the Dandisets (and Zarrs) that need work,
@@ -95,7 +98,7 @@ reads only `.gitmodules` and already works on a bare checkout.
 
 Other tooling that assumes the full tree (`tools/git-annex-info`,
 `generate_whereis`, `du_dandisets`, `derivatives/`) is not part of the
-15-minute loop and can stay on drogon.
+scheduled update and can stay on drogon.
 
 ## 3. Per-Dandiset state in `.gitmodules`
 
@@ -308,7 +311,7 @@ next time and killed again.  Three layers, cheapest first:
    the matrix; it `workflow_dispatch`es a separate `sync-one.yml` run for
    it with `concurrency: {group: dandiset-<id>, cancel-in-progress: false}`,
    so it can run for as long as it takes (self-hosted jobs may run 5 days),
-   never twice at once, and never holds up the 15-minute runs.
+   never twice at once, and never holds up the scheduled runs.
 3. **Record asynchronously.**  `sync-one.yml` pushes the subdataset to GitHub
    and, as its last step, runs `record --from-remotes <id>` itself (retrying
    the superdataset push against concurrent `record`s).  If that step is
@@ -324,6 +327,12 @@ reconciles it.
 
 ### 5.5 Other differences from cron
 
+* **Trigger.**  `schedule: '*/15 * * * *'` until the archive can tell us
+  what changed: a webhook from the dandi-archive instance on Dandiset
+  modification/publication/unembargo → `repository_dispatch` (GitHub) or the
+  equivalent Forgejo webhook, carrying the Dandiset id(s), so a run starts
+  within seconds and `plan` confirms against the API.  The schedule then
+  stays as a slow safety net (e.g. hourly) for missed notifications.
 * `schedule` is best-effort: runs are routinely 5-30 min late and dropped
   under load.  dandi-compute avoids that by dispatching from a site cron
   (`launcher/dispatch_github_action_cron.sh`), and only when there is work;
