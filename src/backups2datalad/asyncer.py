@@ -351,13 +351,16 @@ class Downloader:
             )
         else:
             zarr_dspath = self.config.zarr_root / asset.zarr
-            if not AsyncDataset(zarr_dspath).ds.is_installed():
-                await self.assert_zarr_mirror_is_new(asset, zarr_dspath)
             zl = ZarrLink(
                 zarr_dspath=zarr_dspath,
                 timestamp=None,
                 asset_paths=[asset.path],
             )
+            # Claim the Zarr before awaiting anything, so that another asset
+            # of the same Zarr does not start a second sync of it
+            self.zarrs[asset.zarr] = zl
+            if not AsyncDataset(zarr_dspath).ds.is_installed():
+                await self.assert_zarr_mirror_is_new(asset, zarr_dspath)
             self.nursery.start_soon(
                 partial(
                     sync_zarr,
@@ -370,7 +373,6 @@ class Downloader:
                 zarr_dspath,
                 self.manager.with_sublogger(f"Zarr {asset.zarr}"),
             )
-            self.zarrs[asset.zarr] = zl
 
     async def assert_zarr_mirror_is_new(
         self, asset: RemoteZarrAsset, zarr_dspath: Path

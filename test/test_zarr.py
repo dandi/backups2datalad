@@ -519,6 +519,7 @@ async def test_sync_zarr_converges_github_state(
     )
     gh = MagicMock()
     gh.edit_repo = AsyncMock()
+    gh.repo_exists = AsyncMock(return_value=False)  # a brand-new Zarr
     gh.gate = make_gate(FakeClock())
     manager = Manager(config=config, gh=gh, log=plog, token="token")
     asset = MagicMock(spec=RemoteZarrAsset)
