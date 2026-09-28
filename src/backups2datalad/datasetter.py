@@ -195,7 +195,9 @@ class DandiDatasetter(AsyncResource):
                 " install it (e.g., `datalad get -n` it) rather than having"
                 " it created anew"
             )
-        if self.config.gh_org is not None and (gh := self.manager.gh) is not None:
+        if self.config.gh_org is not None:
+            gh = self.manager.gh
+            assert gh is not None
             repo = GHRepo(self.config.gh_org, dandiset_id)
             if await gh.repo_exists(repo):
                 raise MirrorMissingError(

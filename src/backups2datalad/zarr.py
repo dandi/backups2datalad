@@ -528,13 +528,13 @@ async def sync_zarr(
                 " updated on server"
             )
 
+        zgh = manager.config.zarrs.github_org
+
         async def assert_mirror_is_new() -> None:
-            assert manager.config.zarrs is not None
-            if (
-                (zgh := manager.config.zarrs.github_org) is not None
-                and manager.gh is not None
-                and await manager.gh.repo_exists(repo := GHRepo(zgh, asset.zarr))
-            ):
+            if zgh is None:
+                return
+            assert manager.gh is not None
+            if await manager.gh.repo_exists(repo := GHRepo(zgh, asset.zarr)):
                 raise MirrorMissingError(
                     f"Zarr {asset.zarr} in Dandiset {asset.dandiset_id} is not"
                     f" installed at {dsdir}, but GitHub repository {repo}"
