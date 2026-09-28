@@ -114,8 +114,13 @@ class Downloader:
     tracker: AssetTracker
     s3client: httpx.AsyncClient
     annex: AsyncAnnex
-    nursery: anyio.abc.TaskGroup
     error_on_change: bool = False
+    # Set after construction, once the task group it will run under exists --
+    # see `async_assets()`, which enters `async with dm:` *around* the task
+    # group so that `__aexit__` (which must force-close `addurl`) only runs
+    # once every task in the group -- including `addurl`'s own feeder/reader
+    # tasks -- has actually finished or been cancelled.
+    nursery: anyio.abc.TaskGroup | None = None
     addurl: TextProcess | None = None
     addurl_lock: anyio.Lock = field(init=False, default_factory=anyio.Lock)
     last_timestamp: datetime | None = None
@@ -172,6 +177,7 @@ class Downloader:
                     await self.addurl.force_aclose()
 
     async def asset_loop(self, aia: AsyncIterator[RemoteAsset | None]) -> None:
+        assert self.nursery is not None
         now = datetime.now(timezone.utc)
         downloading = True
         async with self.download_sender:
@@ -328,6 +334,7 @@ class Downloader:
     async def process_zarr(
         self, asset: RemoteZarrAsset, zarr_digest: str | None
     ) -> None:
+        assert self.nursery is not None
         if self.manager.config.zarr_mode is ZarrMode.ASSET_CHECKSUM:
             if not self.tracker.register_asset_by_timestamp(
                 asset, force=self.config.force
@@ -405,6 +412,7 @@ class Downloader:
             return await self.asha256(filepath)
 
     async def ensure_addurl(self) -> None:
+        assert self.nursery is not None
         async with self.addurl_lock:
             if self.addurl is None:
                 env = os.environ.copy()
@@ -454,6 +462,7 @@ class Downloader:
 
     async def read_addurl(self) -> None:
         assert self.addurl is not None
+        assert self.nursery is not None
         async for line in self.addurl:
             data = json.loads(line)
             if "byte-progress" in data:
@@ -514,6 +523,21 @@ class Downloader:
         return digester.hexdigest()
 
 
+async def run_downloader(
+    dm: Downloader, aia: AsyncIterator[RemoteAsset | None]
+) -> None:
+    # `dm` must wrap the task group, not sit inside it: its `__aexit__`
+    # force-closes `addurl`, and that has to happen after every task in the
+    # group (including addurl's own feeder/reader) has finished/been
+    # cancelled -- not right after merely *scheduling* `asset_loop` with
+    # `start_soon`. Pulled out into its own function (rather than inlined in
+    # `async_assets()`) so a test can exercise this exact nesting directly.
+    async with dm:
+        async with anyio.create_task_group() as nursery:
+            dm.nursery = nursery
+            nursery.start_soon(dm.asset_loop, aia)
+
+
 async def async_assets(
     dandiset: RemoteDandiset,
     ds: AsyncDataset,
@@ -534,7 +558,6 @@ async def async_assets(
                 async with (
                     AsyncAnnex(ds.pathobj) as annex,
                     httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as s3client,
-                    anyio.create_task_group() as nursery,
                 ):
                     dm = Downloader(
                         dandiset_id=dandiset.identifier,
@@ -545,11 +568,9 @@ async def async_assets(
                         tracker=tracker,
                         s3client=s3client,
                         annex=annex,
-                        nursery=nursery,
                         error_on_change=error_on_change,
                     )
-                    async with dm:
-                        nursery.start_soon(dm.asset_loop, aia)
+                    await run_downloader(dm, aia)
             finally:
                 tracker.dump()
 
