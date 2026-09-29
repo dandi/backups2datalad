@@ -28,6 +28,7 @@ from packaging.version import Version as PkgVersion
 from .adandi import AsyncDandiClient, RemoteDandiset, RemoteZarrAsset
 from .adataset import AssetsState, AsyncDataset
 from .aioutil import aruncmd, pool_amap
+from .asyncer import fetch_stable_assets
 from .config import BackupConfig, Mode
 from .consts import DEFAULT_BRANCH, GIT_OPTIONS
 from .logging import PrefixedLogger, log, quiet_filter
@@ -348,9 +349,19 @@ class DandiDatasetter(AsyncResource):
 
         await syncer.update_embargo_status()
         await update_dandiset_metadata(dandiset, ds, log=manager.log)
-        await syncer.sync_assets()
-        await syncer.prune_deleted()
-        await syncer.dump_asset_metadata()
+
+        # Validate the listing right before use, not before (dandi-archive#2943);
+        # skip only the steps below that depend on it if it went stale.
+        assets = await fetch_stable_assets(dandiset)
+        if assets is None:
+            manager.log.info(
+                "Dandiset changed while retrieving its asset listing; not"
+                " syncing assets this run, will retry on a later run"
+            )
+        else:
+            await syncer.sync_assets(assets)
+            await syncer.prune_deleted()
+            await syncer.dump_asset_metadata()
         manager.log.debug("Checking whether repository is dirty ...")
         if await ds.is_dirty():
             manager.log.info("Committing changes")

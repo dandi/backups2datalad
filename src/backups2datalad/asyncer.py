@@ -543,6 +543,7 @@ async def async_assets(
     ds: AsyncDataset,
     manager: Manager,
     tracker: AssetTracker,
+    assets: list[RemoteAsset],
     error_on_change: bool = False,
 ) -> Report:
     if datalad.support.external_versions.external_versions["cmd:annex"] < "10.20220724":
@@ -552,7 +553,7 @@ async def async_assets(
         )
     done_flag = anyio.Event()
     total_report = Report()
-    async with aclosing(aiterassets(dandiset, done_flag)) as aia:
+    async with aclosing(aiterassets(dandiset, assets, done_flag)) as aia:
         while not done_flag.is_set():
             try:
                 async with (
@@ -686,8 +687,43 @@ async def async_assets(
     return total_report
 
 
+async def fetch_stable_assets(dandiset: RemoteDandiset) -> list[RemoteAsset] | None:
+    """
+    Fetch the full asset listing, then return `None` if `dandiset.modified`
+    moved during the fetch (dandi-archive#2943: paginated listing has no
+    snapshot guarantee) -- caller should skip syncing this run, like a
+    quiescent-period miss.
+    """
+    last_ts: datetime | None = None
+    assets: list[RemoteAsset] = []
+    async for asset in dandiset.aget_assets():
+        assert last_ts is None or last_ts <= asset.created, (
+            f"Asset {asset.path} created at {asset.created} but"
+            f" returned after an asset created at {last_ts}!"
+        )
+        last_ts = asset.created
+        assets.append(asset)
+    if dandiset.version_id != "draft":
+        return assets  # published versions are immutable
+    # Re-fetch via the same endpoint that populated `dandiset.version`
+    # (not aget_version()'s different one) to avoid a spurious mismatch.
+    current = await dandiset.aclient.get_dandiset(dandiset.identifier)
+    if current.version.modified != dandiset.version.modified:
+        log.info(
+            "Dandiset %s: modified timestamp changed from %s to %s while"
+            " retrieving its asset listing (%s assets fetched); listing is"
+            " no longer valid",
+            dandiset.identifier,
+            dandiset.version.modified,
+            current.version.modified,
+            len(assets),
+        )
+        return None
+    return assets
+
+
 async def aiterassets(
-    dandiset: RemoteDandiset, done_flag: anyio.Event
+    dandiset: RemoteDandiset, assets: list[RemoteAsset], done_flag: anyio.Event
 ) -> AsyncGenerator[RemoteAsset | None, None]:
     last_ts: datetime | None = None
     if dandiset.version_id == "draft":
@@ -696,11 +732,7 @@ async def aiterassets(
         versions = deque(vs)
     else:
         versions = deque()
-    async for asset in dandiset.aget_assets():
-        assert last_ts is None or last_ts <= asset.created, (
-            f"Asset {asset.path} created at {asset.created} but"
-            f" returned after an asset created at {last_ts}!"
-        )
+    for asset in assets:
         if (
             versions
             and (last_ts is None or last_ts < versions[0].created)
