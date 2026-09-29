@@ -223,6 +223,7 @@ async def test_backup_zarr_delete_zarr(
     assert isinstance(asset, RemoteZarrAsset)
     await new_dandiset.client.delete(asset.api_path)
     new_dandiset.rmasset("sample.zarr")
+    await new_dandiset.settle()
 
     log.info("test_backup_zarr_delete_zarr: Syncing Zarr dandiset after deleting Zarr")
     await di.update_from_backup([dandiset_id])

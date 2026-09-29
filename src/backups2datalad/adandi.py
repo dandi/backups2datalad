@@ -172,7 +172,9 @@ class RemoteDandiset(SyncRemoteDandiset):
 
     async def aget_version(self, version_id: str) -> Version:
         return Version.model_validate(
-            self.aclient.get(f"/dandisets/{self.identifier}/versions/{version_id}/info")
+            await self.aclient.get(
+                f"/dandisets/{self.identifier}/versions/{version_id}/info"
+            )
         )
 
     async def aget_versions(
