@@ -7,8 +7,9 @@ from pathlib import Path
 import subprocess
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
+import anyio
 from dandi.consts import EmbargoStatus
 from ghrepo import GHRepo
 import httpx
@@ -16,11 +17,13 @@ import pytest
 
 from backups2datalad.adandi import AsyncDandiClient, RemoteZarrAsset
 from backups2datalad.adataset import AsyncDataset
-from backups2datalad.asyncer import Downloader
+from backups2datalad.aioutil import TextProcess
+from backups2datalad.annex import AsyncAnnex
+from backups2datalad.asyncer import Downloader, run_downloader
 from backups2datalad.config import BackupConfig, ResourceConfig
 from backups2datalad.datasetter import DandiDatasetter
 from backups2datalad.manager import GitHub, Manager
-from backups2datalad.util import MirrorMissingError
+from backups2datalad.util import AssetTracker, MirrorMissingError
 from backups2datalad.zarr import sync_zarr
 
 pytestmark = pytest.mark.anyio
@@ -179,6 +182,110 @@ async def test_zarr_already_on_github_is_not_recreated(tmp_path: Path) -> None:
         await sync_zarr(cast(RemoteZarrAsset, asset), None, dsdir, di.manager)
     assert gh.asked == [f"dandizarrs/{ZARR_ID}"]
     assert not dsdir.exists()
+
+
+# --- Downloader cleanup --------------------------------------------------------
+
+
+class FakeAddurl:
+    """Stand-in for a `TextProcess`, recording which close method ran."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def aclose(self) -> None:
+        self.calls.append("aclose")
+
+    async def force_aclose(self) -> None:
+        self.calls.append("force_aclose")
+
+
+def make_downloader() -> Downloader:
+    annex = SimpleNamespace(get_keys_missing_from=AsyncMock())
+    manager = SimpleNamespace(
+        config=SimpleNamespace(dandisets=SimpleNamespace(remote=None))
+    )
+    return Downloader(
+        dandiset_id="000001",
+        embargoed=False,
+        embargo_status=EmbargoStatus.OPEN,
+        ds=cast(AsyncDataset, MagicMock()),
+        manager=cast(Manager, manager),
+        tracker=cast(AssetTracker, MagicMock()),
+        s3client=cast(httpx.AsyncClient, MagicMock()),
+        annex=cast(AsyncAnnex, annex),
+    )
+
+
+@pytest.mark.ai_generated
+async def test_downloader_force_closes_addurl_after_task_group_fails() -> None:
+    """
+    Regression test for a leaked `git-annex addurl --batch` process. This
+    calls the actual `run_downloader()` helper `async_assets()` uses (not a
+    hand-copied nesting), so a regression back to the old ordering -- where
+    `async with dm:` closed around nothing but `nursery.start_soon(...)`, so
+    `__aexit__` ran immediately with `self.addurl` still `None` and a crash
+    left the real subprocess orphaned -- gets caught here too.
+    """
+    dm = make_downloader()
+    fake_addurl = FakeAddurl()
+
+    async def flaky_asset_loop(_aia: object) -> None:
+        dm.addurl = cast(TextProcess, fake_addurl)
+        raise RuntimeError("boom")
+
+    dm.asset_loop = flaky_asset_loop  # type: ignore[method-assign,assignment]
+    with pytest.raises(ExceptionGroup) as excinfo:
+        await run_downloader(dm, cast(Any, None))
+    assert isinstance(excinfo.value.exceptions[0], RuntimeError)
+    assert fake_addurl.calls == ["force_aclose"]
+
+
+@pytest.mark.ai_generated
+async def test_downloader_waits_for_sibling_task_before_force_closing_addurl() -> None:
+    """
+    `force_aclose()` must fire only once every task in the group --
+    including one still running when a sibling crashes -- has actually
+    finished, not merely been *told* to cancel. Models the real incident
+    shape: `feed_addurl`/`read_addurl` (started via `self.nursery`, same as
+    here) still in flight when another task raises.
+    """
+    dm = make_downloader()
+    fake_addurl = FakeAddurl()
+    long_task_done = False
+
+    async def flaky_asset_loop(_aia: object) -> None:
+        async def long_running() -> None:
+            nonlocal long_task_done
+            try:
+                await anyio.sleep_forever()
+            finally:
+                long_task_done = True
+
+        assert dm.nursery is not None
+        dm.addurl = cast(TextProcess, fake_addurl)
+        dm.nursery.start_soon(long_running)
+        raise RuntimeError("boom")
+
+    dm.asset_loop = flaky_asset_loop  # type: ignore[method-assign,assignment]
+    with pytest.raises(ExceptionGroup):
+        await run_downloader(dm, cast(Any, None))
+    assert long_task_done, "addurl was closed before the sibling task finished"
+    assert fake_addurl.calls == ["force_aclose"]
+
+
+@pytest.mark.ai_generated
+async def test_downloader_closes_addurl_gracefully_on_success() -> None:
+    """Sanity check: the no-exception branch still calls the plain `aclose`."""
+    dm = make_downloader()
+    fake_addurl = FakeAddurl()
+
+    async def quiet_asset_loop(_aia: object) -> None:
+        dm.addurl = cast(TextProcess, fake_addurl)
+
+    dm.asset_loop = quiet_asset_loop  # type: ignore[method-assign,assignment]
+    await run_downloader(dm, cast(Any, None))
+    assert fake_addurl.calls == ["aclose"]
 
 
 # --- GitHub.repo_exists() -----------------------------------------------------
