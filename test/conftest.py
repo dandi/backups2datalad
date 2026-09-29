@@ -368,6 +368,45 @@ class SampleDandiset(_UpstreamSampleDandiset):
         # asset we just uploaded before returning, so callers can run
         # `update-from-backup` deterministically.
         await self._wait_for_blob_digests()
+        await self.settle()
+
+    async def settle(self, timeout: float = 60.0, poll_interval: float = 1.0) -> None:
+        """
+        Wait until dandi-archive's background tasks are done with the draft.
+
+        After an asset change, the archive's celery beat jobs (every
+        ``DJANGO_DANDI_VALIDATION_JOB_INTERVAL`` = 5 s in the test compose
+        setup) validate the assets and the version and aggregate the assets
+        summary, each bumping the draft's ``modified``.  If that happens while
+        ``update-from-backup`` is fetching the asset listing,
+        ``fetch_stable_assets()`` rightly treats the listing as stale and skips
+        syncing assets, failing tests that expect them.  So wait until the
+        version is validated, no asset is still pending validation, and
+        ``modified`` has then held still for ``2 * poll_interval``.
+        """
+        deadline = anyio.current_time() + timeout
+        path = f"/dandisets/{self.dandiset_id}/versions/draft/info/"
+        last_modified: str | None = None
+        stable_since = anyio.current_time()
+        while True:
+            info = await self.dandiset.aclient.get(path)
+            now = anyio.current_time()
+            if info["modified"] != last_modified:
+                last_modified = info["modified"]
+                stable_since = now
+            settled = info["status"] in ("Valid", "Invalid") and not any(
+                e.get("message") == "asset is currently being validated, please wait."
+                for e in info.get("asset_validation_errors", [])
+            )
+            if settled and now - stable_since >= 2 * poll_interval:
+                return
+            if now >= deadline:
+                raise TimeoutError(
+                    f"Dandiset {self.dandiset_id} draft did not settle within"
+                    f" {timeout}s: status={info['status']!r},"
+                    f" modified={info['modified']!r}"
+                )
+            await anyio.sleep(poll_interval)
 
     async def _wait_for_blob_digests(
         self, timeout: float = 60.0, poll_interval: float = 1.0
