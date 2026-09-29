@@ -689,11 +689,21 @@ async def async_assets(
 
 async def fetch_stable_assets(dandiset: RemoteDandiset) -> list[RemoteAsset] | None:
     """
-    Fetch the full asset listing, then return `None` if `dandiset.modified`
-    moved during the fetch (dandi-archive#2943: paginated listing has no
-    snapshot guarantee) -- caller should skip syncing this run, like a
-    quiescent-period miss.
+    Fetch the full asset listing, then return `None` if the Dandiset's
+    ``modified`` timestamp moved during the fetch (dandi-archive#2943:
+    paginated listing has no snapshot guarantee) -- caller should skip syncing
+    this run, like a quiescent-period miss.
+
+    The timestamp is fetched afresh immediately before and after the listing,
+    both times via the same endpoint, rather than compared against
+    ``dandiset.version``: that was captured when the run started (possibly
+    much earlier, and possibly via the ``/dandisets/`` list endpoint), so a
+    change made before the listing began -- which cannot invalidate it --
+    would otherwise be taken for one made during it.
     """
+    draft = dandiset.version_id == "draft"
+    # Published versions are immutable; no need to re-check them.
+    before = await _draft_modified(dandiset) if draft else None
     last_ts: datetime | None = None
     assets: list[RemoteAsset] = []
     async for asset in dandiset.aget_assets():
@@ -703,23 +713,26 @@ async def fetch_stable_assets(dandiset: RemoteDandiset) -> list[RemoteAsset] | N
         )
         last_ts = asset.created
         assets.append(asset)
-    if dandiset.version_id != "draft":
-        return assets  # published versions are immutable
-    # Re-fetch via the same endpoint that populated `dandiset.version`
-    # (not aget_version()'s different one) to avoid a spurious mismatch.
-    current = await dandiset.aclient.get_dandiset(dandiset.identifier)
-    if current.version.modified != dandiset.version.modified:
-        log.info(
-            "Dandiset %s: modified timestamp changed from %s to %s while"
-            " retrieving its asset listing (%s assets fetched); listing is"
-            " no longer valid",
-            dandiset.identifier,
-            dandiset.version.modified,
-            current.version.modified,
-            len(assets),
-        )
-        return None
+    if draft:
+        after = await _draft_modified(dandiset)
+        if after != before:
+            log.info(
+                "Dandiset %s: modified timestamp changed from %s to %s while"
+                " retrieving its asset listing (%s assets fetched); listing is"
+                " no longer valid",
+                dandiset.identifier,
+                before,
+                after,
+                len(assets),
+            )
+            return None
     return assets
+
+
+async def _draft_modified(dandiset: RemoteDandiset) -> datetime:
+    current = await dandiset.aclient.get_dandiset(dandiset.identifier)
+    modified: datetime = current.version.modified
+    return modified
 
 
 async def aiterassets(

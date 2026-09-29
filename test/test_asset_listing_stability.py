@@ -30,21 +30,31 @@ def make_asset(path: str, created: datetime) -> RemoteAsset:
 
 
 def make_dandiset(
-    assets: list[RemoteAsset], initial_modified: datetime, refetched_modified: datetime
+    assets: list[RemoteAsset],
+    before: datetime,
+    after: datetime,
+    initial_modified: datetime | None = None,
 ) -> RemoteDandiset:
+    """``before``/``after`` are what successive ``get_dandiset()`` calls see;
+    ``initial_modified`` is ``dandiset.version.modified`` as of the run's start
+    (defaults to ``before``)."""
+    fetched = iter([before, after])
+
     async def aget_assets() -> object:
         for a in assets:
             yield a
 
     async def get_dandiset(_identifier: str) -> SimpleNamespace:
-        return SimpleNamespace(version=SimpleNamespace(modified=refetched_modified))
+        return SimpleNamespace(version=SimpleNamespace(modified=next(fetched)))
 
     return cast(
         RemoteDandiset,
         SimpleNamespace(
             identifier="000001",
             version_id="draft",
-            version=SimpleNamespace(modified=initial_modified),
+            version=SimpleNamespace(
+                modified=before if initial_modified is None else initial_modified
+            ),
             aget_assets=aget_assets,
             aclient=SimpleNamespace(get_dandiset=get_dandiset),
         ),
@@ -68,6 +78,16 @@ async def test_fetch_stable_assets_returns_none_when_dandiset_changed_mid_fetch(
     assets = [make_asset("a", T0)]
     dandiset = make_dandiset(assets, T0, T0 + timedelta(seconds=5))
     assert await fetch_stable_assets(dandiset) is None
+
+
+@pytest.mark.ai_generated
+async def test_fetch_stable_assets_ignores_change_before_listing_began() -> None:
+    """A change between the run's start and the listing does not invalidate
+    the listing: only the timestamps bracketing the fetch are compared."""
+    assets = [make_asset("a", T0)]
+    later = T0 + timedelta(seconds=3)
+    dandiset = make_dandiset(assets, later, later, initial_modified=T0)
+    assert await fetch_stable_assets(dandiset) == assets
 
 
 @pytest.mark.ai_generated
