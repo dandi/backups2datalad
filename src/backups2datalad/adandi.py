@@ -191,7 +191,11 @@ class RemoteDandiset(SyncRemoteDandiset):
         async with aclosing(
             self.aclient.paginate(
                 f"{self.version_api_path}assets/",
-                params={"order": "created", "metadata": "1", "page_size": "1000"},
+                # `created` alone is not unique, and ties at a page boundary
+                # can come back in a different order on each page, repeating
+                # one asset and skipping another (dandi-archive#2943); `path`
+                # is unique within a version and so makes the order total.
+                params={"order": "created,path", "metadata": "1", "page_size": "1000"},
                 timeout=60,
             )
         ) as ait:
