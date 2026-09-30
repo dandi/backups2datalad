@@ -449,9 +449,9 @@ class Downloader:
                         # Lock dataset while there are any downloads in
                         # progress in order to prevent conflicts with `git rm`.
                         await self.ds.lock.acquire()
-                    # A path must not be in flight twice (see
-                    # `dedup_assets()`): the first result would pop the
-                    # entry and the second would then hit a `KeyError`.
+                    # A path must not be in flight twice: the first result
+                    # would pop the entry and the second would then hit a
+                    # bare `KeyError` in `pop_in_progress()`.
                     if td.blob.path in self.in_progress:
                         raise RuntimeError(
                             f"Dandiset {self.dandiset_id}: {td.blob.path} sent"
@@ -735,57 +735,7 @@ async def fetch_stable_assets(dandiset: RemoteDandiset) -> list[RemoteAsset] | N
                 len(assets),
             )
             return None
-    return dedup_assets(dandiset, assets)
-
-
-def dedup_assets(
-    dandiset: RemoteDandiset, assets: list[RemoteAsset]
-) -> list[RemoteAsset] | None:
-    """
-    Guard the rest of the sync against a listing with a path in it twice,
-    which `Downloader` cannot handle (it tracks downloads by path, and would
-    send the path to ``addurl`` twice).
-
-    - The same asset twice means the pagination itself was inconsistent (an
-      asset shifted across a page boundary), so some other asset may be
-      missing: return `None`, i.e., skip like a listing that went stale.
-
-    - Two distinct assets at one path is a duplicate on the server itself
-      (dandi-archive checks for an existing path outside of the transaction
-      that adds the asset, so concurrent uploads of one path can both
-      succeed).  Only one can be mirrored; keep the newest, as the one a
-      client would have meant to replace the other with, and log an error so
-      that the duplicate gets fixed on the server.
-    """
-    by_id: set[str] = set()
-    by_path: dict[str, RemoteAsset] = {}
-    for asset in assets:
-        if asset.identifier in by_id:
-            log.warning(
-                "Dandiset %s: asset %s (%s) returned twice in asset listing;"
-                " listing is inconsistent, will retry on a later run",
-                dandiset.identifier,
-                asset.identifier,
-                asset.path,
-            )
-            return None
-        by_id.add(asset.identifier)
-        if (prev := by_path.get(asset.path)) is not None:
-            log.error(
-                "Dandiset %s: server has multiple assets at path %s: %s"
-                " (created %s) and %s (created %s); backing up only the latter",
-                dandiset.identifier,
-                asset.path,
-                prev.identifier,
-                prev.created,
-                asset.identifier,
-                asset.created,
-            )
-        # Listing is in `created` order, so the last one seen is the newest
-        by_path[asset.path] = asset
-    if len(by_path) == len(assets):
-        return assets
-    return [a for a in assets if by_path[a.path] is a]
+    return assets
 
 
 async def _draft_modified(dandiset: RemoteDandiset) -> datetime:

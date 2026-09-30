@@ -74,30 +74,6 @@ def make_dandiset(
 
 
 @pytest.mark.ai_generated
-async def test_fetch_stable_assets_keeps_newest_of_assets_sharing_a_path(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    # Two distinct assets at one path, as left behind on the server by
-    # concurrent uploads of the same file; only one can be mirrored.
-    old = make_asset("code/submit.sh", T0, identifier="old")
-    other = make_asset("b", T0 + timedelta(seconds=1))
-    new = make_asset("code/submit.sh", T0 + timedelta(seconds=2), identifier="new")
-    dandiset = make_dandiset([old, other, new], T0, T0)
-    assert await fetch_stable_assets(dandiset) == [other, new]
-    assert "multiple assets at path code/submit.sh" in caplog.text
-
-
-@pytest.mark.ai_generated
-async def test_fetch_stable_assets_returns_none_when_asset_listed_twice() -> None:
-    # The same asset on two pages: pagination was inconsistent, so something
-    # else may be missing from the listing.
-    a = make_asset("a", T0)
-    b = make_asset("b", T0 + timedelta(seconds=1))
-    dandiset = make_dandiset([a, b, b], T0, T0)
-    assert await fetch_stable_assets(dandiset) is None
-
-
-@pytest.mark.ai_generated
 async def test_fetch_stable_assets_returns_all_assets_when_unchanged() -> None:
     assets = [make_asset("a", T0), make_asset("b", T0 + timedelta(seconds=1))]
     dandiset = make_dandiset(assets, T0, T0)
