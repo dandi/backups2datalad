@@ -25,17 +25,8 @@ pytestmark = pytest.mark.anyio
 T0 = datetime(2026, 9, 23, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def make_asset(
-    path: str, created: datetime, identifier: str | None = None
-) -> RemoteAsset:
-    return cast(
-        RemoteAsset,
-        SimpleNamespace(
-            path=path,
-            created=created,
-            identifier=f"id-{path}" if identifier is None else identifier,
-        ),
-    )
+def make_asset(path: str, created: datetime) -> RemoteAsset:
+    return cast(RemoteAsset, SimpleNamespace(path=path, created=created))
 
 
 def make_dandiset(
