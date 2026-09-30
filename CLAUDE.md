@@ -225,7 +225,8 @@ since `Downloader` tracks downloads by path and crashes (`KeyError` in
 twice means inconsistent pagination: the listing is discarded, as when it goes
 stale.  Two *distinct* assets at one path are a duplicate on the server itself
 (dandi-archive checks for an existing path outside the transaction that adds
-the asset, so concurrent uploads of one path can both succeed; seen on 001873):
+the asset, so concurrent uploads of one path can both succeed -- possible by
+reading the code, not yet observed):
 the newest is kept and the other is logged at ERROR, as there is nothing we can
 do about it but have it removed on the server.
 
