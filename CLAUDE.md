@@ -217,6 +217,18 @@ past, before the local dataset is even created; the next run picks it up.
   up within seconds of each other.  Tests exercising the gate itself
   (`test/test_quiescence.py`) pass `quiescent_period` explicitly.
 
+### Duplicate paths in the listing
+
+`fetch_stable_assets()` also passes the listing through `dedup_assets()`,
+since `Downloader` tracks downloads by path and crashes (`KeyError` in
+`pop_in_progress()`) when a path is fed to `addurl` twice.  The same asset
+twice means inconsistent pagination: the listing is discarded, as when it goes
+stale.  Two *distinct* assets at one path are a duplicate on the server itself
+(dandi-archive checks for an existing path outside the transaction that adds
+the asset, so concurrent uploads of one path can both succeed; seen on 001873):
+the newest is kept and the other is logged at ERROR, as there is nothing we can
+do about it but have it removed on the server.
+
 ## Dirty Mirrors
 
 A mirror left uncommitted by an interrupted run used to be able to hide
