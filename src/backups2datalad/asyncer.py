@@ -449,6 +449,15 @@ class Downloader:
                         # Lock dataset while there are any downloads in
                         # progress in order to prevent conflicts with `git rm`.
                         await self.ds.lock.acquire()
+                    # A path must not be in flight twice: the first result
+                    # would pop the entry and the second would then hit a
+                    # bare `KeyError` in `pop_in_progress()`.
+                    if td.blob.path in self.in_progress:
+                        raise RuntimeError(
+                            f"Dandiset {self.dandiset_id}: {td.blob.path} sent"
+                            " for download while a download of it is already"
+                            " in progress"
+                        )
                     self.in_progress[td.blob.path] = td
                     td.blob.log.info("Downloading from %s", td.url)
                     await self.addurl.send(f"{td.url} {td.blob.path}\n")

@@ -19,7 +19,8 @@ from backups2datalad.adandi import AsyncDandiClient, RemoteZarrAsset
 from backups2datalad.adataset import AsyncDataset
 from backups2datalad.aioutil import TextProcess
 from backups2datalad.annex import AsyncAnnex
-from backups2datalad.asyncer import Downloader, run_downloader
+from backups2datalad.asyncer import Downloader, ToDownload, run_downloader
+from backups2datalad.blob import BlobBackup
 from backups2datalad.config import BackupConfig, ResourceConfig
 from backups2datalad.datasetter import DandiDatasetter
 from backups2datalad.manager import GitHub, Manager
@@ -287,6 +288,50 @@ async def test_downloader_closes_addurl_gracefully_on_success() -> None:
     await run_downloader(dm, cast(Any, None))
     assert fake_addurl.calls == ["aclose"]
 
+
+class FakeStdin:
+    async def __aenter__(self) -> FakeStdin:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        pass
+
+
+@pytest.mark.ai_generated
+async def test_feed_addurl_refuses_path_already_in_flight() -> None:
+    """
+    Feeding a path to `addurl` while a download of it is still in progress
+    must fail right there, naming the path -- not later as a bare `KeyError`
+    in `pop_in_progress()` once the second result for the path arrives
+    (the 001873 crash, caused by the path being listed twice).
+    """
+    dm = make_downloader()
+    dm.ds.lock = anyio.Lock()  # type: ignore[assignment]
+    sent: list[str] = []
+
+    async def send(line: str) -> None:
+        sent.append(line)
+
+    dm.addurl = cast(
+        TextProcess, SimpleNamespace(p=SimpleNamespace(stdin=FakeStdin()), send=send)
+    )
+    path = "code/submit.sh"
+    blob = SimpleNamespace(path=path, log=MagicMock())
+    td = ToDownload(blob=cast(BlobBackup, blob), url="https://example.com/x")
+
+    async def feed_twice() -> None:
+        async with dm.download_sender:
+            await dm.download_sender.send(td)
+            await dm.download_sender.send(td)
+
+    with pytest.raises(ExceptionGroup) as excinfo:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(dm.feed_addurl)
+            tg.start_soon(feed_twice)
+    (exc,) = excinfo.value.exceptions
+    assert isinstance(exc, RuntimeError)
+    assert f"{path} sent for download while a download of it is already" in str(exc)
+    assert sent == [f"https://example.com/x {path}\n"]
 
 # --- GitHub.repo_exists() -----------------------------------------------------
 
