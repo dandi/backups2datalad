@@ -13,7 +13,6 @@ from .consts import (
     DEFAULT_GIT_ANNEX_JOBS,
     DEFAULT_QUIESCENT_PERIOD,
     DEFAULT_WORKERS,
-    HASH_LIMIT,
     ZARR_LIMIT,
 )
 
@@ -128,10 +127,6 @@ class BackupConfig(BaseModel):
     @cached_property
     def zarr_limit(self) -> anyio.CapacityLimiter:
         return anyio.CapacityLimiter(ZARR_LIMIT)
-
-    @cached_property
-    def hash_limit(self) -> anyio.CapacityLimiter:
-        return anyio.CapacityLimiter(HASH_LIMIT)
 
     def match_asset(self, asset_path: str) -> bool:
         return self.asset_filter is None or bool(self.asset_filter.search(asset_path))

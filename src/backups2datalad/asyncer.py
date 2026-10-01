@@ -31,7 +31,7 @@ from .aioutil import TextProcess, aruncmd, open_git_annex
 from .annex import AsyncAnnex
 from .blob import BlobBackup
 from .config import BackupConfig, ZarrMode
-from .consts import BLOB_LIMIT, GIT_OPTIONS, USER_AGENT
+from .consts import GIT_OPTIONS, USER_AGENT
 from .logging import PrefixedLogger, log
 from .manager import Manager
 from .procedures.cfg_dandiset import size_limit_bytes
@@ -123,17 +123,6 @@ class Downloader:
     nursery: anyio.abc.TaskGroup | None = None
     addurl: TextProcess | None = None
     addurl_lock: anyio.Lock = field(init=False, default_factory=anyio.Lock)
-    # Acquired by `asset_loop()` before starting each `process_blob()` task
-    # and released when that task ends, so that the listing -- fetched upfront
-    # by `fetch_stable_assets()` -- is not turned into one task per asset at
-    # once (#130).  A slot is held only until `process_blob()` has handed its
-    # download to `feed_addurl()`: `read_addurl()`/`feed_addurl()` must never
-    # wait for a slot, as slot holders may be waiting on `ds.lock`, which only
-    # they release.  Per `Downloader` rather than process-wide, as a task
-    # cancelled before it first runs never releases its slot.
-    blob_limit: anyio.Semaphore = field(
-        init=False, default_factory=lambda: anyio.Semaphore(BLOB_LIMIT)
-    )
     last_timestamp: datetime | None = None
     report: Report = field(init=False, default_factory=Report)
     in_progress: dict[str, ToDownload] = field(init=False, default_factory=dict)
@@ -235,7 +224,6 @@ class Downloader:
                                     f"Asset {asset.path}"
                                 ),
                             )
-                            await self.blob_limit.acquire()
                             self.nursery.start_soon(
                                 self.process_blob,
                                 blob,
@@ -262,17 +250,6 @@ class Downloader:
                             self.report.old_unhashed += 1
 
     async def process_blob(
-        self,
-        blob: BlobBackup,
-        sender: MemoryObjectSendStream[ToDownload],
-    ) -> None:
-        # The caller has acquired `blob_limit` for us
-        try:
-            await self._process_blob(blob, sender)
-        finally:
-            self.blob_limit.release()
-
-    async def _process_blob(
         self,
         blob: BlobBackup,
         sender: MemoryObjectSendStream[ToDownload],
@@ -543,17 +520,17 @@ class Downloader:
 
     async def asha256(self, path: Path) -> str:
         self.log.debug("Starting to compute sha256 digest of %s", path)
-        tp = anyio.Path(path)
-        digester = hashlib.sha256()
-        # Bounds the files held open at once, across all Dandisets (#130)
-        async with self.config.hash_limit, await tp.open("rb") as fp:
-            while True:
-                blob = await fp.read(65535)
-                if blob == b"":
-                    break
-                digester.update(blob)
+        # Open, read and close within one worker thread call, so that a file
+        # is open only while a thread is hashing it: opening it in one call and
+        # reading it in others left it open while queued for a thread (#130).
+        digest = await anyio.to_thread.run_sync(sha256_file, path)
         self.log.debug("Finished computing sha256 digest of %s", path)
-        return digester.hexdigest()
+        return digest
+
+
+def sha256_file(path: Path) -> str:
+    with open(path, "rb") as fp:
+        return hashlib.file_digest(fp, "sha256").hexdigest()
 
 
 async def run_downloader(
