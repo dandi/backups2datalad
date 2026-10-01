@@ -270,6 +270,30 @@ Two notes for anyone extending this:
   and, unlike ordinary deletions (which `get_deleted()` handles by popping the
   metadata first), it means the two records disagree.
 
+## Bounded Asset Concurrency
+
+`fetch_stable_assets()` hands `async_assets()` the complete asset listing
+upfront, so nothing paces `Downloader.asset_loop()` anymore -- formerly the
+round trip per page of 1000 assets did.  Left unbounded, a Dandiset with tens
+of thousands of changed assets got one `process_blob()` task per asset at
+once, and hashing the unannexed text files among them concurrently ran out of
+file descriptors (#130, 001697).  Two limits now apply:
+
+- `Downloader.blob_limit` (`BLOB_LIMIT`, per Dandiset): `asset_loop()`
+  acquires it before starting each `process_blob()` task, which releases it
+  when done.  A slot is held only until the task has handed its download to
+  `feed_addurl()`; `feed_addurl()`/`read_addurl()` must never wait for one,
+  as slot holders may be waiting on `ds.lock`, which only those two release.
+  It is per `Downloader` because a task cancelled before it first runs never
+  releases its slot -- harmless once that `Downloader` is gone, but a shared
+  semaphore would shrink for the rest of the run.
+- `BackupConfig.hash_limit` (`HASH_LIMIT`, process-wide `CapacityLimiter`,
+  like `zarr_limit`): taken via `async with` in `asha256()` for as long as the
+  file is open, so it bounds the files held open for hashing across all
+  concurrent Dandisets and covers `check_unannexed_hash()` too.  This is the
+  limit that guards file descriptors; `blob_limit` only bounds tasks in
+  flight.  (Subprocess pipes and HTTP sockets remain bounded only indirectly.)
+
 ## Testing
 
 The project uses pytest for testing, with fixtures for:

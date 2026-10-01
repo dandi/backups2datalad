@@ -23,6 +23,14 @@ MINIMUM_GIT_ANNEX_VERSION = "10.20240430"
 # Maximum number of Zarrs to process at once
 ZARR_LIMIT = 10
 
+# Maximum number of blob assets of a single Dandiset to process at once
+BLOB_LIMIT = 100
+
+# Maximum number of files to hash at once, across all Dandisets being backed
+# up.  Each is held open while being hashed, so this must stay well below the
+# open-files limit (commonly 1024).
+HASH_LIMIT = 100
+
 USER_AGENT = "backups2datalad ({}) httpx/{} {}/{}".format(
     __url__,
     httpx.__version__,
