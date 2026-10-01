@@ -520,16 +520,17 @@ class Downloader:
 
     async def asha256(self, path: Path) -> str:
         self.log.debug("Starting to compute sha256 digest of %s", path)
-        tp = anyio.Path(path)
-        digester = hashlib.sha256()
-        async with await tp.open("rb") as fp:
-            while True:
-                blob = await fp.read(65535)
-                if blob == b"":
-                    break
-                digester.update(blob)
+        # Open, read and close within one worker thread call, so that a file
+        # is open only while a thread is hashing it: opening it in one call and
+        # reading it in others left it open while queued for a thread (#130).
+        digest = await anyio.to_thread.run_sync(sha256_file, path)
         self.log.debug("Finished computing sha256 digest of %s", path)
-        return digester.hexdigest()
+        return digest
+
+
+def sha256_file(path: Path) -> str:
+    with open(path, "rb") as fp:
+        return hashlib.file_digest(fp, "sha256").hexdigest()
 
 
 async def run_downloader(
