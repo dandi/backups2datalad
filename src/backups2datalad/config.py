@@ -42,6 +42,16 @@ class ZarrMode(StrEnum):
     ASSET_CHECKSUM = "asset_checksum"
 
 
+class ZarrDirty(StrEnum):
+    """What to do about a Zarr mirror found dirty on the way in."""
+
+    #: Fail the Zarr, as this program has always done.
+    ERROR = "error"
+    #: Warn, `git reset --hard` + `git clean -dfx`, and carry on -- but still
+    #: fail if that left the mirror dirty.
+    RESET_CLEAN = "reset+clean"
+
+
 class BackupConfig(BaseModel):
     # Give everything a default so we can construct an "empty" config when no
     # config file is given
@@ -64,6 +74,7 @@ class BackupConfig(BaseModel):
     gc_assets: bool = False
     mode: Mode = Mode.TIMESTAMP
     zarr_mode: ZarrMode = ZarrMode.TIMESTAMP
+    zarr_dirty: ZarrDirty = ZarrDirty.ERROR
     force_push: set[str] = Field(default_factory=set)  # "dandisets", "zarrs", "all"
     # `default_factory` rather than `default` so that the constant is
     # looked up at instantiation time, which lets the test suite disable

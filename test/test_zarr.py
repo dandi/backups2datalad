@@ -21,7 +21,7 @@ from test_util import GitRepo, zarr_format_of
 from backups2datalad.adandi import RemoteZarrAsset
 from backups2datalad.adataset import AsyncDataset, DatasetStats
 from backups2datalad.aioutil import GitHubRateLimited, arequest
-from backups2datalad.config import BackupConfig, ResourceConfig
+from backups2datalad.config import BackupConfig, Mode, ResourceConfig, ZarrDirty
 from backups2datalad.datasetter import DandiDatasetter
 from backups2datalad.logging import log as plog
 from backups2datalad.manager import Manager
@@ -610,3 +610,92 @@ async def test_set_zarr_description_uses_given_dataset(tmp_path: Path) -> None:
     ), "must not leak into the global git config"
     with pytest.raises(RuntimeError, match="no dataset at"):
         await manager.set_zarr_description("missing", stats)
+
+
+@pytest.mark.ai_generated
+async def test_zarr_dirty_reset_clean(
+    tmp_path: Path, monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    `--zarr-dirty=reset+clean` discards a dirty Zarr's uncommitted state and
+    carries on, but still fails when that did not make the Zarr clean -- which
+    `git clean` cannot do for an untracked nested git repository, since the
+    `-ff` that would remove it is deliberately not used.
+    """
+    zarr_root = tmp_path / "zarrs"
+    config = BackupConfig(
+        backup_root=tmp_path,
+        zarrs=ResourceConfig(path="zarrs"),
+        dandisets=ResourceConfig(path="dandisets"),
+    )
+    manager = Manager(config=config, gh=None, log=plog, token="token")
+    asset = MagicMock(spec=RemoteZarrAsset)
+    asset.zarr = "zarr1"
+    asset.dandiset_id = "000001"
+    asset.path = "sample.zarr"
+    asset.created = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    dsdir = zarr_root / "zarr1"
+
+    monkeypatch.setattr("backups2datalad.zarr.ZarrSyncer.run", AsyncMock())
+
+    async def visit(error_on_change: bool = False) -> None:
+        link = ZarrLink(zarr_dspath=dsdir, timestamp=None, asset_paths=["sample.zarr"])
+        await sync_zarr(
+            asset, None, dsdir, manager, link=link, error_on_change=error_on_change
+        )
+
+    await visit()
+    ds = AsyncDataset(dsdir)
+
+    # Default is unchanged: a dirty Zarr is refused.
+    (ds.pathobj / "stray.txt").write_text("x\n")
+    with pytest.raises(RuntimeError, match=r"(?s)is dirty.*stray\.txt"):
+        await visit()
+    assert (ds.pathobj / "stray.txt").exists()
+
+    # reset+clean discards it and carries on, announcing itself on one line
+    # under a token a run of 20k Zarrs can be audited by.
+    config.zarr_dirty = ZarrDirty.RESET_CLEAN
+    with caplog.at_level(logging.WARNING, logger="backups2datalad"):
+        await visit()
+    warnings = [
+        r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].startswith("ZARR-RESET: ")
+    assert "1 path" in warnings[0]
+    assert "\n" not in warnings[0]
+    assert not (ds.pathobj / "stray.txt").exists()
+    assert not await ds.is_dirty()
+
+    # Tracked modifications are discarded too, and `.git/annex` survives.
+    annex_marker = ds.pathobj / ".git" / "annex" / "keep-me"
+    annex_marker.parent.mkdir(parents=True, exist_ok=True)
+    annex_marker.write_text("object\n")
+    (ds.pathobj / ".dandi" / ".gitattributes").write_text("tampered\n")
+    await visit()
+    assert not await ds.is_dirty()
+    assert annex_marker.read_text() == "object\n"
+    assert (ds.pathobj / ".dandi" / ".gitattributes").read_text() != "tampered\n"
+
+    # An untracked nested git repo survives `clean -dfx`, so the Zarr still
+    # fails -- loudly, naming what is left, rather than passing silently.
+    orphan = ds.pathobj / "orphan.zarr"
+    orphan.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(orphan)], check=True)
+    (orphan / "payload").write_text("irreplaceable\n")
+    with pytest.raises(RuntimeError, match=r"(?s)still dirty after.*orphan\.zarr"):
+        await visit()
+    assert (orphan / "payload").read_text() == "irreplaceable\n"
+    rmtree(orphan)
+
+    # `--mode verify` is a diagnostic; it must not discard what it was asked to
+    # report.  The gate is the mode itself, not the `error_on_change` that
+    # verify only passes down once it also finds the timestamp unchanged --
+    # otherwise verifying a Dandiset that *had* changed would still discard.
+    (ds.pathobj / "stray.txt").write_text("x\n")
+    config.mode = Mode.VERIFY
+    for eoc in (False, True):
+        with pytest.raises(RuntimeError, match=r"(?s)is dirty.*stray\.txt"):
+            await visit(error_on_change=eoc)
+        assert (ds.pathobj / "stray.txt").exists()
