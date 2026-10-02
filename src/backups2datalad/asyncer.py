@@ -367,7 +367,9 @@ class Downloader:
             # of the same Zarr does not start a second sync of it
             self.zarrs[asset.zarr] = zl
             if not AsyncDataset(zarr_dspath).ds.is_installed():
-                await self.assert_zarr_mirror_is_new(asset, zarr_dspath)
+                # Bounded: all uninstalled Zarrs get here at once (#133)
+                async with self.config.zarr_limit:
+                    await self.assert_zarr_mirror_is_new(asset, zarr_dspath)
             self.nursery.start_soon(
                 partial(
                     sync_zarr,

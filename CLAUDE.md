@@ -270,6 +270,23 @@ Two notes for anyone extending this:
   and, unlike ordinary deletions (which `get_deleted()` handles by popping the
   metadata first), it means the two records disagree.
 
+## Per-Asset Fan-Out
+
+`Downloader.asset_loop()` is handed the whole asset listing at once
+(`fetch_stable_assets()`) and starts a task per asset straight away -- some
+36k for 001412.  Whatever such a task holds before it reaches something bounded
+(the worker-thread pool, a lock, `zarr_limit`, httpx's connection pool) is held
+that many times over, and file descriptors run out (`EMFILE`):
+
+- #130: `asha256()` kept a file open while queued for a worker thread; it now
+  opens, hashes and closes it within one thread call.
+- #133: each uninstalled Zarr runs a `git config` to look itself up in
+  `.gitmodules` (`Downloader.assert_zarr_mirror_is_new()`); `process_zarr()`
+  now does so under `zarr_limit`.
+
+Per-asset work that needs a subprocess or an open file has to happen behind
+such a bound.
+
 ## Testing
 
 The project uses pytest for testing, with fixtures for:

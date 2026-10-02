@@ -17,11 +17,12 @@ import pytest
 
 from backups2datalad.adandi import AsyncDandiClient, RemoteZarrAsset
 from backups2datalad.adataset import AsyncDataset
-from backups2datalad.aioutil import TextProcess
+from backups2datalad.aioutil import TextProcess, areadcmd
 from backups2datalad.annex import AsyncAnnex
 from backups2datalad.asyncer import Downloader, ToDownload, run_downloader
 from backups2datalad.blob import BlobBackup
 from backups2datalad.config import BackupConfig, ResourceConfig
+from backups2datalad.consts import ZARR_LIMIT
 from backups2datalad.datasetter import DandiDatasetter
 from backups2datalad.manager import GitHub, Manager
 from backups2datalad.util import AssetTracker, MirrorMissingError
@@ -183,6 +184,60 @@ async def test_zarr_already_on_github_is_not_recreated(tmp_path: Path) -> None:
         await sync_zarr(cast(RemoteZarrAsset, asset), None, dsdir, di.manager)
     assert gh.asked == [f"dandizarrs/{ZARR_ID}"]
     assert not dsdir.exists()
+
+
+@pytest.mark.ai_generated
+async def test_uninstalled_zarrs_are_checked_within_zarr_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Regression test for #133: `asset_loop()` starts a task for every asset at
+    once, and each uninstalled Zarr runs a `git config` to look itself up in
+    ``.gitmodules``; unbounded, a Dandiset with thousands of new Zarrs ran out
+    of file descriptors.  No more of those may run at once than `ZARR_LIMIT`.
+    """
+    dandiset = tmp_path / "001412"
+    dandiset.mkdir()
+    git(dandiset, "init", "-q", "-b", "draft")
+    running = peak = 0
+
+    async def counting_areadcmd(*args: str | Path, **kwargs: Any) -> str:
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        try:
+            return await areadcmd(*args, **kwargs)
+        finally:
+            running -= 1
+
+    synced: list[str] = []
+
+    async def fake_sync_zarr(asset: RemoteZarrAsset, *_args: Any, **_kw: Any) -> None:
+        synced.append(asset.zarr)
+
+    monkeypatch.setattr("backups2datalad.adataset.areadcmd", counting_areadcmd)
+    monkeypatch.setattr("backups2datalad.asyncer.sync_zarr", fake_sync_zarr)
+    config = BackupConfig(backup_root=tmp_path, zarrs=ResourceConfig(path="dandizarrs"))
+    dm = Downloader(
+        dandiset_id="001412",
+        embargoed=False,
+        embargo_status=EmbargoStatus.OPEN,
+        ds=AsyncDataset(dandiset),
+        manager=Manager(config=config, gh=None, log=MagicMock(), token="dummy"),
+        tracker=cast(AssetTracker, MagicMock()),
+        s3client=cast(httpx.AsyncClient, MagicMock()),
+        annex=cast(AsyncAnnex, MagicMock()),
+    )
+    zarr_ids = [f"zarr-{i}" for i in range(3 * ZARR_LIMIT)]
+    async with anyio.create_task_group() as tg:
+        dm.nursery = tg
+        for i, zarr_id in enumerate(zarr_ids):
+            asset = SimpleNamespace(
+                path=f"sub-{i}/z{i}.ome.zarr", zarr=zarr_id, created=CREATED
+            )
+            tg.start_soon(dm.process_zarr, cast(RemoteZarrAsset, asset), None)
+    assert 0 < peak <= ZARR_LIMIT
+    assert sorted(synced) == sorted(zarr_ids)
 
 
 # --- Downloader cleanup --------------------------------------------------------
