@@ -21,7 +21,6 @@ from dandi.consts import DANDISET_ID_REGEX, EmbargoStatus, dandiset_metadata_fil
 from dandi.exceptions import NotFoundError
 from datalad.api import clone
 from ghrepo import GHRepo
-from humanize import naturalsize
 from linesep import split_terminated
 from packaging.version import Version as PkgVersion
 
@@ -39,6 +38,7 @@ from .util import (
     MirrorMissingError,
     assets_eq,
     custom_commit_env,
+    describe_superdataset,
     quantify,
     quiescence_wait,
     update_dandiset_metadata,
@@ -427,19 +427,50 @@ class DandiDatasetter(AsyncResource):
             )
             return
         repo = await superds.get_ghrepo()
-        qty = 0
+        # List the archive afresh rather than reuse whatever the current run
+        # iterated over, which `--exclude` or explicit IDs may have narrowed.
+        # (Failed requests are retried by `arequest()`; one that still fails
+        # fails the run rather than leave the description out of date.)
+        on_archive: set[str] = set()
+        async with aclosing(self.dandi_client.get_dandisets()) as diter:
+            async for d in diter:
+                on_archive.add(d.identifier)
+        mirrored = 0
         size = 0
         for s in await superds.get_subdatasets():
-            qty += 1
+            did = s["gitmodule_path"]
+            if did not in on_archive:
+                # Deleted from the archive (its backup was made private), or
+                # not a Dandiset at all (such a path is never an identifier
+                # on the archive, so no `DANDISET_ID_REGEX` check is needed)
+                continue
+            mirrored += 1
             ds = AsyncDataset(s["path"])
-            if (stats := await ds.get_stored_stats()) is not None:
-                size += stats.size
-        total_size = naturalsize(size)
-        desc = (
-            f"{quantify(qty, 'Dandiset')}, {total_size} total."
-            "  DataLad super-dataset of all Dandisets from https://github.com/dandisets"
+            if not ds.ds.is_installed():
+                raise RuntimeError(
+                    f"Mirror of Dandiset {did} at {ds.path} is not installed"
+                )
+            # Uses the cached stats if they are for HEAD, else recounts (and
+            # caches) them, rather than leave the mirror out of the total
+            size += (await ds.get_stats(config=self.config)).size
+        archive = await self.dandi_client.get_archive_stats()
+        if archive.dandiset_count != len(on_archive):
+            # The stats are recomputed only periodically, and the listing shows
+            # only those embargoed Dandisets the token may see
+            log.debug(
+                "Archive stats count %d Dandisets, but %d are listed",
+                archive.dandiset_count,
+                len(on_archive),
+            )
+        await self.manager.edit_github_repo(
+            repo,
+            description=describe_superdataset(
+                mirrored=mirrored,
+                on_archive=len(on_archive),
+                size=size,
+                archive_size=archive.size,
+            ),
         )
-        await self.manager.edit_github_repo(repo, description=desc)
 
     async def tag_releases(
         self,

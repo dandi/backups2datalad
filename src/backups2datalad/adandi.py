@@ -26,6 +26,14 @@ from .consts import USER_AGENT
 from .logging import log
 
 
+class ArchiveStats(BaseModel):
+    #: All Dandisets on the archive, including embargoed and empty ones
+    dandiset_count: int
+    #: Bytes in all distinct blobs & Zarrs belonging to any version of any
+    #: Dandiset
+    size: int
+
+
 @dataclass
 class AsyncDandiClient(AsyncResource):
     session: httpx.AsyncClient
@@ -110,6 +118,13 @@ class AsyncDandiClient(AsyncResource):
         ) as ait:
             async for data in ait:
                 yield RemoteDandiset.from_data(self, data)
+
+    async def get_archive_stats(self) -> ArchiveStats:
+        """
+        Fetch the archive-wide totals that the web UI's front page shows
+        (``/stats/``), which the server recomputes periodically
+        """
+        return ArchiveStats.model_validate(await self.get("/stats/"))
 
     async def get_dandisets_by_ids(
         self, dandiset_ids: Sequence[str]

@@ -19,6 +19,7 @@ from dandi.dandiset import Dandiset
 from dandi.utils import yaml_dump, yaml_load
 from datalad.api import Dataset
 from datalad.support.json_py import dump
+from humanize import naturalsize
 
 from .config import BackupConfig
 from .consts import MINIMUM_GIT_ANNEX_VERSION
@@ -228,6 +229,26 @@ def quiescence_wait(
     if now is None:
         now = datetime.now(timezone.utc)
     return period - (now - modified).total_seconds()
+
+
+def describe_superdataset(
+    mirrored: int, on_archive: int, size: int, archive_size: int
+) -> str:
+    """
+    The GitHub description of the superdataset: how many of the Dandisets on
+    the archive are mirrored, and how much data those mirrors hold next to the
+    archive's own total.
+
+    The two sizes are not computed alike: a mirror counts the files in its
+    draft (each Dandiset separately), while the archive counts every distinct
+    blob and Zarr in any version.  They agree only roughly even when every
+    mirror is current; a large gap means something is not being mirrored.
+    """
+    return (
+        f"{mirrored} of {quantify(on_archive, 'Dandiset')} mirrored"
+        f" ({naturalsize(size)} of the archive's {naturalsize(archive_size)})."
+        "  DataLad super-dataset of all Dandisets from https://github.com/dandisets"
+    )
 
 
 def quantify(qty: int, singular: str, plural: str | None = None) -> str:
