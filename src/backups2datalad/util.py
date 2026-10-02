@@ -245,11 +245,11 @@ def describe_superdataset(
     mirror is current; a large gap means something is not being mirrored.
     """
     if archive_size is None:
-        sizes = f"{naturalsize(size)} total"
+        sizes = naturalsize(size)
     else:
-        sizes = f"{naturalsize(size)} of {naturalsize(archive_size)}"
+        sizes = f"{naturalsize(size)} of the archive's {naturalsize(archive_size)}"
     return (
-        f"{mirrored} of {quantify(on_archive, 'Dandiset')} mirrored, {sizes}."
+        f"{mirrored} of {quantify(on_archive, 'Dandiset')} mirrored ({sizes})."
         "  DataLad super-dataset of all Dandisets from https://github.com/dandisets"
     )
 

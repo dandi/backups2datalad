@@ -291,7 +291,7 @@ such a bound.
 
 `DandiDatasetter.set_superds_description()` sets the GitHub description of
 the superdataset (`dandi/dandisets`) to e.g. "1191 of 1191 Dandisets
-mirrored, 1.1 PB of 2.4 PB." (`util.describe_superdataset()`):
+mirrored (1.1 PB of the archive's 2.4 PB)." (`util.describe_superdataset()`):
 
 - The Dandiset count compares the mirrors (submodules) against a fresh listing
   of the archive, so Dandisets deleted from the archive -- whose submodules
@@ -299,6 +299,10 @@ mirrored, 1.1 PB of 2.4 PB." (`util.describe_superdataset()`):
 - The mirrored size sums each mirror's cached `dandi.stats`;
   `get_mirror_stats()` recounts a mirror whose cache is out of date rather
   than counting it as 0, which used to make it silently drop out of the total.
+  Normally only mirrors the run did not visit need it (`update_dandiset()`
+  refreshes the cache), but a recount recurses into Zarr stats and can be slow.
+- Failing to list the archive skips the update with a warning rather than
+  failing the run; failing to fetch `/api/stats/` drops the archive size.
 - The archive size comes from `/api/stats/`, the number dandiarchive.org shows.
   It counts every distinct blob/Zarr of every version (embargoed included),
   while a mirror counts its draft's files, so the two only roughly agree; a

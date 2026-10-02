@@ -24,7 +24,6 @@ from ghrepo import GHRepo
 import httpx
 from linesep import split_terminated
 from packaging.version import Version as PkgVersion
-from pydantic import ValidationError
 
 from .adandi import AsyncDandiClient, RemoteDandiset, RemoteZarrAsset
 from .adataset import AssetsState, AsyncDataset, DatasetStats
@@ -432,28 +431,49 @@ class DandiDatasetter(AsyncResource):
         # List the archive afresh rather than reuse whatever the current run
         # iterated over, which `--exclude` or explicit IDs may have narrowed.
         on_archive: set[str] = set()
-        async with aclosing(self.dandi_client.get_dandisets()) as diter:
-            async for d in diter:
-                on_archive.add(d.identifier)
+        try:
+            async with aclosing(self.dandi_client.get_dandisets()) as diter:
+                async for d in diter:
+                    on_archive.add(d.identifier)
+        except (httpx.HTTPError, ValueError) as e:
+            # A cosmetic step; do not fail an otherwise successful run
+            log.warning(
+                "Could not list Dandisets on the archive (%s); not updating"
+                " superdataset description",
+                e,
+            )
+            return
         mirrored = 0
         size = 0
         for s in await superds.get_subdatasets():
             did = s["gitmodule_path"]
             if did not in on_archive:
                 # Deleted from the archive (its backup was made private), or
-                # not a Dandiset at all
+                # not a Dandiset at all (such a path is never an identifier
+                # on the archive, so no `DANDISET_ID_REGEX` check is needed)
                 continue
             mirrored += 1
             stats = await self.get_mirror_stats(AsyncDataset(s["path"]))
             if stats is not None:
                 size += stats.size
+        archive_size: int | None
         try:
-            archive_size: int | None = (
-                await self.dandi_client.get_archive_stats()
-            ).size
-        except (httpx.HTTPError, ValidationError) as e:
+            archive = await self.dandi_client.get_archive_stats()
+        except (httpx.HTTPError, ValueError) as e:
+            # `ValueError` covers both a non-JSON body and a pydantic
+            # `ValidationError`
             log.warning("Could not fetch archive stats: %s", e)
             archive_size = None
+        else:
+            archive_size = archive.size
+            if archive.dandiset_count != len(on_archive):
+                # The stats are recomputed only periodically, and the listing
+                # shows only those embargoed Dandisets the token may see
+                log.debug(
+                    "Archive stats count %d Dandisets, but %d are listed",
+                    archive.dandiset_count,
+                    len(on_archive),
+                )
         await self.manager.edit_github_repo(
             repo,
             description=describe_superdataset(
@@ -472,14 +492,16 @@ class DandiDatasetter(AsyncResource):
         """
         if (stats := await ds.get_stored_stats()) is not None:
             return stats
-        if not ds.pathobj.exists():
-            log.warning("%s: mirror not present; not counting its size", ds.path)
+        if not ds.ds.is_installed():
+            log.warning("%s: mirror not installed; not counting its size", ds.path)
             return None
         log.warning("%s: no up-to-date stats cached; recounting", ds.path)
         try:
             return await ds.get_stats(config=self.config)
-        except Exception as e:
-            log.warning("%s: could not count up files: %s", ds.path, e)
+        except Exception:
+            # Best-effort; most likely `zarr_root` is unset for a Dandiset
+            # with Zarrs, which fails an `assert` with no message
+            log.warning("%s: could not count up files", ds.path, exc_info=True)
             return None
 
     async def tag_releases(
