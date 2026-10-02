@@ -8,6 +8,24 @@ Companion to `docs/github-zarr-rate-limits-plan.md`, which owns everything that
 needs a GitHub API call to decide.  This document owns local repository state
 only.
 
+Revised against `main` after the dirty-mirror work of late September.  That
+work changed the premises in three ways worth reading before the rest:
+
+* **Dirt no longer conceals itself.**  `update_dandiset()` gates on
+  `get_backup_state()`, the *older* of the working-tree and `HEAD` states
+  (`adataset.py:1073-1084`), so an uncommitted state bump can no longer make a
+  mirror look current.  Before that it could, and did: 000571 sat dirty and
+  unmentioned from 2026-09-10.  The failure mode this plan addresses is
+  therefore now *loud*, which removes the urgency but not the cost.
+* **The maintainer has recorded a deliberate decision** (CLAUDE.md, "Dirty
+  Mirrors") that no dirtiness check runs on the skip path, with measured
+  costs: `git status` ~70 ms warm on a 50k-file mirror, `git diff --cached`
+  ~8 ms, `get_backup_state()` ~2 ms, over ~1400 mirrors.  Any detector this
+  plan adds must respect that budget, and §4.8 is written to it.
+* **Scale is larger than first assumed.**  ~1400 Dandisets, and 001412 alone
+  has 23,614 Zarr assets.  A full `git status` per Zarr is not affordable; the
+  two-tier sweep of §4.8 exists for that reason.
+
 ---
 
 ## 0. Verdict
@@ -264,7 +282,25 @@ manufactured by a two-line ordering bug.
 6. **Evidence is nearly free; keep it.**
 7. **Measure before enabling destruction.**
 
-### 4.2 Classification
+### 4.2 Remediation: a ladder, then a pile
+
+The structure is **attempt → re-verify → escalate to a pile an operator works
+through**, not a taxonomy that must be complete before anything ships.  This is
+simpler than classifying every case up front and reaches the same place, because
+the re-verification *is* the classifier: a remedy that leaves the dataset clean
+was the right remedy, and one that does not escalates regardless of what we
+thought the dirt was.
+
+Two constraints on the attempt, both from §2:
+
+* **The first rung must not be `git clean -dfx`.**  The temptation is to try
+  the cheap generic thing first and only classify what survives it.  The
+  measurement inverts that trade: the two dominant dirt shapes are *precisely*
+  the ones that survive it, so nearly every incident ends up in the pile
+  anyway — and the destruction has already happened, before anything was
+  learned from it.  A generic first rung buys nothing and spends the evidence.
+* **Rungs are ordered cheapest-and-narrowest first**, each followed by
+  `is_dirty()`, stopping at the first clean result.
 
 Input: `git status --porcelain=v2 -z --untracked-files=normal
 --ignore-submodules=none` (v2 exposes submodule sub-state directly).
@@ -294,10 +330,19 @@ Then, per porcelain entry:
 For the reported 001769 failure the entire remedy is one command:
 `git restore --source=HEAD --staged --worktree -- .dandi/assets.json dandiset.yaml`.
 
-**Always re-verify.**  `is_dirty()` is re-run after the plan; residual dirt is
-an immediate hard failure (`outcome: residual-dirt`), not a consumed strike.
-That single rule is what would have caught §2.2 in the field rather than in a
-document.
+**Always re-verify.**  `is_dirty()` is re-run after each rung; residual dirt
+after the last one is an immediate hard failure (`outcome: residual-dirt`), not
+a consumed strike.  That single rule is what would have caught §2.2 in the
+field rather than in a document.
+
+**The pile.**  Everything that refuses or survives the ladder goes onto a
+queue an operator works through, not merely into a raised exception: a journal
+record with `outcome: refused` plus the dataset's name in the
+`HEAL SUMMARY:` line, enumerable afterwards by `--tripped-only` (§4.8).  This
+is the part of the original proposal that most deserves keeping — "a pile to
+report to the admin for manual inspection" is a better framing than "error
+out", because the run continues and the operator gets a worklist instead of
+whichever dataset happened to fail first.
 
 ### 4.3 Hook points
 
@@ -305,18 +350,84 @@ Three, and one deliberate non-hook:
 
 | Where | Change |
 | ----- | ------ |
-| `datasetter.py:293-297` | `ensure_healthy(..., kind="dandiset")` |
-| `zarr.py:571-575` | `ensure_healthy(..., kind="zarr")` |
+| `datasetter.py:327-331` | `ensure_healthy(..., kind="dandiset")` |
+| `zarr.py:595-599` | `ensure_healthy(..., kind="zarr")` |
 | end of `sync_dataset()` / `sync_zarr()` | record a `clean` event iff the dataset is clean and on `DEFAULT_BRANCH` |
-| **`adataset.py:478-482`** | **unchanged — never heal here** |
+| **`adataset.py:489`** | **unchanged — never heal here** |
 
 The last is the assertion "our own commit did not capture what we staged".
 That is a bug in *this* tool operating on freshly produced work; resetting it
 would delete exactly what we were trying to save.
 
 No generic sweep over `dandiset_root` — see §3.11.  The heal must also run
-before `AssetTracker.from_dataset()` (`datasetter.py:303`), which the current
-guard position already satisfies.
+before `AssetTracker.from_dataset()`, which the current guard position already
+satisfies.
+
+### 4.3a Cross-process locking
+
+This is a prerequisite, not an extension.  A healer that resets a repository
+another process is mid-way through writing is the worst failure this design can
+produce, and nothing today prevents it.
+
+**What exists is not a dataset lock.**  `AsyncDataset.lock` is an
+`anyio.Semaphore(1)` built by a `default_factory` **per instance**
+(`adataset.py:65-67`), so two `AsyncDataset` objects over the same directory
+hold two unrelated semaphores.  It guards `remove()` / `remove_batch()`
+(`:618`, `:641`) against each other within one object, and nothing else.  There
+is no cross-process locking anywhere: `grep -rn "flock\|fcntl\|LOCK_EX" src
+test` is empty.  The only lock-aware code is `_retry_on_git_lock()`
+(`adataset.py:546-590`), which retries on git's own `index.lock` and shells out
+to `fuser -v` for diagnostics — code that exists because this contention has
+been *observed in production*.
+
+**Who can collide:** `populate` / `populate-zarrs` (`__main__.py:399-527`)
+operate on the same directories as `update-from-backup`, and a maintainer
+running a command by hand is inside no `flock` at all.
+
+**Use `flock(2)`, not a PID file.**  The proposal's "verify by PID, clean up if
+the process was killed" is the classic trap: PIDs recycle, so a stale file
+whose PID has been reused by an unrelated process reads as *live* and blocks
+forever, while the race between checking liveness and removing the file is
+unfixable in userspace.  `flock` has no such failure mode — **the kernel
+releases the lock when the holder dies, including under SIGKILL**, so there is
+no staleness to detect and no cleanup to write.  This is also the one place
+where the absence of a SIGTERM handler (R4) costs nothing.
+
+```
+<dataset>/.git/dandi/lock        # open(O_CREAT), fcntl.flock(LOCK_EX|LOCK_NB)
+                                 # in anyio.to_thread.run_sync
+```
+
+Write the holder's pid, host, command and start time *into* the file as
+diagnostics — so `HEAL REFUSED:` can say who holds it, the way
+`_retry_on_git_lock()` uses `fuser -v` — but never let correctness depend on
+reading them back.
+
+Details that matter:
+
+* **`.git/` is the right location** (the established namespace, and `git clean`
+  never descends there).  `.git/dandi/lock` rather than the proposed
+  `.git/backups2datalad.lock`, for consistency with `debug_logfile()`
+  (`datasetter.py:735-745`).  For an *installed* submodule `.git` is a gitfile
+  and the real directory is `<parent>/.git/modules/<path>/`, which
+  `uninstall_subdatasets()`'s `reckless="kill"` removes — so a Zarr's lock must
+  only ever be taken on the standalone `zarr_root/<id>`, never on an installed
+  checkout.
+* **Non-blocking, always.**  Acquire `LOCK_NB` and refuse on contention rather
+  than waiting: a blocking acquire across ~1400 mirrors invites a pile-up that
+  is harder to diagnose than a skip.
+* **Lock ordering.**  A Dandiset sync holds its own lock and then takes Zarr
+  locks beneath it (`sync_zarr()` under `zarr_limit`).  Parent-before-child,
+  always, and never a child-then-parent acquisition, or two runs over
+  overlapping Dandisets can deadlock.  With `LOCK_NB` a cycle degrades to a
+  refusal rather than a hang, which is the main reason to insist on it.
+* **NFS.**  `flock` over NFS is only reliable on reasonably current kernels
+  with a local-mount fallback; confirm the backup root is local storage
+  (open question §9.8), and prefer `fcntl.lockf` if it is not.
+* **Scope creep to resist.**  The lock's purpose is to make healing safe.  It
+  should *not* become a general "one writer per dataset" guarantee in this
+  change — that is a larger invariant with its own failure modes, and
+  `_retry_on_git_lock()` keeps covering what it covers today.
 
 ### 4.4 Persistence
 
@@ -421,10 +532,54 @@ half-finished datasets, which is the thing being fixed.
 **Cadence caveat, and a detection bias worth knowing:** thresholds are in
 incidents, so alarm latency scales with cron cadence.  And `sync_dataset()` —
 hence `is_dirty()` — only runs when the server timestamp advanced or the mode
-is force/verify (`datasetter.py:229-250`), so **a Dandiset that is dirty *and*
-unchanged upstream is invisible to the detector entirely**.  The reporting
-command must therefore walk the mirror tree directly, as `populate` does
-(`__main__.py:439-451`), not piggyback on the sync path.
+is force/verify, so **a mirror that is dirty *and* unchanged upstream is
+invisible to the sync path entirely**.  CLAUDE.md's "Dirty Mirrors" section says
+this outright, and deliberately: nothing makes such a mirror look stale.  The
+sweep of §4.8 is the answer, and it is why the sweep must walk the tree rather
+than piggyback on the sync.
+
+### 4.8 The dirtiness sweep — ship this first
+
+Today there is no way to ask which mirrors are dirty, and for Zarrs no way at
+all; the only fleet-wide answer is `tools/find-INVISIBLE-changed.sh`, **a shell
+script that lives on drogon and is not in this repository** (CLAUDE.md,
+"Dirty Mirrors").  An unversioned production script encoding fleet policy is a
+liability on its own, and bringing it in as a subcommand is the cheapest useful
+thing in this whole plan: it is read-only, it needs none of the healing
+machinery, and it is what turns every threshold here from a guess into a
+measurement.
+
+Everything it needs already exists:
+
+* **Enumeration** — `zarr_root.iterdir()`, a flat directory keyed by asset id,
+  skipping `.git` / `.datalad`, exactly as `populate_zarrs` does
+  (`__main__.py:505-512`), with `afilter_installed()` (`__main__.py:659`)
+  available.  `dandiset_root` likewise.
+* **The cheap predicate** — `has_changes(cached=True)` (`adataset.py:298`), i.e.
+  `git diff --quiet --cached`, ~8 ms, which is the same test the drogon script
+  makes with `git diff-index --cached --quiet HEAD` at ~12 s for all mirrors.
+* **The committed-state primitives** — `get_committed_assets_state()`
+  (`adataset.py:1054`) and `get_backup_state()` (`:1073`).
+
+**Two tiers, because the scale forbids one.**  001412 alone has 23,614 Zarr
+assets; a full `git status` at ~70 ms each is ~28 minutes for that one
+Dandiset's Zarrs, before the rest of the fleet.  So:
+
+1. **Tier 1, always** — `git diff --quiet --cached` per dataset. Catches
+   everything an interrupted run leaves, because this tool stages everything it
+   writes (`git annex add`, `git rm`, `git add`). Affordable over both roots.
+2. **Tier 2, only on tier-1 hits or when asked** — the full
+   `--porcelain=v2 --ignore-submodules=none` status, which is what finds
+   untracked junk, orphaned clones and dirty submodules. `--deep` forces it
+   everywhere for an occasional audit.
+
+```
+backups2datalad status [--zarrs] [--deep] [--json] [--dirty-only]
+```
+
+For Zarrs this is also the precondition for the auto-cleanup the proposal asks
+for: you cannot safely clean what you cannot enumerate and classify, and tier 1
+makes the candidate set small enough that tier 2's cost stops mattering.
 
 ### 4.7 Config, CLI, logging
 
@@ -494,18 +649,28 @@ framework is cheap: they keep their code and gain a journal record.
 ## 6. Upstream fixes that reduce the need for this
 
 The healer treats a symptom.  These are small, mechanical, testable without
-docker, and **R1+R2 together eliminate the dirt in the reported error**:
+docker, and **R1+R2 together eliminate the dirt in the reported error**.
 
-| # | Fix | Where |
-| - | --- | ----- |
-| **R1** | Move `tracker.dump()` out of the `finally:`, or shield a restore of `.dandi/assets.json` on the cancellation path | `asyncer.py:532-535` |
-| **R2** | `atomic_write_*()` helper (tmp in same dir + `os.replace`); replace `json_py.dump` in `AssetTracker.dump()` | `util.py:124-126` + 8 sites |
-| **R3** | Make `update_dandiset_metadata()` self-contained: write → add → commit as one unit | `util.py:191-213` |
-| **R4** | SIGTERM/SIGINT handler converting the signal into a cancellation so shielded cleanup runs at all | `__main__.py` |
-| **R5** | Wrap `mkrelease()`'s branch work in `try`/`finally` so HEAD always returns to `draft` (§2.5) | `datasetter.py:525-570` |
-| **R6** | `ensure_dandiset_policy()` commits when `.gitattributes` differs from **HEAD**, not from the desired content — today an interrupted policy commit returns early at `adataset.py:158` and the dirt is **permanent and unhealable** | `adataset.py:142-169` |
-| **R7** | Make the post-`create` steps of `ensure_installed()` idempotent | `adataset.py:113-138` |
-| **R8** | `has_unpushed_commits()` uses `rev-parse --abbrev-ref`, which returns `"HEAD"` when detached, so it warns and returns `False` — a detached Zarr is **never pushed**.  Use `symbolic-ref` | `adataset.py:902-918` |
+Re-checked against `main`: **all eight are still live.**  Line numbers below are
+current.
+
+| # | Fix | Where | Status |
+| - | --- | ----- | ------ |
+| **R1** | Move `tracker.dump()` out of the `finally:`, or shield a restore of `.dandi/assets.json` on the cancellation path | `asyncer.py:587-590` | Live, unchanged: `tracker.dump()` is still inside `finally:` and `ds.add()` still outside it |
+| **R2** | `atomic_write_*()` helper (tmp in same dir + `os.replace`); replace `json_py.dump`, which unlinks before rewriting | `util.py:125-127`, import at `util.py:21`, + 8 sites | Live, unchanged |
+| **R3** | Make `update_dandiset_metadata()` self-contained: write → add → commit as one unit | `util.py:212-214` | Live, but narrower than it was: a new semantic-comparison short-circuit (`util.py:202-209`) returns early when the metadata is unchanged, so the staged-`dandiset.yaml` window is now only entered when it genuinely differs |
+| **R4** | SIGTERM/SIGINT handler converting the signal into a cancellation so shielded cleanup runs at all | `__main__.py` | Live.  No handler anywhere; the only SIGTERM reference is `aioutil.py:72`, which *sends* one to a child |
+| **R5** | Wrap `mkrelease()`'s branch work in `try`/`finally` so HEAD always returns to `draft` (§2.5) | `checkout -b` at `datasetter.py:606` and `:626`; return to `draft` only at `:645-646` | Live, unchanged — still no `try`/`finally` spanning them |
+| **R6** | `ensure_dandiset_policy()` must commit when `.gitattributes` differs from **HEAD**, not from the desired content | `adataset.py:166-180`; the early return is `:168-169` | Live, unchanged.  An interrupted policy commit is still **permanent, unhealable dirt**: `apply_policy()` returns `False` next run, so the staged file is never committed |
+| **R7** | Make the post-`create` steps of `ensure_installed()` idempotent | `adataset.py:94-100` guards on `is_installed()`; `initremote` at `:129` | Live, unchanged — a create that died before `initremote` is skipped forever after |
+| **R8** | `has_unpushed_commits()` uses `rev-parse --abbrev-ref`, which returns `"HEAD"` when detached, so it warns and returns `False` — a detached Zarr is **never pushed**.  Use `symbolic-ref` | `adataset.py:919` | Live, unchanged |
+
+What *did* change is the reason R1–R3 matter.  The dirt they produce used to
+conceal itself; it is now reported (CLAUDE.md, "Dirty Mirrors").  So these are
+no longer about a silent failure — they are about not manufacturing the dirt
+whose cleanup this whole plan is otherwise about.  R6 and R8 are different in
+kind: neither is reachable by any healer, so they are bugs that must be fixed
+regardless of whether this plan ships at all.
 
 Ship R1, R2, R5 and R6 before or alongside the healer, and instrument the
 healer so the residual dirt rate can be watched to fall.  Ship only the healer
@@ -531,17 +696,28 @@ crash silently consumes a heal budget.
 ## 8. Implementation phases
 
 0. **Upstream fixes** R1, R2, R5, R6 — independently justified, no new concepts.
-1. **Detector, read-only.**  `status_records()`, `current_branch()`, the
-   classifier, the journal, and `heal-report`.  Wire into the two gates in
-   `report` mode: classify, record, then raise exactly as today.  Zero
-   behaviour change.  Run it in production for a fortnight and publish the
-   distribution — every threshold above is a guess until this exists.
-2. **Remedies.**  `META`, `SUBMODULE`, `CHECKOUT`, evidence, breakers,
-   `heal-report --clear` / `--prune`.  Default still `report`.
-3. **The rest.**  `NESTED_CLONE` completion, `STAGED_ASSET`, folding in the six
+   R6 and R8 are bugs regardless of this plan.
+1. **The sweep (§4.8).**  `backups2datalad status` over both roots, two-tier,
+   read-only, replacing `tools/find-INVISIBLE-changed.sh` and extending it to
+   Zarrs — which have no dirtiness answer at all today.  Nothing else in this
+   plan is a prerequisite, and it is what makes every threshold below a
+   measurement instead of a guess.  Run it for a fortnight and publish the
+   distribution.
+2. **The lock (§4.3a).**  `flock` on `.git/dandi/lock`, non-blocking,
+   parent-before-child.  A prerequisite for *any* remediation, and useful on its
+   own against the contention `_retry_on_git_lock()` currently only retries.
+3. **Detector, read-only.**  `status_records()`, `current_branch()`, the
+   journal, and the pile.  Wire into the two gates in `report` mode: classify,
+   record, then raise exactly as today.  Zero behaviour change.
+4. **Remedies.**  The ladder's `META`, `SUBMODULE` and `CHECKOUT` rungs,
+   evidence, breakers, `--clear` / `--prune`.  Default still `report`.
+5. **The rest.**  `NESTED_CLONE` completion, `STAGED_ASSET`, folding in the six
    existing silent self-heals.
-4. **Flip the default to `on`** once phase-1 data supports it, and document it
-   in `CLAUDE.md` beside the Quiescent Period and Force-Push sections.
+6. **Flip the default to `on`** once the phase-1 data supports it, and document
+   it in `CLAUDE.md` beside the Quiescent Period and Dirty Mirrors sections.
+
+Phases 1 and 2 are each independently worth shipping even if the rest of this
+plan is never built.
 
 Tests worth calling out, beyond per-class unit coverage of the classifier
 (which is a pure function over porcelain records, so that is where density
@@ -574,9 +750,21 @@ run 3 is a clean no-op.
    should large trees refuse instead?
 7. **Sticky trips.**  Should a tripped dataset stay tripped until an operator
    clears it, or should the next clean run un-trip it?
-8. **Concurrency.**  Can `populate` / `populate-zarrs` overlap
-   `update-from-backup` on the same dataset in production?  It decides whether
-   the per-dataset `flock` is load-bearing or belt-and-braces.
+8. **Storage under the backup roots.**  Local disk, or NFS?  `flock` over NFS
+   needs a current kernel; if the roots are networked, §4.3a should use
+   `fcntl.lockf` instead.  Related: can `populate` / `populate-zarrs` overlap
+   `update-from-backup` on the same dataset in production, and is the cron
+   `flock` per host, per root, or per command?
 9. **R5** (`mkrelease` stranding) — confirm it is real and not prevented by
    something outside the repository; if real it should land ahead of this
    feature.
+10. **Does the sweep (§4.8) want to subsume
+   `tools/find-INVISIBLE-changed.sh`,** or sit beside it?  Folding it in puts
+   fleet policy under version control and under test, but the script may carry
+   drogon-specific assumptions that are not in this repository.
+11. **Zarr auto-cleanup scope.**  With the sweep in place, is an *automatic*
+   Zarr cleanup wanted, or is an enumerate-and-report worklist enough?  Zarrs
+   differ from Dandisets in that the authoritative copy is `zarr_root/<id>` and
+   an installed submodule checkout is already an anomaly, so more is safely
+   discardable there — but at 23,614 Zarrs for a single Dandiset the blast
+   radius of a wrong rule is correspondingly larger.
