@@ -21,12 +21,11 @@ from dandi.consts import DANDISET_ID_REGEX, EmbargoStatus, dandiset_metadata_fil
 from dandi.exceptions import NotFoundError
 from datalad.api import clone
 from ghrepo import GHRepo
-import httpx
 from linesep import split_terminated
 from packaging.version import Version as PkgVersion
 
 from .adandi import AsyncDandiClient, RemoteDandiset, RemoteZarrAsset
-from .adataset import AssetsState, AsyncDataset, DatasetStats
+from .adataset import AssetsState, AsyncDataset
 from .aioutil import aruncmd, pool_amap
 from .asyncer import fetch_stable_assets
 from .config import BackupConfig, Mode
@@ -430,19 +429,12 @@ class DandiDatasetter(AsyncResource):
         repo = await superds.get_ghrepo()
         # List the archive afresh rather than reuse whatever the current run
         # iterated over, which `--exclude` or explicit IDs may have narrowed.
+        # (Failed requests are retried by `arequest()`; one that still fails
+        # fails the run rather than leave the description out of date.)
         on_archive: set[str] = set()
-        try:
-            async with aclosing(self.dandi_client.get_dandisets()) as diter:
-                async for d in diter:
-                    on_archive.add(d.identifier)
-        except (httpx.HTTPError, ValueError) as e:
-            # A cosmetic step; do not fail an otherwise successful run
-            log.warning(
-                "Could not list Dandisets on the archive (%s); not updating"
-                " superdataset description",
-                e,
-            )
-            return
+        async with aclosing(self.dandi_client.get_dandisets()) as diter:
+            async for d in diter:
+                on_archive.add(d.identifier)
         mirrored = 0
         size = 0
         for s in await superds.get_subdatasets():
@@ -453,56 +445,32 @@ class DandiDatasetter(AsyncResource):
                 # on the archive, so no `DANDISET_ID_REGEX` check is needed)
                 continue
             mirrored += 1
-            stats = await self.get_mirror_stats(AsyncDataset(s["path"]))
-            if stats is not None:
-                size += stats.size
-        archive_size: int | None
-        try:
-            archive = await self.dandi_client.get_archive_stats()
-        except (httpx.HTTPError, ValueError) as e:
-            # `ValueError` covers both a non-JSON body and a pydantic
-            # `ValidationError`
-            log.warning("Could not fetch archive stats: %s", e)
-            archive_size = None
-        else:
-            archive_size = archive.size
-            if archive.dandiset_count != len(on_archive):
-                # The stats are recomputed only periodically, and the listing
-                # shows only those embargoed Dandisets the token may see
-                log.debug(
-                    "Archive stats count %d Dandisets, but %d are listed",
-                    archive.dandiset_count,
-                    len(on_archive),
+            ds = AsyncDataset(s["path"])
+            if not ds.ds.is_installed():
+                raise RuntimeError(
+                    f"Mirror of Dandiset {did} at {ds.path} is not installed"
                 )
+            # Uses the cached stats if they are for HEAD, else recounts (and
+            # caches) them, rather than leave the mirror out of the total
+            size += (await ds.get_stats(config=self.config)).size
+        archive = await self.dandi_client.get_archive_stats()
+        if archive.dandiset_count != len(on_archive):
+            # The stats are recomputed only periodically, and the listing shows
+            # only those embargoed Dandisets the token may see
+            log.debug(
+                "Archive stats count %d Dandisets, but %d are listed",
+                archive.dandiset_count,
+                len(on_archive),
+            )
         await self.manager.edit_github_repo(
             repo,
             description=describe_superdataset(
                 mirrored=mirrored,
                 on_archive=len(on_archive),
                 size=size,
-                archive_size=archive_size,
+                archive_size=archive.size,
             ),
         )
-
-    async def get_mirror_stats(self, ds: AsyncDataset) -> DatasetStats | None:
-        """
-        The stats for a Dandiset mirror, recounting them if those cached are
-        out of date.  `None` -- with a warning, as the description then
-        understates the mirror -- if they cannot be had.
-        """
-        if (stats := await ds.get_stored_stats()) is not None:
-            return stats
-        if not ds.ds.is_installed():
-            log.warning("%s: mirror not installed; not counting its size", ds.path)
-            return None
-        log.warning("%s: no up-to-date stats cached; recounting", ds.path)
-        try:
-            return await ds.get_stats(config=self.config)
-        except Exception:
-            # Best-effort; most likely `zarr_root` is unset for a Dandiset
-            # with Zarrs, which fails an `assert` with no message
-            log.warning("%s: could not count up files", ds.path, exc_info=True)
-            return None
 
     async def tag_releases(
         self,

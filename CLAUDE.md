@@ -290,24 +290,29 @@ such a bound.
 ## Superdataset Description
 
 `DandiDatasetter.set_superds_description()` sets the GitHub description of
-the superdataset (`dandi/dandisets`) to e.g. "1191 of 1191 Dandisets
-mirrored (1.1 PB of the archive's 2.4 PB)." (`util.describe_superdataset()`):
+the superdataset (`dandi/dandisets`) to e.g. "1190 of 1191 Dandisets
+mirrored (2.3 PB of the archive's 2.4 PB)." (`util.describe_superdataset()`):
 
 - The Dandiset count compares the mirrors (submodules) against a fresh listing
   of the archive, so Dandisets deleted from the archive -- whose submodules
   stay, with their backups made private -- are not counted.
-- The mirrored size sums each mirror's cached `dandi.stats`;
-  `get_mirror_stats()` recounts a mirror whose cache is out of date rather
-  than counting it as 0, which used to make it silently drop out of the total.
-  Normally only mirrors the run did not visit need it (`update_dandiset()`
-  refreshes the cache), but a recount recurses into Zarr stats and can be slow.
-- Failing to list the archive skips the update with a warning rather than
-  failing the run; failing to fetch `/api/stats/` drops the archive size.
+- The mirrored size sums each mirror's `get_stats()`, which recounts (and
+  caches) the stats of a mirror whose cached `dandi.stats` are not for its
+  HEAD; the old code counted such a mirror as 0, silently dropping it from the
+  total.  Normally only mirrors the run did not visit need a recount
+  (`update_dandiset()` refreshes the cache), but a recount recurses into Zarr
+  stats and can be slow.
+- Nothing here is best-effort: DANDI API requests are retried by
+  `arequest()`, and a request that still fails, a mirror that is not
+  installed, or one whose stats cannot be counted fails the run rather than
+  leave the description silently out of date.
 - The archive size comes from `/api/stats/`, the number dandiarchive.org shows.
   It counts every distinct blob/Zarr of every version (embargoed included),
-  while a mirror counts its draft's files, so the two only roughly agree; a
-  large gap means something is not being mirrored (as 001412's 1.2 PB of Zarrs
-  was not in 2026).
+  while a mirror counts its draft's files (and a blob shared by Dandisets once
+  per Dandiset), so the two agree only roughly even when every mirror is
+  current; a large gap means something is not being mirrored -- in 2026 the
+  description read "1.1 PB" against 2.4 PB because 001412's 1.2 PB of Zarrs
+  was not being mirrored although its (stale) mirror existed and was counted.
 
 ## Testing
 
