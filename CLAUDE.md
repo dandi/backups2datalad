@@ -287,6 +287,24 @@ that many times over, and file descriptors run out (`EMFILE`):
 Per-asset work that needs a subprocess or an open file has to happen behind
 such a bound.
 
+## Superdataset Description
+
+`DandiDatasetter.set_superds_description()` sets the GitHub description of
+the superdataset (`dandi/dandisets`) to e.g. "1191 of 1191 Dandisets
+mirrored, 1.1 PB of 2.4 PB." (`util.describe_superdataset()`):
+
+- The Dandiset count compares the mirrors (submodules) against a fresh listing
+  of the archive, so Dandisets deleted from the archive -- whose submodules
+  stay, with their backups made private -- are not counted.
+- The mirrored size sums each mirror's cached `dandi.stats`;
+  `get_mirror_stats()` recounts a mirror whose cache is out of date rather
+  than counting it as 0, which used to make it silently drop out of the total.
+- The archive size comes from `/api/stats/`, the number dandiarchive.org shows.
+  It counts every distinct blob/Zarr of every version (embargoed included),
+  while a mirror counts its draft's files, so the two only roughly agree; a
+  large gap means something is not being mirrored (as 001412's 1.2 PB of Zarrs
+  was not in 2026).
+
 ## Testing
 
 The project uses pytest for testing, with fixtures for:
