@@ -325,11 +325,17 @@ every blob asset of every mirror (see #136).
 
 Until dandi-archive#2962 restores the old form, `RemoteAsset.from_data()` in
 `adandi.py` -- through which every asset record from the API passes -- maps
-the URLs back with `strip_s3_region()`.  `.dandi/assets.json` and the S3 URLs
-registered with git-annex therefore keep the region-less form.  Mirrors synced
-between the server change and this workaround have the regional form in
-`.dandi/assets.json` (`git grep -l s3.us-east-2 HEAD -- .dandi/assets.json`);
-syncing them again (e.g., `--mode force`) puts it back.
+the URLs back with `strip_s3_region()`, so `.dandi/assets.json` keeps the
+region-less form and new git-annex URL registrations use it.  Like
+`BackupConfig.bucket_url`, this assumes the region-less endpoint works for the
+bucket.
+
+Mirrors synced between the server change and this workaround have the
+regional form in `.dandi/assets.json`; find them with
+`grep -lF s3.us-east-2.amazonaws.com <mirror>/.dandi/assets.json` (not
+`git grep`, which misses an annexed `assets.json`).  Until such a mirror is
+synced again, `--mode verify` still raises `UnexpectedChangeError` for it;
+`update-from-backup --mode force <ids>` puts the region-less form back.
 
 ## Testing
 
