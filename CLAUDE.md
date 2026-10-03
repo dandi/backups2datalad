@@ -314,6 +314,23 @@ mirrored (2.3 PB of the archive's 2.4 PB)." (`util.describe_superdataset()`):
   description read "1.1 PB" against 2.4 PB because 001412's 1.2 PB of Zarrs
   was not being mirrored although its (stale) mirror existed and was counted.
 
+## S3 URLs Without a Region
+
+dandi-archive v1.0.11 (dandi-archive#2951, 2026-10-01) started reporting asset
+S3 URLs as `https://dandiarchive.s3.us-east-2.amazonaws.com/...` instead of the
+region-less `https://dandiarchive.s3.amazonaws.com/...` they always had.  The
+change hit the `contentUrl` of every asset of every version, but no
+`modified` timestamp, so `--mode verify` raised `UnexpectedChangeError` for
+every blob asset of every mirror (see #136).
+
+Until dandi-archive#2962 restores the old form, `RemoteAsset.from_data()` in
+`adandi.py` -- through which every asset record from the API passes -- maps
+the URLs back with `strip_s3_region()`.  `.dandi/assets.json` and the S3 URLs
+registered with git-annex therefore keep the region-less form.  Mirrors synced
+between the server change and this workaround have the regional form in
+`.dandi/assets.json` (`git grep -l s3.us-east-2 HEAD -- .dandi/assets.json`);
+syncing them again (e.g., `--mode force`) puts it back.
+
 ## Testing
 
 The project uses pytest for testing, with fixtures for:

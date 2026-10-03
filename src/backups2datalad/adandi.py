@@ -25,6 +25,25 @@ from .aioutil import arequest
 from .consts import USER_AGENT
 from .logging import log
 
+#: Matches an AWS S3 URL whose host includes a Region, e.g.
+#: ``https://dandiarchive.s3.us-east-2.amazonaws.com/``
+S3_REGIONAL_URL = re.compile(r"^(https://[^/]+\.s3)\.[a-z0-9-]+(\.amazonaws\.com/)")
+
+
+def strip_s3_region(url: str) -> str:
+    """
+    Remove the Region from the host of an AWS S3 URL, e.g., turn
+    ``https://dandiarchive.s3.us-east-2.amazonaws.com/blobs/...`` into
+    ``https://dandiarchive.s3.amazonaws.com/blobs/...``; other URLs are
+    returned unchanged.
+
+    dandi-archive v1.0.11 (dandi-archive#2951) started reporting the former in
+    the ``contentUrl`` of every asset, without updating any ``modified``
+    timestamps, while every asset metadata record mirrored before then has the
+    latter.  This undoes that until dandi-archive#2962 is resolved.
+    """
+    return S3_REGIONAL_URL.sub(r"\1\2", url)
+
 
 class ArchiveStats(BaseModel):
     #: All Dandisets on the archive, including embargoed and empty ones
@@ -360,6 +379,12 @@ class RemoteAsset(BaseModel, populate_by_name=True, arbitrary_types_allowed=True
                 raise ValueError("Asset data contains both `blob` and `zarr`'")
         else:
             raise ValueError("Asset data contains neither `blob` nor `zarr`")
+        md = data.get("metadata")
+        if isinstance(md, dict) and isinstance(md.get("contentUrl"), list):
+            md["contentUrl"] = [
+                strip_s3_region(url) if isinstance(url, str) else url
+                for url in md["contentUrl"]
+            ]
         return klass(dandiset=dandiset, **data)  # type: ignore[call-arg]
 
     @property
