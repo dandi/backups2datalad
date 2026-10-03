@@ -203,9 +203,7 @@ Before running `backups2datalad`, the following setup must be performed:
 
       This option can also be set via the `--zarr-dirty` option of the
       `update-from-backup` and `backup-zarrs` subcommands, which overrides any
-      value given in the configuration file.  To clean up a Dandiset's Zarr
-      mirrors outside a backup run, see
-      `tools/reset-clean-dandiset-zarrs.sh`.
+      value given in the configuration file.
 
 - If pushing mirror repositories to GitHub, a GitHub access token with
   appropriate permissions must be provided via one of the following methods

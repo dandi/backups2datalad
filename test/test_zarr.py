@@ -654,7 +654,8 @@ async def test_zarr_dirty_reset_clean(
     assert (ds.pathobj / "stray.txt").exists()
 
     # reset+clean discards it and carries on, announcing itself on one line
-    # under a token a run of 20k Zarrs can be audited by.
+    # under a token a run of 20k Zarrs can be audited by.  The dirty paths are
+    # deliberately not listed: there can be thousands of them.
     config.zarr_dirty = ZarrDirty.RESET_CLEAN
     with caplog.at_level(logging.WARNING, logger="backups2datalad"):
         await visit()
@@ -663,7 +664,7 @@ async def test_zarr_dirty_reset_clean(
     ]
     assert len(warnings) == 1
     assert warnings[0].startswith("ZARR-RESET: ")
-    assert "1 path" in warnings[0]
+    assert "stray.txt" not in warnings[0]
     assert "\n" not in warnings[0]
     assert not (ds.pathobj / "stray.txt").exists()
     assert not await ds.is_dirty()

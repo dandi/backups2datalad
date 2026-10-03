@@ -592,7 +592,7 @@ async def sync_zarr(
                 "Created GitHub sibling with privacy %s",
                 "private" if embargo_status is EmbargoStatus.EMBARGOED else "public",
             )
-        if dirt_lines := await ds.dirty_paths():
+        if await ds.is_dirty():
             desc = f"Zarr {asset.zarr} in Dandiset {asset.dandiset_id}"
             # `--mode verify` exists to report local divergence, so discarding
             # it first would answer the question it was asked to ask.  Gate on
@@ -602,28 +602,12 @@ async def sync_zarr(
                 manager.config.zarr_dirty is ZarrDirty.RESET_CLEAN
                 and manager.config.mode is not Mode.VERIFY
             ):
-                # One line, led by a token, so that a run over tens of
-                # thousands of Zarrs can be audited with
-                # `grep -c 'ZARR-RESET:'`; the paths go to DEBUG, which
-                # `debug_logfile()` captures in full regardless.
+                # Led by a token, so that a run over tens of thousands of Zarrs
+                # can be audited with `grep -c 'ZARR-RESET:'`.
                 manager.log.warning(
-                    "ZARR-RESET: %s is dirty (%s); discarding uncommitted state",
-                    desc,
-                    quantify(len(dirt_lines), "path"),
+                    "ZARR-RESET: %s is dirty; discarding uncommitted state", desc
                 )
-                manager.log.debug(
-                    "ZARR-RESET: %s: discarding:\n%s", desc, "\n".join(dirt_lines)
-                )
-                await ds.reset_hard_clean()
-                if await ds.is_dirty():
-                    raise RuntimeError(
-                        f"{desc} is still dirty after `git reset --hard` and"
-                        " `git clean -dfx`, so it needs manual inspection"
-                        " (`git clean` leaves an active submodule and an"
-                        " untracked nested git repository alone, and the `-ff`"
-                        " that would remove the latter is deliberately not"
-                        f" used).  Remaining: {await ds.describe_dirt()}"
-                    )
+                await ds.reset_hard_clean(check_clean=True)
             else:
                 raise RuntimeError(
                     f"{desc} is dirty; clean or save before running;"

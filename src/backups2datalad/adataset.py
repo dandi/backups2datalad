@@ -280,14 +280,6 @@ class AsyncDataset:
     async def is_dirty(self) -> bool:
         return await self._status_porcelain() != ""
 
-    async def dirty_paths(self) -> list[str]:
-        """
-        The ``git status --porcelain`` lines that make the dataset dirty, so a
-        caller can report how many there are without parsing
-        `describe_dirt()`'s prose back apart.  Empty iff the dataset is clean.
-        """
-        return (await self._status_porcelain()).splitlines()
-
     async def describe_dirt(self, limit: int = 10) -> str:
         """
         Summarize what makes the dataset dirty, for error messages: the
@@ -303,31 +295,29 @@ class AsyncDataset:
             desc += f"\n... and {len(lines) - limit} more"
         return desc
 
-    async def reset_hard_clean(self) -> None:
+    async def reset_hard_clean(self, check_clean: bool = False) -> None:
         """
         Discard everything not committed: ``git reset --hard`` followed by
         ``git clean -dfx``.
 
-        Does not converge on every kind of dirt: `git clean` leaves an active
-        submodule and an untracked directory that is itself a git repository
-        alone, and the `-ff` that would remove the latter is deliberately never
-        passed.  Callers must therefore re-check `is_dirty()` afterwards rather
-        than assume success.
-
         `.git/annex` is not touched by either command, so annexed content
         survives as (possibly unreferenced) objects and is not re-downloaded.
 
-        Used only on Zarr mirrors (`sync_zarr()`).  Discarding a Dandiset
-        mirror's uncommitted state is a different matter -- that is the state
-        CLAUDE.md's "Dirty Mirrors" gate exists to surface rather than throw
-        away -- and the superdataset's dirt is pending submodule registrations,
-        i.e. real work.
+        With ``check_clean``, error if that did not actually make the dataset
+        clean: `git clean` leaves an active submodule and an untracked
+        directory that is itself a git repository alone, and the `-ff` that
+        would remove the latter is deliberately never passed.
         """
         # --quiet / -q: `clean` prints a line per removed path, and a Zarr may
         # hold hundreds of thousands, all of which `aruncmd` would buffer and
         # then splice into the exception message if the command failed.
         await self.call_git("reset", "--hard", "--quiet")
         await self.call_git("clean", "-dfxq")
+        if check_clean and await self.is_dirty():
+            raise RuntimeError(
+                f"{self.path} is still dirty after `git reset --hard` and"
+                f" `git clean -dfx`; {await self.describe_dirt()}"
+            )
 
     async def has_changes(
         self, paths: Sequence[str | Path] = (), cached: bool = False
