@@ -22,7 +22,7 @@ from . import __version__
 from .adandi import AsyncDandiClient
 from .adataset import AsyncDataset
 from .aioutil import pool_amap, stream_lines_command
-from .config import BackupConfig, Mode, ZarrMode
+from .config import BackupConfig, Mode, ZarrDirty, ZarrMode
 from .consts import DEFAULT_QUIESCENT_PERIOD, GIT_OPTIONS
 from .datasetter import DandiDatasetter
 from .logging import log
@@ -209,6 +209,26 @@ def print_logfile(
     ),
 )
 @click.option(
+    "--zarr-dirty",
+    # Choice over the *values*, not the enum: click derives an Enum choice's
+    # token from the member name, which would make this `reset_clean` on the
+    # command line while the config file still wanted `reset+clean`.
+    type=click.Choice([m.value for m in ZarrDirty], case_sensitive=False),
+    default=None,
+    help=(
+        "What to do about a Zarr mirror found dirty.  'error' — raise, as"
+        " always, which aborts that Zarr's whole Dandiset and cancels the Zarr"
+        " syncs running alongside it; 'reset+clean' — warn, discard the"
+        " uncommitted state with `git reset --hard` and `git clean -dfx`, and"
+        " carry on, raising as above only if that left it dirty.  Applies only"
+        " to the Zarrs of the Dandisets being backed up, so name those"
+        " Dandisets to scope it; it does not relax the separate dirtiness gate"
+        " on the Dandiset mirror itself.  Ignored under `--mode verify`."
+        "  WARNING: 'reset+clean' discards uncommitted work irrecoverably."
+        "  [default: error, unless different value set via config file]"
+    ),
+)
+@click.option(
     "--force-push",
     multiple=True,
     type=click.Choice(["dandisets", "zarrs", "all"], case_sensitive=False),
@@ -233,6 +253,7 @@ async def update_from_backup(
     gc_assets: bool | None,
     mode: Mode | None,
     zarr_mode: ZarrMode | None,
+    zarr_dirty: str | None,
     force_push: tuple[str, ...],
     quiescent_period: float | None,
 ) -> None:
@@ -257,6 +278,15 @@ async def update_from_backup(
             datasetter.config.mode = mode
         if zarr_mode is not None:
             datasetter.config.zarr_mode = zarr_mode
+        if zarr_dirty is not None:
+            datasetter.config.zarr_dirty = ZarrDirty(zarr_dirty)
+        if datasetter.config.zarr_dirty is ZarrDirty.RESET_CLEAN:
+            # Deliberately does not contain the per-Zarr `ZARR-RESET:` token,
+            # so that grepping for that counts Zarrs and not this banner.
+            log.warning(
+                "Dirty Zarr mirrors will have their uncommitted state"
+                " discarded irrecoverably; see ZARR-RESET: lines"
+            )
         if gc_assets is not None:
             datasetter.config.gc_assets = gc_assets
         if quiescent_period is not None:
@@ -283,6 +313,22 @@ async def update_from_backup(
     ),
 )
 @click.option("-w", "--workers", type=int, help="Number of workers to run concurrently")
+@click.option(
+    "--zarr-dirty",
+    type=click.Choice([m.value for m in ZarrDirty], case_sensitive=False),
+    default=None,
+    help=(
+        "What to do about a Zarr mirror found dirty.  'error' — raise, as"
+        " always; 'reset+clean' — warn, discard the uncommitted state with"
+        " `git reset --hard` and `git clean -dfx`, and carry on, raising only"
+        " if that left it dirty.  Note this command skips any Zarr already"
+        " backed up, so the only thing it can reach is a leftover under the"
+        " partial directory, never a mirror under the Zarrs root; use"
+        " `update-from-backup --zarr-dirty` for those.  WARNING:"
+        " 'reset+clean' discards uncommitted work irrecoverably.  [default:"
+        " error, unless different value set via config file]"
+    ),
+)
 @click.argument("dandiset")
 @click.pass_obj
 @print_logfile
@@ -291,6 +337,7 @@ async def backup_zarrs(
     dandiset: str,
     workers: int | None,
     partial_dir: Path | None,
+    zarr_dirty: str | None,
 ) -> None:
     """
     Create (but do not update) local mirrors of Zarrs for a single Dandiset
@@ -301,6 +348,8 @@ async def backup_zarrs(
             raise click.UsageError("Zarr backups not configured in config file")
         if workers is not None:
             datasetter.config.workers = workers
+        if zarr_dirty is not None:
+            datasetter.config.zarr_dirty = ZarrDirty(zarr_dirty)
         if partial_dir is None:
             partial_dir = datasetter.config.backup_root / "partial-zarrs"
         await datasetter.backup_zarrs(dandiset, partial_dir)

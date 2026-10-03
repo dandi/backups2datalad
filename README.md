@@ -186,6 +186,25 @@ Before running `backups2datalad`, the following setup must be performed:
       `update-from-backup` subcommand, which overrides any value given in the
       configuration file.
 
+    - `zarr_dirty` — Specify what to do about a Zarr mirror found to have
+      uncommitted changes, e.g. left behind by an interrupted run.  Possible
+      values are:
+
+        - `"error"` *(default)* — raise an error.  Note that this aborts the
+          whole Dandiset the Zarr belongs to, and cancels the Zarr syncs running
+          alongside it, leaving those dirty in turn.
+
+        - `"reset+clean"` — log a warning and discard the uncommitted state with
+          `git reset --hard` and `git clean -dfx`, then carry on; if that did not
+          make the mirror clean, error as above.  **This discards uncommitted
+          work irrecoverably.**  It applies only to the Zarrs of the Dandisets
+          being backed up, and does not affect the separate check on the
+          Dandiset mirror itself.  It is ignored when `mode` is `"verify"`.
+
+      This option can also be set via the `--zarr-dirty` option of the
+      `update-from-backup` and `backup-zarrs` subcommands, which overrides any
+      value given in the configuration file.
+
 - If pushing mirror repositories to GitHub, a GitHub access token with
   appropriate permissions must be provided via one of the following methods
   (in order of precedence):

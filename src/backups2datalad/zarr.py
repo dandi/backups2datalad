@@ -22,7 +22,7 @@ from .adandi import RemoteZarrAsset
 from .adataset import AsyncDataset
 from .aioutil import GitHubRateLimited
 from .annex import AsyncAnnex
-from .config import BackupConfig, ZarrMode
+from .config import BackupConfig, Mode, ZarrDirty, ZarrMode
 from .consts import MAX_ZARR_SYNCS
 from .logging import PrefixedLogger
 from .manager import Manager
@@ -593,10 +593,26 @@ async def sync_zarr(
                 "private" if embargo_status is EmbargoStatus.EMBARGOED else "public",
             )
         if await ds.is_dirty():
-            raise RuntimeError(
-                f"Zarr {asset.zarr} in Dandiset {asset.dandiset_id} is dirty;"
-                f" clean or save before running; {await ds.describe_dirt()}"
-            )
+            desc = f"Zarr {asset.zarr} in Dandiset {asset.dandiset_id}"
+            # `--mode verify` exists to report local divergence, so discarding
+            # it first would answer the question it was asked to ask.  Gate on
+            # the mode itself rather than on `error_on_change`, which is only
+            # passed down when verify *also* finds the timestamp unchanged.
+            if (
+                manager.config.zarr_dirty is ZarrDirty.RESET_CLEAN
+                and manager.config.mode is not Mode.VERIFY
+            ):
+                # Led by a token, so that a run over tens of thousands of Zarrs
+                # can be audited with `grep -c 'ZARR-RESET:'`.
+                manager.log.warning(
+                    "ZARR-RESET: %s is dirty; discarding uncommitted state", desc
+                )
+                await ds.reset_hard_clean(check_clean=True)
+            else:
+                raise RuntimeError(
+                    f"{desc} is dirty; clean or save before running;"
+                    f" {await ds.describe_dirt()}"
+                )
         async with AsyncAnnex(dsdir, digest_type="MD5") as annex:
             if (r := manager.config.zarrs.remote) is not None:
                 backup_remote = r.name

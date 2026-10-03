@@ -270,6 +270,63 @@ Two notes for anyone extending this:
   and, unlike ordinary deletions (which `get_deleted()` handles by popping the
   metadata first), it means the two records disagree.
 
+## Dirty Zarrs
+
+`sync_zarr()` refuses a Zarr mirror that is dirty on the way in.  `--zarr-dirty`
+(on `update-from-backup` and `backup-zarrs`, or `zarr_dirty` in the config file)
+chooses what happens instead:
+
+- `error` (default) — unchanged behaviour: fail that Zarr with
+  `describe_dirt()`.
+- `reset+clean` — log a WARNING with the dirt, run `git reset --hard` and
+  `git clean -dfx`, and carry on.
+
+The scope is the Zarrs of the Dandisets being backed up: `sync_zarr()` is
+reached through a Dandiset's own asset listing, so naming Dandisets on the
+command line is what narrows it (`update-from-backup --zarr-dirty=reset+clean
+001412`).  No Zarr outside those Dandisets is touched.
+
+Four properties to preserve when touching this:
+
+- **"Fail that Zarr" is not what failing a Zarr does.**  `sync_zarr()` is
+  `start_soon`'d into a task group (`asyncer.py`), so one `RuntimeError` cancels
+  the other in-flight Zarr syncs (up to `ZARR_LIMIT`), propagates out through
+  `sync_dataset()`, and fails the whole Dandiset and the run.  The cancelled
+  siblings are left dirty, so **each aborted run manufactures up to
+  `ZARR_LIMIT` newly dirty mirrors**.  The practical consequence: if dirt is
+  the only thing aborting the run, `reset+clean` converges -- each run heals
+  every dirty Zarr it reaches and dirties at most ten on the way out, so the
+  backlog shrinks run over run -- but a single Zarr that cannot be reset blocks
+  its Dandiset indefinitely, because nothing skips it.
+- **This does not relax the Dandiset mirror's own dirtiness gate.**  That one is
+  in `sync_dataset()` (see "Dirty Mirrors" above) and is reached *before* any
+  Zarr, so a Dandiset whose own mirror is dirty fails identically with or
+  without this option.
+- **The remedy does not always converge, and the code must not assume it
+  does.**  `git clean` leaves an active submodule and an untracked nested git
+  repository alone, and the `-ff` that would remove the latter is deliberately
+  never passed.  `reset_hard_clean(check_clean=True)` therefore re-checks and
+  errors naming what is left, rather than passing silently.  (Neither case is
+  expected in a Zarr mirror, which has no submodules and is never cloned into;
+  the re-check is cheap insurance, not a prediction.)
+- **`--mode verify` never discards.**  Verify exists to report local
+  divergence, so discarding first would answer the question it was asked to
+  ask.  The gate is `config.mode`, deliberately not the `error_on_change` flag,
+  which verify passes down only when it *also* finds the timestamp unchanged --
+  gating on that would still discard when verifying a Dandiset that had changed.
+
+Each reset logs one WARNING led by `ZARR-RESET:` so that a run over tens of
+thousands of Zarrs can be audited with `grep -c 'ZARR-RESET:'`.  What made the
+mirror dirty is deliberately *not* listed: there can be thousands of paths, and
+limiting that sensibly buys nothing the count does not already give.  The
+startup banner avoids the token so it does not inflate the count.
+
+`git reset --hard` and `git clean -dfx` do not touch `.git/annex`, so annexed
+content survives as (possibly unreferenced) objects and is not re-downloaded;
+what a reset costs is the wall clock of re-registering keys, not bytes.  What is
+genuinely lost is uncommitted work, irrecoverably -- there is no evidence kept
+today.
+
 ## Per-Asset Fan-Out
 
 `Downloader.asset_loop()` is handed the whole asset listing at once
