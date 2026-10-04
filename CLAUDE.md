@@ -366,8 +366,14 @@ lab)", #103), a leading `-`, and -- through the `A-z` range -- `[`, `]` and
   contain spaces, and `addurl`'s JSON `file` comes back verbatim.  Only a
   newline in a path (which `\s` also admits) would break them.
 
-`test/test_unusual_paths.py` covers these without Docker;
-`test_core.py::test_unusual_asset_paths` covers a full sync.
+Tests use the names in `test/obscure.py`, derived from DataLad's
+`OBSCURE_FILENAME` (`' |;&%b5{}\'"<> .datc '` on Linux): `OBSCURE_NAMES` where
+dandi-archive is not involved (`test/test_unusual_paths.py`, no Docker), and
+`obscure_asset_path()` -- as obscure as dandi-archive's regex allows, and
+checked against it -- for assets.  The `text_dandiset` fixture includes such an
+asset, so every test using it syncs one; `test_core.py::test_obscure_asset_paths`
+adds a blob, a Zarr, an update and a deletion.  Use these names rather than
+inventing plain ones when a test adds paths.
 
 ## Superdataset Description
 

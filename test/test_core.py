@@ -12,11 +12,13 @@ from dandi.dandiapi import Version
 from dandi.utils import yaml_load
 from datalad.api import Dataset
 from datalad.tests.utils_pytest import assert_repo_status, ok_file_under_git
+import numpy as np
+from obscure import glob_sibling, obscure_asset_path
 import pytest
 from test_util import GitRepo
 
 from backups2datalad.adataset import AssetsState, AsyncDataset
-from backups2datalad.config import BackupConfig
+from backups2datalad.config import BackupConfig, ResourceConfig
 from backups2datalad.consts import DEFAULT_BRANCH
 from backups2datalad.datasetter import DandiDatasetter
 from backups2datalad.procedures.cfg_dandiset import (
@@ -252,7 +254,7 @@ async def test_2(
         f"1 added ({dandiset_id})\n"
         "\n"
         f"{dandiset_id}:\n"
-        " - [backups2datalad] 5 files added\n"
+        " - [backups2datalad] 6 files added\n"
         f" - {POLICY_COMMIT_MESSAGE}\n"
         " - [DATALAD] new dataset"
     )
@@ -430,12 +432,11 @@ async def test_binary(
 
 
 @pytest.mark.ai_generated
-async def test_unusual_asset_paths(
+async def test_obscure_asset_paths(
     docker_archive: Archive, new_dandiset: SampleDandiset, tmp_path: Path
 ) -> None:
-    # Whitespace and parentheses (as in 001449, #103), a glob character class
-    # and a leading dash, all of which dandi-archive admits in asset paths;
-    # cf. `test_unusual_paths.py`.
+    # Asset paths as obscure as dandi-archive allows (see `obscure.py`), and
+    # 001449's from #103
     di = DandiDatasetter(
         dandi_client=new_dandiset.client,
         config=BackupConfig(
@@ -444,6 +445,8 @@ async def test_unusual_asset_paths(
             s3bucket=docker_archive.s3bucket,
             s3endpoint=docker_archive.s3endpoint,
             content_url_regex=f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/",
+            dandisets=ResourceConfig(path="ds"),
+            zarrs=ResourceConfig(path="zarrs"),
         ),
     )
     stem = (
@@ -452,31 +455,34 @@ async def test_unusual_asset_paths(
     )
     new_dandiset.add_text(f"{stem}_desc-atlas_cells.tsv", "x\ty\n1\t2\n")
     new_dandiset.add_blob(f"{stem}_desc-heatmap_SPIM.tif", b"\0\1\2\3\4\5")
-    new_dandiset.add_text("foo1.txt", "foo1\n")
-    new_dandiset.add_text("foo[1].txt", "foo[1]\n")
-    new_dandiset.add_text("-leading-dash.txt", "dash\n")
+    text = obscure_asset_path("text.txt")
+    new_dandiset.add_text(text, "Obscure\n")
+    # What `text` would match as a glob
+    new_dandiset.add_text(glob_sibling(text), "Sibling\n")
+    new_dandiset.add_blob(obscure_asset_path("blob.dat"), b"\0\1\2\3\4\5\6")
+    new_dandiset.add_zarr(obscure_asset_path("sample.zarr"), np.eye(5))
     await new_dandiset.upload()
     dandiset_id = new_dandiset.dandiset_id
-    ds = Dataset(tmp_path / "dandisets" / dandiset_id)
-    log.info("test_unusual_asset_paths: Syncing test dandiset")
+    ds = Dataset(tmp_path / "ds" / dandiset_id)
+    log.info("test_obscure_asset_paths: Syncing test dandiset")
     await di.update_from_backup([dandiset_id])
-    await new_dandiset.check_backup(ds)
+    await new_dandiset.check_backup(ds, tmp_path / "zarrs")
 
     # An updated asset is removed before it is fetched again, and a removal of
-    # "foo[1].txt" that is not literal takes "foo1.txt" with it.
-    new_dandiset.add_text("foo[1].txt", "foo[1], modified\n")
+    # `text` that is not literal takes its glob sibling with it.
+    new_dandiset.add_text(text, "Obscure, modified\n")
     await new_dandiset.upload()
-    log.info("test_unusual_asset_paths: Syncing modified asset")
+    log.info("test_obscure_asset_paths: Syncing modified asset")
     await di.update_from_backup([dandiset_id])
-    await new_dandiset.check_backup(ds)
+    await new_dandiset.check_backup(ds, tmp_path / "zarrs")
 
-    new_dandiset.rmasset("foo[1].txt")
-    asset = await new_dandiset.dandiset.aget_asset_by_path("foo[1].txt")
+    new_dandiset.rmasset(text)
+    asset = await new_dandiset.dandiset.aget_asset_by_path(text)
     await new_dandiset.client.delete(asset.api_path)
     await new_dandiset.settle()
-    log.info("test_unusual_asset_paths: Syncing deleted asset")
+    log.info("test_obscure_asset_paths: Syncing deleted asset")
     await di.update_from_backup([dandiset_id])
-    await new_dandiset.check_backup(ds)
+    await new_dandiset.check_backup(ds, tmp_path / "zarrs")
 
 
 async def test_custom_commit_date(tmp_path: Path) -> None:
