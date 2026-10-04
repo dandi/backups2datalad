@@ -6,6 +6,7 @@ may have left disagreeing with it (#139).
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 import subprocess
 
@@ -13,7 +14,6 @@ import pytest
 
 from backups2datalad.adataset import AsyncDataset, DatasetStats
 from backups2datalad.config import BackupConfig, ResourceConfig
-from backups2datalad.util import key_size
 
 pytestmark = pytest.mark.anyio
 
@@ -43,22 +43,6 @@ def write(path: Path, content: bytes | str) -> None:
 
 
 @pytest.mark.ai_generated
-@pytest.mark.parametrize(
-    "key,size",
-    [
-        ("MD5E-s1234--0123456789abcdef0123456789abcdef.dat", 1234),
-        ("SHA256E-s0--e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca", 0),
-        ("SHA256E-s10-S5-C2--deadbeef", 10),
-        ("SHA256E-m1700000000-s42--deadbeef", 42),
-        ("URL--https&c%%example.com%a-s99", None),
-        ("WORM-m1700000000--foo-s7", None),
-    ],
-)
-def test_key_size(key: str, size: int | None) -> None:
-    assert key_size(key) == size
-
-
-@pytest.mark.ai_generated
 async def test_get_stats_counts_head_not_worktree(tmp_path: Path) -> None:
     path = tmp_path / "000001"
     init_repo(path)
@@ -69,13 +53,11 @@ async def test_get_stats_counts_head_not_worktree(tmp_path: Path) -> None:
     write(path / "small.txt", "hello\n")
     write(path / "dandiset.yaml", "identifier: '000001'\n")
     git(path, "annex", "add", "-q", "--force-small", "small.txt", "dandiset.yaml")
-    (path / "link").symlink_to("small.txt")
-    git(path, "annex", "add", "-q", "--force-small", "link")
     git(path, "commit", "-q", "-m", "Add files")
-    # Annexed files are counted by their keys' sizes, the rest (including a
-    # symlink not into the annex) by their blobs' sizes; metadata files are
-    # not counted, whether in git (dandiset.yaml) or annexed (.dandi/)
-    expected = DatasetStats(files=4, size=1000 + 500 + 6 + len("small.txt"))
+    # Annexed files are counted by their keys' sizes, the rest by their blobs'
+    # sizes; metadata files are not counted, whether in git (dandiset.yaml) or
+    # annexed (.dandi/)
+    expected = DatasetStats(files=3, size=1000 + 500 + 6)
 
     # What an interrupted or concurrent run may leave behind (#139): an
     # annexed file not in HEAD made `get_file_stats()` raise a KeyError
@@ -89,6 +71,24 @@ async def test_get_stats_counts_head_not_worktree(tmp_path: Path) -> None:
     config = BackupConfig(backup_root=tmp_path)
     assert await ds.get_stats(config=config) == expected
     assert await ds.get_stored_stats() == expected
+
+
+@pytest.mark.ai_generated
+async def test_get_stats_refuses_unannexed_symlink(tmp_path: Path) -> None:
+    """
+    Annexed files are told by being symlinks, so one that is not annexed
+    fails the count rather than skewing it
+    """
+    path = tmp_path / "000001"
+    init_repo(path)
+    write(path / "data.bin", b"x" * 100)
+    git(path, "annex", "add", "-q", "data.bin")
+    (path / "link").symlink_to("data.bin")
+    git(path, "annex", "add", "-q", "--force-small", "link")
+    git(path, "commit", "-q", "-m", "Add files")
+    ds = AsyncDataset(path)
+    with pytest.raises(RuntimeError, match="counts 1 annexed files .* 2 symlinks"):
+        await ds.get_stats(config=BackupConfig(backup_root=tmp_path))
 
 
 @pytest.mark.ai_generated
@@ -106,18 +106,18 @@ async def test_get_stats_cached_for_counted_commit(
     git(path, "commit", "-q", "-m", "Add data")
     counted = git(path, "rev-parse", "HEAD")
 
-    count_tree = AsyncDataset.count_tree
+    get_annexed_tree_stats = AsyncDataset.get_annexed_tree_stats
 
     async def count_then_commit(
-        self: AsyncDataset, commit: str
-    ) -> tuple[DatasetStats, list]:
-        r = await count_tree(self, commit)
+        self: AsyncDataset, commit: str, exclude: Iterable[str] = ()
+    ) -> DatasetStats:
+        r = await get_annexed_tree_stats(self, commit, exclude)
         write(path / "more.bin", b"y" * 50)
         git(path, "annex", "add", "-q", "more.bin")
         git(path, "commit", "-q", "-m", "Add more")
         return r
 
-    monkeypatch.setattr(AsyncDataset, "count_tree", count_then_commit)
+    monkeypatch.setattr(AsyncDataset, "get_annexed_tree_stats", count_then_commit)
     ds = AsyncDataset(path)
     stats = await ds.get_stats(config=BackupConfig(backup_root=tmp_path))
     assert stats == DatasetStats(files=1, size=100)

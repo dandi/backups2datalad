@@ -378,28 +378,36 @@ leaving out metadata files (`is_meta_file()`) and counting a Zarr submodule by
 its own mirror's stats, and caches the result in `dandi.stats` as
 `<commit>,<files>,<size>`:
 
-- It counts one commit: `HEAD`, resolved once up front, and the stats are
-  cached for that commit, so another process committing meanwhile cannot get
-  them filed under the wrong one.
+- It counts one commit: `HEAD`, resolved once up front, and caches the stats
+  for that commit, so another process committing meanwhile cannot get them
+  filed under the wrong one.
 - Everything is read from that commit, never from the working tree.  It used
   to match `git ls-tree HEAD` against `git annex find`, which lists the
   *working tree*, so a file annexed but not yet committed by a concurrent run
-  raised `KeyError` (#139); Zarr submodules were likewise looked up in the
-  working tree's `.gitmodules`.  They now come from the commit's `.gitmodules`
-  (`get_submodule_urls()`).
-- `count_tree()` relies on annexed files being symlinks into the annex (the
-  mirrors never unlock files): `git ls-tree` lists the tree, `git cat-file
-  --batch` reads the symlinks' targets, and each annexed file's size is the
-  `-s` field of its key (`util.key_size()`); a key without one is an error.
-  An unlocked (pointer) file would be counted at its pointer's size.
-- That is a deliberate choice over git-annex, measured on a 100k-file tree:
-  ~0.6 s, against ~7 s for the old working-tree `git annex find --json`,
-  ~13-23 s for a commit-pinned `git annex find --branch`, and ~17 s for
-  `git annex info --fast <tree>` -- git-annex pays a large per-file cost
-  reading a tree.  `git annex info` also refuses matching options for a
-  tree, so it could not leave the (possibly annexed) `.dandi/` files out.
+  raised `KeyError` (#139); Zarr submodules were likewise looked up via
+  `datalad subdatasets`, i.e. the working tree's `.gitmodules`.
+- `git ls-tree` counts the files and sizes the ones in Git.  The annexed ones
+  are sized by `git annex info --fast <commit>` (`get_annexed_tree_stats()`),
+  less `git annex info` of any metadata directory holding annexed files
+  (`<commit>:.dandi`, as `.dandi/assets.json` may be annexed); `git annex info`
+  refuses matching options for a tree, so this is the way to leave them out.
+  A key without a size makes it report e.g. `5500 (+ 1 unknown size)`, which
+  is an error.
+- An annexed file is told apart in `ls-tree` by being a symlink (the mirrors
+  never unlock files), and the count is checked against git-annex's: a symlink
+  not into the annex, or an unlocked file, fails the count rather than skews
+  it.  So does an annexed top-level metadata file such as `dandiset.yaml`,
+  which is not a tree that `git annex info` could subtract.
+- Zarr URLs come from the commit's `.gitmodules`
+  (`get_repo_config(..., blob="<commit>:.gitmodules")`), following the
+  submodule-name-is-path convention used throughout.
+- Cost: ~17 s per 100k annexed files (the old working-tree `git annex find`
+  took ~7 s; reading the symlinks with `git cat-file --batch` and parsing the
+  keys would take ~0.6 s, but would duplicate git-annex's and DataLad's
+  (`AnnexRepo.get_size_from_key()`) key handling).  The stats are cached, so
+  only a changed mirror is recounted.
 - A Zarr's stats are those of its mirror's `HEAD`, not of the commit the
-  Dandiset records for it (see the TODO in `get_zarr_stats()`).
+  Dandiset records for it (see the TODO in `get_zarr_sub_stats()`).
 
 ## S3 URLs Without a Region
 

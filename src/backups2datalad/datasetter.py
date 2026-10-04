@@ -398,7 +398,11 @@ class DandiDatasetter(AsyncResource):
                 # here we will rely on get_stats to use cached during above
                 # recursive through subdatasets ds.get_stats call
                 await self.manager.set_zarr_description(
-                    *(await AsyncDataset.get_zarr_sub_stats(sub_info, self.config))
+                    *(
+                        await AsyncDataset.get_zarr_sub_stats(
+                            sub_info["gitmodule_url"], self.config
+                        )
+                    )
                 )
         if not dandiset_ids and exclude is None:
             superds = AsyncDataset(self.config.dandiset_root)

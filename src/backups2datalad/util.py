@@ -264,19 +264,6 @@ def key2hash(key: str) -> str:
     return key.split("-")[-1].partition(".")[0]
 
 
-def key_size(key: str) -> int | None:
-    """
-    The size of the content of a git-annex key, as recorded in the key's
-    ``-s`` field (e.g., 1234 for ``MD5E-s1234--<md5>.dat``), or `None` if the
-    key does not record it
-    """
-    fields, _, _ = key.partition("--")
-    for fld in fields.split("-")[1:]:
-        if fld.startswith("s") and fld[1:].isdigit():
-            return int(fld[1:])
-    return None
-
-
 def format_errors(messages: list[str]) -> str:
     if not messages:
         return " <no error message>"
