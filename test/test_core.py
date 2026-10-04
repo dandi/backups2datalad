@@ -460,7 +460,8 @@ async def test_obscure_asset_paths(
     # What `text` would match as a glob
     new_dandiset.add_text(glob_sibling(text), "Sibling\n")
     new_dandiset.add_blob(obscure_asset_path("blob.dat"), b"\0\1\2\3\4\5\6")
-    new_dandiset.add_zarr(obscure_asset_path("sample.zarr"), np.eye(5))
+    # Not at the top level: see `OBSCURE_ASSET_NAME`
+    new_dandiset.add_zarr(f"zarrs/{obscure_asset_path('sample.zarr')}", np.eye(5))
     await new_dandiset.upload()
     dandiset_id = new_dandiset.dandiset_id
     ds = Dataset(tmp_path / "ds" / dandiset_id)

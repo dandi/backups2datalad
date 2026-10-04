@@ -1151,7 +1151,12 @@ class AsyncDataset:
             log.debug("No subdatasets to uninstall")
 
     async def add_submodule(self, path: str, url: str, datalad_id: str) -> None:
-        await self.call_git("submodule", "add", "--", url, path)
+        # `--literal-pathspecs` (see `remove()`) reaches the index lookup and
+        # the `git add` inside `git submodule add`: without it, adding
+        # "a[1].zarr" fails if "a1.zarr" is already a submodule.  (A `path`
+        # starting with "-" fails regardless, and Git would ignore such a
+        # submodule anyway; see "Asset Paths on Command Lines" in CLAUDE.md.)
+        await self.call_git("--literal-pathspecs", "submodule", "add", "--", url, path)
         await self.set_repo_config(
             f"submodule.{path}.datalad-id",
             datalad_id,
