@@ -371,6 +371,36 @@ mirrored (2.3 PB of the archive's 2.4 PB)." (`util.describe_superdataset()`):
   description read "1.1 PB" against 2.4 PB because 001412's 1.2 PB of Zarrs
   was not being mirrored although its (stale) mirror existed and was counted.
 
+## Dataset Stats
+
+`AsyncDataset.get_stats()` counts a mirror's files and their total size,
+leaving out metadata files (`is_meta_file()`) and counting a Zarr submodule by
+its own mirror's stats, and caches the result in `dandi.stats` as
+`<commit>,<files>,<size>`:
+
+- It counts one commit: `HEAD`, resolved once up front, and the stats are
+  cached for that commit, so another process committing meanwhile cannot get
+  them filed under the wrong one.
+- Everything is read from that commit, never from the working tree.  It used
+  to match `git ls-tree HEAD` against `git annex find`, which lists the
+  *working tree*, so a file annexed but not yet committed by a concurrent run
+  raised `KeyError` (#139); Zarr submodules were likewise looked up in the
+  working tree's `.gitmodules`.  They now come from the commit's `.gitmodules`
+  (`get_submodule_urls()`).
+- `count_tree()` relies on annexed files being symlinks into the annex (the
+  mirrors never unlock files): `git ls-tree` lists the tree, `git cat-file
+  --batch` reads the symlinks' targets, and each annexed file's size is the
+  `-s` field of its key (`util.key_size()`); a key without one is an error.
+  An unlocked (pointer) file would be counted at its pointer's size.
+- That is a deliberate choice over git-annex, measured on a 100k-file tree:
+  ~0.6 s, against ~7 s for the old working-tree `git annex find --json`,
+  ~13-23 s for a commit-pinned `git annex find --branch`, and ~17 s for
+  `git annex info --fast <tree>` -- git-annex pays a large per-file cost
+  reading a tree.  `git annex info` also refuses matching options for a
+  tree, so it could not leave the (possibly annexed) `.dandi/` files out.
+- A Zarr's stats are those of its mirror's `HEAD`, not of the commit the
+  Dandiset records for it (see the TODO in `get_zarr_stats()`).
+
 ## S3 URLs Without a Region
 
 dandi-archive v1.0.11 (dandi-archive#2951, 2026-10-01) started reporting asset
