@@ -380,7 +380,7 @@ checked against it -- for assets.  The `text_dandiset` fixture includes such an
 asset, so every test using it syncs one; `test_core.py::test_obscure_asset_paths`
 adds a blob, a Zarr, an update and a deletion.  Asset names lack a tab, though
 dandi-archive admits one, because DataLad 1.6.5's `status` (hence
-`assert_repo_status()`) misreports such files; test helpers that parse Git
+`assert_repo_status()`) misreports such files (datalad/datalad#7953); test helpers that parse Git
 output use `-z` (`GitRepo.readcmd_z()`), since Git quotes such paths.  Use
 these names rather than inventing plain ones when a test adds paths.
 

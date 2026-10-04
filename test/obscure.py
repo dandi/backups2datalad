@@ -31,11 +31,12 @@ ASSET_PATH_REGEX = rf"^({ASSET_CHARS_REGEX}?\/?\.?{ASSET_CHARS_REGEX})+$"
 #: and escape, a trigger of Git's C-quoting of paths (backslash), and 001449's
 #: parentheses.  A tab, which it admits too, is left out: as of DataLad 1.6.5,
 #: `datalad status` (and thereby `assert_repo_status()`) misreports a file
-#: with a tab in its name as deleted.
+#: with a tab in its name as deleted (fixed by datalad/datalad#7953).
 DANDI_OBSCURE_PART = "[1]\\^`(#+~=,)"
 
-# As of DataLad 1.6.5, `UNICODE_FILENAME` is appended to the parts only where
-# the filesystem encoding is *not* UTF-8, so it is usually missing.
+# DataLad 1.3.2 to 1.6.5 append `UNICODE_FILENAME` to the parts only where the
+# filesystem encoding is *not* UTF-8, so it is usually missing
+# (datalad/datalad#7953).
 _unicode = "" if UNICODE_FILENAME in OBSCURE_FILENAME else UNICODE_FILENAME
 
 #: File names (no "/"), each obscure in its own way, since one name cannot both
