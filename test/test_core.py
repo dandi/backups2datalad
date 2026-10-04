@@ -429,6 +429,56 @@ async def test_binary(
     await new_dandiset.check_backup(Dataset(tmp_path / "dandisets" / dandiset_id))
 
 
+@pytest.mark.ai_generated
+async def test_unusual_asset_paths(
+    docker_archive: Archive, new_dandiset: SampleDandiset, tmp_path: Path
+) -> None:
+    # Whitespace and parentheses (as in 001449, #103), a glob character class
+    # and a leading dash, all of which dandi-archive admits in asset paths;
+    # cf. `test_unusual_paths.py`.
+    di = DandiDatasetter(
+        dandi_client=new_dandiset.client,
+        config=BackupConfig(
+            backup_root=tmp_path,
+            dandi_instance=docker_archive.instance_id,
+            s3bucket=docker_archive.s3bucket,
+            s3endpoint=docker_archive.s3endpoint,
+            content_url_regex=f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/.*blobs/",
+        ),
+    )
+    stem = (
+        "derivatives/sub-A1/ses-1/micr/"
+        "sub-A1_ses-1_space-Unified mouse brain atlas (Kim lab)"
+    )
+    new_dandiset.add_text(f"{stem}_desc-atlas_cells.tsv", "x\ty\n1\t2\n")
+    new_dandiset.add_blob(f"{stem}_desc-heatmap_SPIM.tif", b"\0\1\2\3\4\5")
+    new_dandiset.add_text("foo1.txt", "foo1\n")
+    new_dandiset.add_text("foo[1].txt", "foo[1]\n")
+    new_dandiset.add_text("-leading-dash.txt", "dash\n")
+    await new_dandiset.upload()
+    dandiset_id = new_dandiset.dandiset_id
+    ds = Dataset(tmp_path / "dandisets" / dandiset_id)
+    log.info("test_unusual_asset_paths: Syncing test dandiset")
+    await di.update_from_backup([dandiset_id])
+    await new_dandiset.check_backup(ds)
+
+    # An updated asset is removed before it is fetched again, and a removal of
+    # "foo[1].txt" that is not literal takes "foo1.txt" with it.
+    new_dandiset.add_text("foo[1].txt", "foo[1], modified\n")
+    await new_dandiset.upload()
+    log.info("test_unusual_asset_paths: Syncing modified asset")
+    await di.update_from_backup([dandiset_id])
+    await new_dandiset.check_backup(ds)
+
+    new_dandiset.rmasset("foo[1].txt")
+    asset = await new_dandiset.dandiset.aget_asset_by_path("foo[1].txt")
+    await new_dandiset.client.delete(asset.api_path)
+    await new_dandiset.settle()
+    log.info("test_unusual_asset_paths: Syncing deleted asset")
+    await di.update_from_backup([dandiset_id])
+    await new_dandiset.check_backup(ds)
+
+
 async def test_custom_commit_date(tmp_path: Path) -> None:
     ds = AsyncDataset(tmp_path)
     assert await ds.ensure_installed("Test dataset")

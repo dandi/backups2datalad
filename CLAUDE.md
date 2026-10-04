@@ -344,6 +344,31 @@ that many times over, and file descriptors run out (`EMFILE`):
 Per-asset work that needs a subprocess or an open file has to happen behind
 such a bound.
 
+## Asset Paths on Command Lines
+
+Asset paths come from the archive and are passed to Git and git-annex as they
+are.  dandi-archive's `ASSET_CHARS_REGEX` (`[A-z0-9(),&\s#+~_=-]`) admits
+whitespace and parentheses (001449's "space-Unified mouse brain atlas (Kim
+lab)", #103), a leading `-`, and -- through the `A-z` range -- `[`, `]` and
+`\`.  Hence:
+
+- Commands are argument lists, never shell strings; `shlex` only renders them
+  for logs.
+- Git takes paths as *pathspecs*, i.e. globs: `git rm -- 'foo[1].txt'` removes
+  `foo1.txt` as well.  Pass `--literal-pathspecs` (a top-level option, so it
+  goes before the subcommand: `call_git("--literal-pathspecs", "rm", ...)`)
+  wherever an asset path reaches one, including `--pathspec-from-file`; or use
+  `:(literal)` per path, as `get_superds_commit_message()` does.
+- Put `--` before paths.  `git annex add` matches its paths literally already,
+  but takes `-foo` for an option without `--`.
+- The `--batch` protocols (`fromkey`, `examinekey`, `addurl --with-files`,
+  `registerurl`) split each line at its first space only, so the path may
+  contain spaces, and `addurl`'s JSON `file` comes back verbatim.  Only a
+  newline in a path (which `\s` also admits) would break them.
+
+`test/test_unusual_paths.py` covers these without Docker;
+`test_core.py::test_unusual_asset_paths` covers a full sync.
+
 ## Superdataset Description
 
 `DandiDatasetter.set_superds_description()` sets the GitHub description of

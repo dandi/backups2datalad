@@ -12,6 +12,7 @@ from operator import attrgetter
 import os
 import os.path
 from pathlib import Path, PurePosixPath
+import shlex
 import subprocess
 from types import TracebackType
 
@@ -590,11 +591,12 @@ async def async_assets(
             await ds.add(".dandi/assets.json")
 
             for fpath in dm.need_add:
-                manager.log.info("Manually running `git add %s`", fpath)
+                manager.log.info("Manually running `git add %s`", shlex.quote(fpath))
                 try:
-                    await ds.call_git("add", fpath)
+                    # `--literal-pathspecs`: see `AsyncDataset.remove()`
+                    await ds.call_git("--literal-pathspecs", "add", "--", fpath)
                 except subprocess.CalledProcessError:
-                    manager.log.error("Manual `git add %s` failed", fpath)
+                    manager.log.error("Manual `git add %s` failed", shlex.quote(fpath))
                     dm.report.failed += 1
 
             timestamp = dm.last_timestamp

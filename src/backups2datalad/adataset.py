@@ -634,8 +634,9 @@ class AsyncDataset:
                 raise
 
     async def add(self, path: str) -> None:
-        # `path` must be relative to the root of the dataset
-        await self.call_annex("add", path)
+        # `path` must be relative to the root of the dataset.  git-annex takes
+        # it literally, but would take a leading "-" for an option.
+        await self.call_annex("add", "--", path)
 
     async def remove(self, path: str) -> None:
         # `path` must be relative to the root of the dataset
@@ -645,7 +646,12 @@ class AsyncDataset:
             self.ds.repo.precommit()
 
             async def _do_remove() -> None:
+                # `--literal-pathspecs`, because asset paths may contain `[`,
+                # `]` and `\` (dandi-archive's `ASSET_CHARS_REGEX` admits the
+                # whole `A-z` range), which Git would otherwise match as a
+                # glob: removing `foo[1].txt` would remove `foo1.txt` as well.
                 await self.call_git(
+                    "--literal-pathspecs",
                     "rm",
                     "-f",
                     "--ignore-unmatch",
@@ -673,7 +679,9 @@ class AsyncDataset:
                         print(p, end="\0", file=fp)
                     fp.flush()
                     fp.seek(0)
+                    # `--literal-pathspecs`: see `remove()`
                     await self.call_git(
+                        "--literal-pathspecs",
                         "rm",
                         "-f",
                         "--ignore-unmatch",
