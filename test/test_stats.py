@@ -6,7 +6,6 @@ may have left disagreeing with it (#139).
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from pathlib import Path
 import subprocess
 
@@ -49,14 +48,17 @@ async def test_get_stats_counts_head_not_worktree(tmp_path: Path) -> None:
     write(path / "data.bin", b"x" * 1000)
     write(path / "sub-1" / "more.bin", b"y" * 500)
     write(path / ".dandi" / "assets.json", b"[]" * 5000)
-    git(path, "annex", "add", "-q", "data.bin", "sub-1", ".dandi")
-    write(path / "small.txt", "hello\n")
     write(path / "dandiset.yaml", "identifier: '000001'\n")
-    git(path, "annex", "add", "-q", "--force-small", "small.txt", "dandiset.yaml")
+    # Annexed metadata, as under a low BACKUPS2DATALAD_TEXT_SIZE_LIMIT
+    git(path, "annex", "add", "-q", "data.bin", "sub-1", ".dandi", "dandiset.yaml")
+    write(path / "small.txt", "hello\n")
+    write(path / ".dandi" / "assets-state.json", "{}\n")
+    git(path, "annex", "add", "-q", "--force-small", "small.txt", ".dandi")
     git(path, "commit", "-q", "-m", "Add files")
     # Annexed files are counted by their keys' sizes, the rest by their blobs'
-    # sizes; metadata files are not counted, whether in git (dandiset.yaml) or
-    # annexed (.dandi/)
+    # sizes; metadata files are not counted, whether in git
+    # (.dandi/assets-state.json) or annexed, in a directory (.dandi/assets.json)
+    # or not (dandiset.yaml)
     expected = DatasetStats(files=3, size=1000 + 500 + 6)
 
     # What an interrupted or concurrent run may leave behind (#139): an
@@ -108,10 +110,8 @@ async def test_get_stats_cached_for_counted_commit(
 
     get_annexed_tree_stats = AsyncDataset.get_annexed_tree_stats
 
-    async def count_then_commit(
-        self: AsyncDataset, commit: str, exclude: Iterable[str] = ()
-    ) -> DatasetStats:
-        r = await get_annexed_tree_stats(self, commit, exclude)
+    async def count_then_commit(self: AsyncDataset, commit: str) -> DatasetStats:
+        r = await get_annexed_tree_stats(self, commit)
         write(path / "more.bin", b"y" * 50)
         git(path, "annex", "add", "-q", "more.bin")
         git(path, "commit", "-q", "-m", "Add more")

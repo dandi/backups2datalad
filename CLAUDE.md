@@ -388,16 +388,17 @@ its own mirror's stats, and caches the result in `dandi.stats` as
   `datalad subdatasets`, i.e. the working tree's `.gitmodules`.
 - `git ls-tree` counts the files and sizes the ones in Git.  The annexed ones
   are sized by `git annex info --fast <commit>` (`get_annexed_tree_stats()`),
-  less `git annex info` of any metadata directory holding annexed files
-  (`<commit>:.dandi`, as `.dandi/assets.json` may be annexed); `git annex info`
-  refuses matching options for a tree, so this is the way to leave them out.
-  A key without a size makes it report e.g. `5500 (+ 1 unknown size)`, which
-  is an error.
+  less the annexed metadata files -- `.dandi/assets.json`, or even
+  `dandiset.yaml` under a low `BACKUPS2DATALAD_TEXT_SIZE_LIMIT` (see
+  `test_large_text_asset`) -- each sized by its key with DataLad's
+  `AnnexRepo.get_size_from_key()`.  (`git annex info` refuses matching
+  options for a tree, and `<commit>:.dandi` would cover directories but not a
+  top-level file.)  A key without a size makes `git annex info` report e.g.
+  `5500 (+ 1 unknown size)`, which is an error.
 - An annexed file is told apart in `ls-tree` by being a symlink (the mirrors
   never unlock files), and the count is checked against git-annex's: a symlink
   not into the annex, or an unlocked file, fails the count rather than skews
-  it.  So does an annexed top-level metadata file such as `dandiset.yaml`,
-  which is not a tree that `git annex info` could subtract.
+  it.
 - Zarr URLs come from the commit's `.gitmodules`
   (`get_repo_config(..., blob="<commit>:.gitmodules")`), following the
   submodule-name-is-path convention used throughout.

@@ -27,6 +27,7 @@ from anyio.to_thread import run_sync
 from dandi.consts import EmbargoStatus
 from datalad.api import Dataset
 from datalad.runner.exception import CommandError
+from datalad.support.annexrepo import AnnexRepo
 from ghrepo import GHRepo
 from pydantic import BaseModel
 import requests
@@ -719,41 +720,32 @@ class AsyncDataset:
                     raise
                 yield fst
 
-    async def get_annexed_tree_stats(
-        self, commit: str, exclude: Iterable[str] = ()
-    ) -> DatasetStats:
+    async def get_annexed_tree_stats(self, commit: str) -> DatasetStats:
         """
-        The number and total size of the annexed files in ``commit``, less
-        those under the directories in ``exclude``, as ``git annex info``
-        counts them
+        The number and total size of the annexed files in ``commit``, as
+        ``git annex info`` counts them
         """
-        trees = [commit, *(f"{commit}:{d}" for d in exclude)]
-        out = await self.read_git(
-            # A read-only query: no need to merge git-annex branches
-            "-c",
-            "annex.merge-annex-branches=false",
-            "annex",
-            "info",
-            "--fast",
-            "--json",
-            "--bytes",
-            *trees,
+        info = json.loads(
+            await self.read_git(
+                # A read-only query: no need to merge git-annex branches
+                "-c",
+                "annex.merge-annex-branches=false",
+                "annex",
+                "info",
+                "--fast",
+                "--json",
+                "--bytes",
+                commit,
+            )
         )
-        # One record per tree: the whole one first, then those to subtract
-        stats = DatasetStats(files=0, size=0)
-        for i, line in enumerate(out.splitlines()):
-            info = json.loads(line)
-            # A key that records no size makes this e.g. "5500 (+ 1 unknown size)"
-            size = info["size of annexed files in tree"]
-            if not size.isdigit():
-                raise RuntimeError(
-                    f"{self.path}: cannot size annexed files in {info['tree']}:"
-                    f" git-annex reports {size!r}"
-                )
-            sign = 1 if i == 0 else -1
-            stats.files += sign * info["annexed files in tree"]
-            stats.size += sign * int(size)
-        return stats
+        # A key that records no size makes this e.g. "5500 (+ 1 unknown size)"
+        size = info["size of annexed files in tree"]
+        if not size.isdigit():
+            raise RuntimeError(
+                f"{self.path}: cannot size annexed files in {commit}: git-annex"
+                f" reports {size!r}"
+            )
+        return DatasetStats(files=info["annexed files in tree"], size=int(size))
 
     async def aiter_annexed_files(self) -> AsyncGenerator[AnnexedFile, None]:
         async with aclosing(
@@ -1046,15 +1038,15 @@ class AsyncDataset:
         files = 0
         size = 0
         # Annexed files are symlinks (the mirrors never unlock files), sized
-        # by git-annex below, less any in metadata directories
+        # by git-annex below, less the annexed metadata files
         symlinks = 0
-        annexed_meta: set[str] = set()
+        annexed_meta: list[str] = []
         submodules: list[str] = []
         async with aclosing(self.aiter_file_stats(commit)) as fstats:
             async for filestat in fstats:
                 if is_meta_file(filestat.path, dandiset=True):
                     if filestat.mode == SYMLINK_MODE:
-                        annexed_meta.add(filestat.path.split("/")[0])
+                        annexed_meta.append(filestat.object)
                 elif filestat.type is ObjectType.COMMIT:
                     submodules.append(filestat.path)
                 else:
@@ -1065,7 +1057,19 @@ class AsyncDataset:
                         assert filestat.size is not None
                         size += filestat.size
         if symlinks or annexed_meta:
-            annexed = await self.get_annexed_tree_stats(commit, sorted(annexed_meta))
+            annexed = await self.get_annexed_tree_stats(commit)
+            for blob in annexed_meta:
+                # E.g. .dandi/assets.json, or dandiset.yaml under a low
+                # BACKUPS2DATALAD_TEXT_SIZE_LIMIT: few, so read one by one.
+                # A symlink's blob is its target, which ends in the key.
+                key = Path(await self.read_git("cat-file", "blob", blob)).name
+                if (keysize := AnnexRepo.get_size_from_key(key)) is None:
+                    raise RuntimeError(
+                        f"{self.path}: cannot size annexed metadata file with"
+                        f" key {key} in {commit}"
+                    )
+                annexed.files -= 1
+                annexed.size -= keysize
             if annexed.files != symlinks:
                 raise RuntimeError(
                     f"{self.path}: git-annex counts {annexed.files} annexed"
@@ -1261,17 +1265,19 @@ class FileStat:
     path: str
     mode: str
     type: ObjectType
+    object: str
     #: For a symlink, the size of the link, not of the annexed file
     size: int | None
 
     @classmethod
     def from_entry(cls, entry: str) -> FileStat:
         stats, _, path = entry.partition("\t")
-        mode, typename, _, sizestr = stats.split()
+        mode, typename, obj, sizestr = stats.split()
         return cls(
             path=path,
             mode=mode,
             type=ObjectType(typename),
+            object=obj,
             size=None if sizestr == "-" else int(sizestr),
         )
 
