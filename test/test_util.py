@@ -26,6 +26,17 @@ class GitRepo:
         assert isinstance(r.stdout, str)
         return r.stdout.strip()
 
+    def readcmd_z(self, *args: str | Path) -> list[str]:
+        """
+        The NUL-terminated fields output by a Git command given ``-z``: unlike
+        lines, they hold paths verbatim (neither quoted nor stripped)
+        """
+        r = self.runcmd(*args, stdout=subprocess.PIPE, text=True, check=True)
+        assert isinstance(r.stdout, str)
+        fields = r.stdout.split("\0")
+        assert fields.pop() == ""
+        return fields
+
     def get_tag_date(self, tag: str) -> str:
         return unzulu(
             self.readcmd(
@@ -78,14 +89,10 @@ class GitRepo:
         return self.readcmd("tag", "-l", "--sort=creatordate").splitlines()
 
     def get_diff_tree(self, commitish: str) -> dict[str, str]:
-        stat = self.readcmd(
-            "diff-tree", "--no-commit-id", "--name-status", "-r", commitish
+        fields = self.readcmd_z(
+            "diff-tree", "--no-commit-id", "--name-status", "-r", "-z", commitish
         )
-        status: dict[str, str] = {}
-        for line in stat.splitlines():
-            sym, _, path = line.partition("\t")
-            status[path] = sym
-        return status
+        return dict(zip(fields[1::2], fields[::2]))
 
     def get_backup_commits(self) -> list[str]:
         return self.readcmd(
@@ -95,9 +102,7 @@ class GitRepo:
     def get_asset_files(self, commitish: str) -> set[str]:
         return {
             fname
-            for fname in self.readcmd(
-                "ls-tree", "-r", "--name-only", commitish
-            ).splitlines()
+            for fname in self.readcmd_z("ls-tree", "-r", "--name-only", "-z", commitish)
             if not is_meta_file(fname, dandiset=True)
         }
 

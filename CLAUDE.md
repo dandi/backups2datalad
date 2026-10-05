@@ -344,6 +344,46 @@ that many times over, and file descriptors run out (`EMFILE`):
 Per-asset work that needs a subprocess or an open file has to happen behind
 such a bound.
 
+## Asset Paths on Command Lines
+
+Asset paths come from the archive and are passed to Git and git-annex as they
+are.  dandi-archive's `ASSET_CHARS_REGEX` (`[A-z0-9(),&\s#+~_=-]`) admits
+whitespace and parentheses (001449's "space-Unified mouse brain atlas (Kim
+lab)", #103), a leading `-`, and -- through the `A-z` range -- `[`, `]` and
+`\`.  Hence:
+
+- Commands are argument lists, never shell strings; `shlex` only renders them
+  for logs.
+- Git takes paths as *pathspecs*, i.e. globs: `git rm -- 'foo[1].txt'` removes
+  `foo1.txt` as well.  Pass `--literal-pathspecs` (a top-level option, so it
+  goes before the subcommand: `call_git("--literal-pathspecs", "rm", ...)`)
+  wherever an asset path reaches one, including `--pathspec-from-file`; or use
+  `:(literal)` per path, as `get_superds_commit_message()` does.
+- Put `--` before paths.  `git annex add` matches its paths literally already,
+  but takes `-foo` for an option without `--`.
+- `git submodule add` needs `--literal-pathspecs` too (otherwise adding Zarr
+  `a[1].zarr` fails when `a1.zarr` is already a submodule).  A Zarr whose path
+  starts with `-` cannot be mirrored as a submodule at all: `git submodule add`
+  runs an inner `git add` without `--` (still so in Git's `master` as of
+  2026-10), and Git ignores a submodule with such a path anyway, as it "may be
+  interpreted as a command-line option".
+- The `--batch` protocols (`fromkey`, `examinekey`, `addurl --with-files`,
+  `registerurl`) split each line at its first space only, so the path may
+  contain spaces, and `addurl`'s JSON `file` comes back verbatim.  Only a
+  newline in a path (which `\s` also admits) would break them.
+
+Tests use the names in `test/obscure.py`, derived from DataLad's
+`OBSCURE_FILENAME` (`' |;&%b5{}\'"<> .datc '` on Linux): `OBSCURE_NAMES` where
+dandi-archive is not involved (`test/test_unusual_paths.py`, no Docker), and
+`obscure_asset_path()` -- as obscure as dandi-archive's regex allows, and
+checked against it -- for assets.  The `text_dandiset` fixture includes such an
+asset, so every test using it syncs one; `test_core.py::test_obscure_asset_paths`
+adds a blob, a Zarr, an update and a deletion.  Asset names lack a tab, though
+dandi-archive admits one, because DataLad 1.6.5's `status` (hence
+`assert_repo_status()`) misreports such files (datalad/datalad#7953); test helpers that parse Git
+output use `-z` (`GitRepo.readcmd_z()`), since Git quotes such paths.  Use
+these names rather than inventing plain ones when a test adds paths.
+
 ## Superdataset Description
 
 `DandiDatasetter.set_superds_description()` sets the GitHub description of

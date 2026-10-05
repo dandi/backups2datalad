@@ -41,6 +41,7 @@ from dandi.upload import upload
 from dandischema.models import DigestType
 from datalad.api import Dataset
 from datalad.tests.utils_pytest import assert_repo_status
+from obscure import obscure_asset_path
 import pytest
 from test_util import find_filepaths, gitattributes_policy
 import zarr
@@ -615,6 +616,8 @@ async def text_dandiset(new_dandiset: SampleDandiset) -> AsyncIterator[SampleDan
         ("subdir1/apple.txt", "Apple\n"),
         ("subdir2/banana.txt", "Banana\n"),
         ("subdir2/coconut.txt", "Coconut\n"),
+        # So that every test using this fixture handles an obscure path too
+        (obscure_asset_path("obscure.txt"), "Obscure\n"),
     ]:
         new_dandiset.add_text(path, contents)
     await new_dandiset.upload()

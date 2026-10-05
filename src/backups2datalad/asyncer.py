@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Iterable
 from contextlib import aclosing
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -12,6 +12,7 @@ from operator import attrgetter
 import os
 import os.path
 from pathlib import Path, PurePosixPath
+import shlex
 import subprocess
 from types import TracebackType
 
@@ -550,6 +551,26 @@ async def run_downloader(
             nursery.start_soon(dm.asset_loop, aia)
 
 
+async def git_add_manually(
+    ds: AsyncDataset, paths: Iterable[str], log: PrefixedLogger
+) -> int:
+    """
+    `git add` each of ``paths``, which `addurl` failed to add, and return how
+    many of them failed again.  Pulled out of `async_assets()` so that a test
+    can reach it without making `addurl` fail.
+    """
+    failed = 0
+    for fpath in paths:
+        log.info("Manually running `git add %s`", shlex.quote(fpath))
+        try:
+            # `--literal-pathspecs`: see `AsyncDataset.remove()`
+            await ds.call_git("--literal-pathspecs", "add", "--", fpath)
+        except subprocess.CalledProcessError:
+            log.error("Manual `git add %s` failed", shlex.quote(fpath))
+            failed += 1
+    return failed
+
+
 async def async_assets(
     dandiset: RemoteDandiset,
     ds: AsyncDataset,
@@ -589,13 +610,7 @@ async def async_assets(
 
             await ds.add(".dandi/assets.json")
 
-            for fpath in dm.need_add:
-                manager.log.info("Manually running `git add %s`", fpath)
-                try:
-                    await ds.call_git("add", fpath)
-                except subprocess.CalledProcessError:
-                    manager.log.error("Manual `git add %s` failed", fpath)
-                    dm.report.failed += 1
+            dm.report.failed += await git_add_manually(ds, dm.need_add, manager.log)
 
             timestamp = dm.last_timestamp
             for zarr_id, zarrlink in dm.zarrs.items():
