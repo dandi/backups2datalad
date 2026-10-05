@@ -15,6 +15,8 @@ import pytest
 
 from backups2datalad.adataset import AsyncDataset
 from backups2datalad.annex import AsyncAnnex
+from backups2datalad.asyncer import git_add_manually
+from backups2datalad.logging import log as plog
 
 pytestmark = pytest.mark.anyio
 
@@ -117,6 +119,19 @@ async def test_add_obscure_paths(tmp_path: Path) -> None:
     write_files(ds.pathobj, OBSCURE_PATHS)
     for path in OBSCURE_PATHS:
         await ds.add(path)
+    staged = set(
+        git(ds.pathobj, "diff", "--cached", "--name-only", "-z").split("\0")
+    ) - {""}
+    assert staged == set(OBSCURE_PATHS)
+
+
+@pytest.mark.ai_generated
+async def test_git_add_manually_obscure_paths(tmp_path: Path) -> None:
+    ds = await make_dataset(tmp_path)
+    write_files(ds.pathobj, GLOB_SIBLINGS)
+    write_files(ds.pathobj, OBSCURE_PATHS)
+    failed = await git_add_manually(ds, [*OBSCURE_PATHS, "nonexistent.txt"], plog)
+    assert failed == 1
     staged = set(
         git(ds.pathobj, "diff", "--cached", "--name-only", "-z").split("\0")
     ) - {""}
