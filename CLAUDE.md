@@ -361,24 +361,44 @@ reset+clean 001412`; two more of its Zarrs showed the same signs in that run.
   delete it).  The ID commit is the last step of `datalad create` proper; a run
   killed during the `cfg_dandiset` procedure is repaired by
   `ensure_dandiset_policy()` as before.
-- **What is done about it**: the creation is rerun over the repository with
-  `datalad create --force`, followed by the rest of `ensure_installed()`'s
-  steps, and a WARNING (`creation of dataset at ... was interrupted; completing
-  it`).  `--force` keeps whatever was committed on top meanwhile and does not
-  duplicate the staged `.gitattributes` lines.  `before_create` is not
-  consulted: the mirror is not new, and its GitHub repository may have been made
-  by a run that built on it, which would trip the guard.  This is not a discard,
-  so it happens under `--mode verify` and whatever `--zarr-dirty` says.
+- **What is done about it** depends on whether the mirror was published, i.e.
+  has a `github` remote or `before_create` -- the guard that refuses to create
+  a mirror existing elsewhere (on GitHub; for a Dandiset, also in the
+  superdataset) -- raises `MirrorMissingError`:
+  - **Not published**: it is removed (DataLad's `rmtree`, which copes with
+    git-annex's read-only objects) and created anew, with a WARNING (`... was
+    interrupted and it was never published; removing it and creating it
+    anew`).  Nothing of it has left the machine, and anything committed on top
+    of it can be had from the archive again, so this is simpler and cleaner
+    than patching it up.
+  - **Published**: a mirror made anew would be refused by `before_create` and
+    could not be pushed over what was published, so the creation is instead
+    completed in place with `datalad create --force`, with a WARNING naming the
+    reason (`... but it was published since (...); completing it`).  `--force`
+    keeps whatever was committed on top and does not duplicate the staged
+    `.gitattributes` lines.  accbedc4 is such a case: the run that failed on
+    it had created its GitHub repository.
+
+  Either way the rest of `ensure_installed()`'s steps follow, under the same
+  shield.  Neither path is gated on `--zarr-dirty` or `--mode verify`: what
+  starting over discards is a mirror that never was one, all of whose content
+  the archive can provide again, not the local divergence verify exists to
+  report.  Afterwards DataLad's cached repository
+  object for the path is dropped from `AnnexRepo`/`GitRepo._unique_instances`
+  (under its own `.path`, the key `Dataset.repo` looks it up by): otherwise
+  `self.ds` goes on reporting the old annex UUID and no dataset ID for the rest
+  of the process.
 - **Not caught**: a process killed (not cancelled) after `datalad create`
   committed but before the `initremote`s leaves a mirror without the `dandiapi`
   remote that still passes `is_created()`.  The API URLs registered there
   (alongside the S3 ones) then fall to the plain `web` remote: still
   retrievable, just without `dandiapi`'s cost ordering.  Not worth a second
   check per visit.
-- **Finding them**: on drogon, from the backup root,
-  `for d in dandisets/[0-9]*/ dandizarrs/*/; do git -C "$d" config --blob
-  HEAD:.datalad/config --get datalad.dataset.id >/dev/null 2>&1 || echo "$d";
-  done` lists the mirrors the next run will complete.
+- **Finding them**: `tools/find-interrupted-create`, run from the backup root
+  on drogon (or given the mirror directories), lists the mirrors the next run
+  will redo or complete.  It uses `find`, not a shell glob over every Zarr, and
+  only looks at directories with a `.git` of their own, since `git -C` in an
+  uninstalled submodule would consult the superdataset instead.
 
 ## Per-Asset Fan-Out
 

@@ -28,6 +28,8 @@ from dandi.consts import EmbargoStatus
 from datalad.api import Dataset
 from datalad.runner.exception import CommandError
 from datalad.support.annexrepo import AnnexRepo
+from datalad.support.gitrepo import GitRepo
+from datalad.utils import rmtree
 from ghrepo import GHRepo
 from pydantic import BaseModel
 import requests
@@ -52,7 +54,14 @@ from .procedures.cfg_dandiset import (
     ensure_dotfiles,
     get_size_limit,
 )
-from .util import custom_commit_env, exp_wait, is_meta_file, key2hash, quantify
+from .util import (
+    MirrorMissingError,
+    custom_commit_env,
+    exp_wait,
+    is_meta_file,
+    key2hash,
+    quantify,
+)
 
 EMBARGO_STATUS_KEY = "dandi.dandiset.embargo-status"
 
@@ -91,8 +100,8 @@ class AsyncDataset:
         before_create: Callable[[], Awaitable[None]] | None = None,
     ) -> bool:
         # Returns True if the dataset was freshly created, or if an earlier
-        # run's interrupted creation of it was completed.  `before_create` may
-        # veto creation by raising.
+        # run's interrupted creation of it was redone or completed.
+        # `before_create` may veto creation by raising.
         argv = [
             "datalad",
             "-c",
@@ -101,6 +110,8 @@ class AsyncDataset:
             f"datalad.locations.extra-procedures={PROCEDURES_DIR}",
             "create",
         ]
+        start_over = False
+        cached_repo_path: str | None = None
         if self.ds.is_installed():
             if await self.is_created():
                 if cfg_proc is not None:
@@ -111,19 +122,43 @@ class AsyncDataset:
                 return False
             # `datalad create` was killed before its first commit, leaving a
             # repository with `.gitattributes` staged and perhaps
-            # `.datalad/config` written, but no commit.  Building on
-            # it would leave the mirror without a dataset ID, the annex backend
-            # or the special remotes, and `--zarr-dirty=reset+clean` would
-            # "clean" it into exactly that.  Rerun the creation over it
-            # instead, keeping whatever was committed on top meanwhile.
-            # `before_create` is not consulted: this is not a new mirror, and
-            # its GitHub repository may well exist, made by such a later run.
-            log.warning(
-                "%s: creation of dataset at %s was interrupted; completing it",
-                desc,
-                self.path,
-            )
-            argv.append("--force")
+            # `.datalad/config` written, but no commit.  Building on it would
+            # leave the mirror without a dataset ID, the annex backend or the
+            # special remotes, and `--zarr-dirty=reset+clean` would "clean" it
+            # into exactly that.
+            cached_repo_path = self.ds.repo.path
+            why = "it has a `github` remote"
+            if not (published := await self.has_github_remote()) and (
+                before_create is not None
+            ):
+                try:
+                    await before_create()
+                except MirrorMissingError as e:
+                    published = True
+                    why = str(e)
+            if published:
+                # A later run built on it and published that: a mirror made
+                # anew would be refused by `before_create` and could not be
+                # pushed over what was published, so complete this one,
+                # keeping whatever was committed on top of it.
+                log.warning(
+                    "%s: creation of dataset at %s was interrupted, but it"
+                    " was published since (%s); completing it",
+                    desc,
+                    self.path,
+                    why,
+                )
+                argv.append("--force")
+            else:
+                # Nothing of it has left this machine, and everything in it
+                # can be had from the archive again, so start from scratch.
+                log.warning(
+                    "%s: creation of dataset at %s was interrupted and it was"
+                    " never published; removing it and creating it anew",
+                    desc,
+                    self.path,
+                )
+                start_over = True
         else:
             if before_create is not None:
                 await before_create()
@@ -136,6 +171,8 @@ class AsyncDataset:
         # one failed Zarr cancels the other Zarr syncs in flight, and any of
         # them still creating its mirror would be left half-made.
         with anyio.CancelScope(shield=True):
+            if start_over:
+                await run_sync(rmtree, self.pathobj)
             await aruncmd(
                 *argv,
                 env={
@@ -170,6 +207,14 @@ class AsyncDataset:
                     backup_remote.name,
                     "(not metadata=distribution-restrictions=*)",
                 )
+        if cached_repo_path is not None:
+            # DataLad caches its repository object per path, and would go on
+            # reporting what it read before: the dataset ID as missing and,
+            # after starting over, the old repository's annex UUID.  Forgetting
+            # it -- under the key `Dataset.repo` looks it up by -- makes
+            # `self.ds` look anew.
+            for cls in (AnnexRepo, GitRepo):
+                cls._unique_instances.pop(cached_repo_path, None)
         log.debug("Dataset for %s created", desc)
         return True
 
