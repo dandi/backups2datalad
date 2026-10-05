@@ -1,0 +1,36 @@
+#!/bin/bash
+# List the mirrors whose `datalad create` never completed: installed (they have
+# a `.git`) but with no `datalad.dataset.id` committed in `.datalad/config` at
+# `HEAD` -- the same test as `AsyncDataset.is_created()`.  The next backup run
+# to visit one completes its creation in place; see "Interrupted Dataset
+# Creation" in CLAUDE.md.
+#
+# Usage: find-interrupted-create [MIRRORS_DIR ...]
+#
+# Each MIRRORS_DIR holds mirrors as its immediate subdirectories; the default
+# is `dandisets dandizarrs`, i.e. run it from the backup root.  Mirrors are
+# printed one per line, and any whose check failed otherwise (e.g. Git's
+# "dubious ownership") are reported on stderr.
+#
+# `find` rather than a shell glob, which would have to expand every Zarr.
+
+set -eu -o pipefail
+
+if [ $# -eq 0 ]; then
+    set -- dandisets dandizarrs
+fi
+
+# Only directories with a `.git` of their own: `git -C` in an uninstalled
+# submodule's empty directory would consult the superdataset instead.
+find "$@" -mindepth 2 -maxdepth 2 -name .git -printf '%h\0' |
+while IFS= read -r -d '' d; do
+    rc=0
+    git -C "$d" config --blob HEAD:.datalad/config --get datalad.dataset.id \
+        >/dev/null 2>&1 || rc=$?
+    case $rc in
+        0) ;;
+        # No commit, no `.datalad/config` in it, or no ID in that
+        1) printf '%s\n' "$d" ;;
+        *) printf '%s: git config exited with %d\n' "$d" "$rc" >&2 ;;
+    esac
+done

@@ -135,7 +135,12 @@ async def test_installed_dataset_is_not_checked(tmp_path: Path) -> None:
     ds_path = tmp_path / "000026"
     ds_path.mkdir()
     git(ds_path, "init", "-q", "-b", "draft")
-    git(ds_path, "commit", "-q", "--allow-empty", "-m", "initial")
+    # A committed dataset ID is what tells a created dataset from one whose
+    # creation was interrupted (see test_interrupted_create.py):
+    (ds_path / ".datalad").mkdir()
+    git(ds_path, "config", "-f", ".datalad/config", "datalad.dataset.id", "x")
+    git(ds_path, "add", ".datalad/config")
+    git(ds_path, "commit", "-q", "-m", "initial")
 
     async def before_create() -> None:
         raise AssertionError("guard consulted for an installed dataset")
