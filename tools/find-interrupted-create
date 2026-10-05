@@ -2,9 +2,8 @@
 # List the mirrors whose `datalad create` never completed: installed (they have
 # a `.git`) but with no `datalad.dataset.id` committed in `.datalad/config` at
 # `HEAD` -- the same test as `AsyncDataset.is_created()`.  The next backup run
-# to visit one removes it and creates it anew or, if it was published in the
-# meantime, completes it in place; see "Interrupted Dataset Creation" in
-# CLAUDE.md.
+# to visit one completes its creation in place; see "Interrupted Dataset
+# Creation" in CLAUDE.md.
 #
 # Usage: find-interrupted-create [MIRRORS_DIR ...]
 #
