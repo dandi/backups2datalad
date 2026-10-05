@@ -111,6 +111,27 @@ async def main(
     log.info("COMMAND: %s", shlex.join(sys.argv))
 
 
+def zarr_dirty_banner(config: BackupConfig) -> str | None:
+    """
+    The warning to start a run with about what will happen to dirty Zarr
+    mirrors, if anything out of the ordinary.  It never contains the per-Zarr
+    ``ZARR-RESET:`` token, so that grepping for that counts Zarrs and not this.
+    """
+    if config.zarr_dirty is not ZarrDirty.RESET_CLEAN:
+        return None
+    if config.mode is Mode.VERIFY:
+        # `sync_zarr()` never discards under verify; say so up front rather
+        # than promise discards and then fail on the first dirty Zarr.
+        return (
+            "zarr_dirty=reset+clean is ignored under --mode verify: a dirty"
+            " Zarr mirror fails its Dandiset as with 'error'"
+        )
+    return (
+        "Dirty Zarr mirrors will have their uncommitted state discarded"
+        " irrecoverably; see the ZARR-RESET lines"
+    )
+
+
 P = ParamSpec("P")
 
 
@@ -280,13 +301,8 @@ async def update_from_backup(
             datasetter.config.zarr_mode = zarr_mode
         if zarr_dirty is not None:
             datasetter.config.zarr_dirty = ZarrDirty(zarr_dirty)
-        if datasetter.config.zarr_dirty is ZarrDirty.RESET_CLEAN:
-            # Deliberately does not contain the per-Zarr `ZARR-RESET:` token,
-            # so that grepping for that counts Zarrs and not this banner.
-            log.warning(
-                "Dirty Zarr mirrors will have their uncommitted state"
-                " discarded irrecoverably; see ZARR-RESET: lines"
-            )
+        if (banner := zarr_dirty_banner(datasetter.config)) is not None:
+            log.warning("%s", banner)
         if gc_assets is not None:
             datasetter.config.gc_assets = gc_assets
         if quiescent_period is not None:

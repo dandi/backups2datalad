@@ -314,18 +314,71 @@ Four properties to preserve when touching this:
   ask.  The gate is `config.mode`, deliberately not the `error_on_change` flag,
   which verify passes down only when it *also* finds the timestamp unchanged --
   gating on that would still discard when verifying a Dandiset that had changed.
+  The startup banner (`zarr_dirty_banner()` in `__main__.py`) says so when
+  both are in effect, rather than promise discards the run will not make.
 
 Each reset logs one WARNING led by `ZARR-RESET:` so that a run over tens of
 thousands of Zarrs can be audited with `grep -c 'ZARR-RESET:'`.  What made the
 mirror dirty is deliberately *not* listed: there can be thousands of paths, and
 limiting that sensibly buys nothing the count does not already give.  The
-startup banner avoids the token so it does not inflate the count.
+startup banner avoids the token so it does not inflate the count (it once read
+"see ZARR-RESET: lines", so `test_zarr_dirty_banner` now checks).
 
 `git reset --hard` and `git clean -dfx` do not touch `.git/annex`, so annexed
 content survives as (possibly unreferenced) objects and is not re-downloaded;
 what a reset costs is the wall clock of re-registering keys, not bytes.  What is
 genuinely lost is uncommitted work, irrecoverably -- there is no evidence kept
 today.
+
+## Interrupted Dataset Creation
+
+`AsyncDataset.ensure_installed()` creates a mirror in several steps --
+`datalad create` (`git init`, `git annex init`, stage `.gitattributes`, write
+`.datalad/config`, commit), then the embargo commit and the `initremote`s --
+and used to take `Dataset.is_installed()`, i.e. "there is a `.git`", to mean
+they had all happened.  `datalad create` killed between staging
+`.gitattributes` and its first commit leaves a repository with no commit, no
+dataset ID, and `A  .gitattributes` in `git status`.  Later runs built on it
+(`sync_zarr()` committed `.dandi/.gitattributes` as the root commit and created
+the GitHub repository) and then failed it as dirty; `--zarr-dirty=reset+clean`
+would have "cleaned" it into a mirror with no dataset ID, annex backend,
+`**/.git*` rule or `dandiapi` remote, which `get_datalad_id()` then trips over
+when the Zarr is added to its Dandiset.  001412's Zarr accbedc4-... was found
+that way in 2026-10, failing `update-from-backup --mode verify --zarr-dirty
+reset+clean 001412`; two more of its Zarrs showed the same signs in that run.
+
+- **What kills it**: cancellation.  anyio kills the subprocess running when a
+  task is cancelled, and one failed Zarr cancels the other Zarr syncs in flight
+  (see "Dirty Zarrs" above), any of which may be creating its mirror.  The
+  creation steps therefore run under `anyio.CancelScope(shield=True)`; a
+  sibling's failure now waits the few seconds it takes them to finish.  A
+  signal sent to the whole process group (Ctrl-C) still reaches `datalad
+  create` itself.
+- **How it is recognised**: `is_created()`, i.e. `HEAD:.datalad/config`
+  carries `datalad.dataset.id` -- one `git config --blob` per visit.  `HEAD`,
+  not the working tree: a creation killed after writing `.datalad/config` but
+  before committing it leaves the file uncommitted (and `reset+clean` would
+  delete it).  The ID commit is the last step of `datalad create` proper; a run
+  killed during the `cfg_dandiset` procedure is repaired by
+  `ensure_dandiset_policy()` as before.
+- **What is done about it**: the creation is rerun over the repository with
+  `datalad create --force`, followed by the rest of `ensure_installed()`'s
+  steps, and a WARNING (`creation of dataset at ... was interrupted; completing
+  it`).  `--force` keeps whatever was committed on top meanwhile and does not
+  duplicate the staged `.gitattributes` lines.  `before_create` is not
+  consulted: the mirror is not new, and its GitHub repository may have been made
+  by a run that built on it, which would trip the guard.  This is not a discard,
+  so it happens under `--mode verify` and whatever `--zarr-dirty` says.
+- **Not caught**: a process killed (not cancelled) after `datalad create`
+  committed but before the `initremote`s leaves a mirror without the `dandiapi`
+  remote that still passes `is_created()`.  The API URLs registered there
+  (alongside the S3 ones) then fall to the plain `web` remote: still
+  retrievable, just without `dandiapi`'s cost ordering.  Not worth a second
+  check per visit.
+- **Finding them**: on drogon, from the backup root,
+  `for d in dandisets/[0-9]*/ dandizarrs/*/; do git -C "$d" config --blob
+  HEAD:.datalad/config --get datalad.dataset.id >/dev/null 2>&1 || echo "$d";
+  done` lists the mirrors the next run will complete.
 
 ## Per-Asset Fan-Out
 

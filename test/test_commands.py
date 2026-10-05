@@ -15,10 +15,15 @@ import numpy as np
 import pytest
 from test_util import GitRepo
 
-from backups2datalad.__main__ import backup_zarrs, main, update_from_backup
+from backups2datalad.__main__ import (
+    backup_zarrs,
+    main,
+    update_from_backup,
+    zarr_dirty_banner,
+)
 from backups2datalad.adataset import AssetsState, AsyncDataset
 from backups2datalad.aioutil import areadcmd
-from backups2datalad.config import BackupConfig, Remote, ResourceConfig, ZarrDirty
+from backups2datalad.config import BackupConfig, Mode, Remote, ResourceConfig, ZarrDirty
 from backups2datalad.logging import log as plog
 from backups2datalad.manager import Manager
 from backups2datalad.zarr import sync_zarr
@@ -442,3 +447,26 @@ def test_zarr_dirty_cli_and_config_agree() -> None:
             )
             is ZarrDirty.RESET_CLEAN
         )
+
+
+@pytest.mark.ai_generated
+def test_zarr_dirty_banner() -> None:
+    """
+    The startup warning says what will actually happen to dirty Zarrs: under
+    `--mode verify`, which never discards, that `reset+clean` is ignored --
+    it used to promise discards there, and the run then failed on the first
+    dirty Zarr.  And it never carries the per-Zarr `ZARR-RESET:` token that
+    a run is audited by (it used to, inflating `grep -c` by one).
+    """
+    assert zarr_dirty_banner(BackupConfig()) is None
+    assert zarr_dirty_banner(BackupConfig(mode=Mode.VERIFY)) is None
+    reset = zarr_dirty_banner(BackupConfig(zarr_dirty=ZarrDirty.RESET_CLEAN))
+    assert reset is not None
+    assert "discarded" in reset
+    verify = zarr_dirty_banner(
+        BackupConfig(zarr_dirty=ZarrDirty.RESET_CLEAN, mode=Mode.VERIFY)
+    )
+    assert verify is not None
+    assert "ignored under --mode verify" in verify
+    for banner in (reset, verify):
+        assert "ZARR-RESET:" not in banner

@@ -90,18 +90,9 @@ class AsyncDataset:
         embargo_status: EmbargoStatus = EmbargoStatus.OPEN,
         before_create: Callable[[], Awaitable[None]] | None = None,
     ) -> bool:
-        # Returns True if the dataset was freshly created.  `before_create`
-        # may veto creation by raising.
-        if self.ds.is_installed():
-            if cfg_proc is not None:
-                # The dataset was created by an earlier run, possibly under an
-                # older policy; bring it up to date so that future commits
-                # abide by the current one.
-                await self.ensure_dandiset_policy()
-            return False
-        if before_create is not None:
-            await before_create()
-        log.info("Creating dataset for %s", desc)
+        # Returns True if the dataset was freshly created, or if an earlier
+        # run's interrupted creation of it was completed.  `before_create` may
+        # veto creation by raising.
         argv = [
             "datalad",
             "-c",
@@ -110,46 +101,93 @@ class AsyncDataset:
             f"datalad.locations.extra-procedures={PROCEDURES_DIR}",
             "create",
         ]
+        if self.ds.is_installed():
+            if await self.is_created():
+                if cfg_proc is not None:
+                    # The dataset was created by an earlier run, possibly under
+                    # an older policy; bring it up to date so that future
+                    # commits abide by the current one.
+                    await self.ensure_dandiset_policy()
+                return False
+            # `datalad create` was killed before its first commit, leaving a
+            # repository with `.gitattributes` staged and perhaps
+            # `.datalad/config` written, but no commit.  Building on
+            # it would leave the mirror without a dataset ID, the annex backend
+            # or the special remotes, and `--zarr-dirty=reset+clean` would
+            # "clean" it into exactly that.  Rerun the creation over it
+            # instead, keeping whatever was committed on top meanwhile.
+            # `before_create` is not consulted: this is not a new mirror, and
+            # its GitHub repository may well exist, made by such a later run.
+            log.warning(
+                "%s: creation of dataset at %s was interrupted; completing it",
+                desc,
+                self.path,
+            )
+            argv.append("--force")
+        else:
+            if before_create is not None:
+                await before_create()
+            log.info("Creating dataset for %s", desc)
         if cfg_proc is not None:
             argv.append("-c")
             argv.append(cfg_proc)
         argv.append(self.path)
-        await aruncmd(
-            *argv,
-            env={
-                **custom_commit_env(commit_date),
-                "GIT_CONFIG_PARAMETERS": f"'init.defaultBranch={DEFAULT_BRANCH}'",
-                SIZE_LIMIT_ENVVAR: get_size_limit(),
-            },
-        )
-        if embargo_status is not EmbargoStatus.OPEN:
-            await self.set_embargo_status(embargo_status)
-            await self.save(
-                "[backups2datalad] Set embargo status", commit_date=commit_date
+        # Shielded, since cancellation kills the command running at the time:
+        # one failed Zarr cancels the other Zarr syncs in flight, and any of
+        # them still creating its mirror would be left half-made.
+        with anyio.CancelScope(shield=True):
+            await aruncmd(
+                *argv,
+                env={
+                    **custom_commit_env(commit_date),
+                    "GIT_CONFIG_PARAMETERS": f"'init.defaultBranch={DEFAULT_BRANCH}'",
+                    SIZE_LIMIT_ENVVAR: get_size_limit(),
+                },
             )
-        await self.call_annex(
-            "initremote",
-            "--sameas=web",
-            "dandiapi",
-            "type=web",
-            "urlinclude=*//api.dandiarchive.org/*",
-            "cost=300",
-        )
-        if backup_remote is not None:
+            if embargo_status is not EmbargoStatus.OPEN:
+                await self.set_embargo_status(embargo_status)
+                await self.save(
+                    "[backups2datalad] Set embargo status", commit_date=commit_date
+                )
             await self.call_annex(
                 "initremote",
-                backup_remote.name,
-                f"type={backup_remote.type}",
-                *[f"{k}={v}" for k, v in backup_remote.options.items()],
+                "--sameas=web",
+                "dandiapi",
+                "type=web",
+                "urlinclude=*//api.dandiarchive.org/*",
+                "cost=300",
             )
-            await self.call_annex("untrust", backup_remote.name)
-            await self.call_annex(
-                "wanted",
-                backup_remote.name,
-                "(not metadata=distribution-restrictions=*)",
-            )
+            if backup_remote is not None:
+                await self.call_annex(
+                    "initremote",
+                    backup_remote.name,
+                    f"type={backup_remote.type}",
+                    *[f"{k}={v}" for k, v in backup_remote.options.items()],
+                )
+                await self.call_annex("untrust", backup_remote.name)
+                await self.call_annex(
+                    "wanted",
+                    backup_remote.name,
+                    "(not metadata=distribution-restrictions=*)",
+                )
         log.debug("Dataset for %s created", desc)
         return True
+
+    async def is_created(self) -> bool:
+        """
+        Whether `datalad create` ran to completion on this (installed)
+        dataset, judged by ``HEAD`` carrying a dataset ID: the commit that
+        records it is the last step of `datalad create` proper, and nothing
+        removes it afterwards.  ``HEAD``, not the working tree, since a
+        creation killed between writing ``.datalad/config`` and committing it
+        leaves the file uncommitted.
+        """
+        return (
+            await self.get_repo_config(
+                "datalad.dataset.id", blob="HEAD:.datalad/config"
+            )
+            is not None
+        )
 
     async def ensure_dandiset_policy(
         self, commit_date: datetime | None = None
