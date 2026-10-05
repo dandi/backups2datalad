@@ -10,7 +10,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import aclosing
-from dataclasses import InitVar, dataclass, field, replace
+from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from enum import Enum
 from functools import partial
@@ -27,6 +27,7 @@ from anyio.to_thread import run_sync
 from dandi.consts import EmbargoStatus
 from datalad.api import Dataset
 from datalad.runner.exception import CommandError
+from datalad.support.annexrepo import AnnexRepo
 from ghrepo import GHRepo
 from pydantic import BaseModel
 import requests
@@ -338,8 +339,19 @@ class AsyncDataset:
         else:
             return False
 
-    async def get_repo_config(self, key: str, file: str | None = None) -> str | None:
-        args = ["--file", file] if file is not None else []
+    async def get_repo_config(
+        self, key: str, file: str | None = None, blob: str | None = None
+    ) -> str | None:
+        """
+        Read ``key`` from the repository's config, or from ``file`` or the
+        committed ``blob`` (e.g. ``HEAD:.gitmodules``) if given
+        """
+        if file is not None:
+            args = ["--file", file]
+        elif blob is not None:
+            args = ["--blob", blob]
+        else:
+            args = []
         try:
             return await self.read_git("config", *args, "--get", key, quiet_rcs=[1])
         except subprocess.CalledProcessError as e:
@@ -700,10 +712,11 @@ class AsyncDataset:
             partial(self.ds.update, how=how, sibling=sibling)
         )
 
-    async def get_file_stats(self) -> list[FileStat]:
-        filedict: dict[str, FileStat] = {}
+    async def aiter_file_stats(self, commit: str) -> AsyncGenerator[FileStat, None]:
         async with aclosing(
-            stream_null_command("git", "ls-tree", "-lrz", "HEAD", cwd=self.pathobj)
+            stream_null_command(
+                "git", "ls-tree", "-lrz", commit, cwd=self.pathobj, check=True
+            )
         ) as p:
             async for entry in p:
                 try:
@@ -713,11 +726,34 @@ class AsyncDataset:
                         "Error parsing ls-tree line %r for %s:", entry, self.path
                     )
                     raise
-                filedict[fst.path] = fst
-        async with aclosing(self.aiter_annexed_files()) as afiles:
-            async for f in afiles:
-                filedict[f.file] = replace(filedict[f.file], size=f.bytesize)
-        return list(filedict.values())
+                yield fst
+
+    async def get_annexed_tree_stats(self, commit: str) -> DatasetStats:
+        """
+        The number and total size of the annexed files in ``commit``, as
+        ``git annex info`` counts them
+        """
+        info = json.loads(
+            await self.read_git(
+                # A read-only query: no need to merge git-annex branches
+                "-c",
+                "annex.merge-annex-branches=false",
+                "annex",
+                "info",
+                "--fast",
+                "--json",
+                "--bytes",
+                commit,
+            )
+        )
+        # A key that records no size makes this e.g. "5500 (+ 1 unknown size)"
+        size = info["size of annexed files in tree"]
+        if not size.isdigit():
+            raise RuntimeError(
+                f"{self.path}: cannot size annexed files in {commit}: git-annex"
+                f" reports {size!r}"
+            )
+        return DatasetStats(files=info["annexed files in tree"], size=int(size))
 
     async def aiter_annexed_files(self) -> AsyncGenerator[AnnexedFile, None]:
         async with aclosing(
@@ -998,39 +1034,81 @@ class AsyncDataset:
         self,
         config: BackupConfig,  # for path to zarrs
     ) -> DatasetStats:
-        stored_stats = await self.get_stored_stats()
+        # Count one commit, resolved once, and never the working tree, which a
+        # concurrent or interrupted run may have left disagreeing with it
+        # (#139); the stats are cached for that same commit.
+        commit = await self.get_commit_hash()
+        stored_stats = await self.get_stored_stats(commit)
         if stored_stats is not None:
             # stats were stored and state of the dataset did not change since then
             return stored_stats
         log.info("%s: Counting up files ...", self.path)
         files = 0
         size = 0
-        # get them all and remap per path
-        subdatasets = {s["path"]: s for s in await self.get_subdatasets()}
-        for filestat in await self.get_file_stats():
-            path = Path(filestat.path)
-            if not is_meta_file(path.parts[0], dandiset=True):
-                if filestat.type is ObjectType.COMMIT:
-                    # this zarr should not be present locally as a submodule
-                    # so we should get its id from its information in submodules.
-                    sub_info = subdatasets[str(self.pathobj / path)]
-                    _, zarr_stat = await self.get_zarr_sub_stats(sub_info, config)
-                    files += zarr_stat.files
-                    size += zarr_stat.size
+        # Annexed files are symlinks (the mirrors never unlock files), sized
+        # by git-annex below, less the annexed metadata files
+        symlinks = 0
+        annexed_meta: list[str] = []
+        submodules: list[str] = []
+        async with aclosing(self.aiter_file_stats(commit)) as fstats:
+            async for filestat in fstats:
+                if is_meta_file(filestat.path, dandiset=True):
+                    if filestat.mode == SYMLINK_MODE:
+                        annexed_meta.append(filestat.object)
+                elif filestat.type is ObjectType.COMMIT:
+                    submodules.append(filestat.path)
                 else:
                     files += 1
-                    assert filestat.size is not None
-                    size += filestat.size
+                    if filestat.mode == SYMLINK_MODE:
+                        symlinks += 1
+                    else:
+                        assert filestat.size is not None
+                        size += filestat.size
+        if symlinks or annexed_meta:
+            annexed = await self.get_annexed_tree_stats(commit)
+            for blob in annexed_meta:
+                # E.g. .dandi/assets.json, or dandiset.yaml under a low
+                # BACKUPS2DATALAD_TEXT_SIZE_LIMIT: few, so read one by one.
+                # A symlink's blob is its target, which ends in the key.
+                key = Path(await self.read_git("cat-file", "blob", blob)).name
+                if (keysize := AnnexRepo.get_size_from_key(key)) is None:
+                    raise RuntimeError(
+                        f"{self.path}: cannot size annexed metadata file with"
+                        f" key {key} in {commit}"
+                    )
+                annexed.files -= 1
+                annexed.size -= keysize
+            if annexed.files != symlinks:
+                raise RuntimeError(
+                    f"{self.path}: git-annex counts {annexed.files} annexed"
+                    f" files in {commit}, but it has {symlinks} symlinks"
+                )
+            size += annexed.size
+        for path in submodules:
+            # this zarr should not be present locally as a submodule
+            # so we should get its id from its URL in .gitmodules.
+            url = await self.get_repo_config(
+                f"submodule.{path}.url", blob=f"{commit}:.gitmodules"
+            )
+            if url is None:
+                raise RuntimeError(
+                    f"{self.path}: submodule {path} has no URL in .gitmodules"
+                    f" of {commit}"
+                )
+            _, zarr_stat = await self.get_zarr_sub_stats(url, config)
+            files += zarr_stat.files
+            size += zarr_stat.size
         log.info("%s: Done counting up files", self.path)
         stats = DatasetStats(files=files, size=size)
-        await self.store_stats(stats)
+        await self.store_stats(stats, commit)
         return stats
 
     @staticmethod
     async def get_zarr_sub_stats(
-        sub_info: dict, config: BackupConfig
+        url: str, config: BackupConfig
     ) -> tuple[str, DatasetStats]:
-        zarr_id = Path(sub_info["gitmodule_url"]).name
+        """The ID and stats of the Zarr mirrored at submodule URL ``url``"""
+        zarr_id = Path(url).name
         assert config.zarr_root is not None
         zarr_ds = AsyncDataset(config.zarr_root / zarr_id)
         # here we assume that HEAD among dandisets is the same as of
@@ -1039,7 +1117,8 @@ class AsyncDataset:
         zarr_stat = await zarr_ds.get_stats(config=config)
         return zarr_id, zarr_stat
 
-    async def get_stored_stats(self) -> DatasetStats | None:
+    async def get_stored_stats(self, commit: str | None = None) -> DatasetStats | None:
+        """The stats cached for ``commit`` (default: ``HEAD``), if any"""
         if (stored_stats := self.ds.config.get("dandi.stats", None)) is not None:
             try:
                 stored_commit, files_str, size_str = stored_stats.split(",")
@@ -1047,12 +1126,13 @@ class AsyncDataset:
                 size = int(size_str)
             except Exception:
                 return None
-            if stored_commit == await self.get_commit_hash():
+            if stored_commit == (commit or await self.get_commit_hash()):
                 return DatasetStats(files=files, size=size)
         return None
 
-    async def store_stats(self, stats: DatasetStats) -> None:
-        commit = await self.get_commit_hash()
+    async def store_stats(self, stats: DatasetStats, commit: str | None = None) -> None:
+        """Cache ``stats`` as those of ``commit`` (default: ``HEAD``)"""
+        commit = commit or await self.get_commit_hash()
         value = f"{commit},{stats.files},{stats.size}"
         self.ds.config.set("dandi.stats", value, scope="local")
 
@@ -1189,19 +1269,28 @@ class ObjectType(Enum):
     TREE = "tree"
 
 
+#: The mode of a symlink in a tree, which is what an annexed file is
+SYMLINK_MODE = "120000"
+
+
 @dataclass
 class FileStat:
     path: str
+    mode: str
     type: ObjectType
+    object: str
+    #: For a symlink, the size of the link, not of the annexed file
     size: int | None
 
     @classmethod
     def from_entry(cls, entry: str) -> FileStat:
         stats, _, path = entry.partition("\t")
-        _, typename, _, sizestr = stats.split()
+        mode, typename, obj, sizestr = stats.split()
         return cls(
             path=path,
+            mode=mode,
             type=ObjectType(typename),
+            object=obj,
             size=None if sizestr == "-" else int(sizestr),
         )
 
