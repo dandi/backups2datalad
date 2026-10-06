@@ -441,10 +441,12 @@ class DandiDatasetter(AsyncResource):
                 on_archive[d.identifier] = d
         mirrored = 0
         size = 0
-        # Mirrors behind the archive, as (Dandiset ID, bytes in the archive's
-        # draft that the mirror lacks); they are what explains a mirrored size
-        # well short of the archive's
+        # Mirrors behind the archive, which are what explains a mirrored size
+        # well short of the archive's: those of public Dandisets as (Dandiset
+        # ID, bytes by which the archive's draft is larger than the mirror),
+        # and a mere count of embargoed ones, as the description is public
         outdated: list[tuple[str, int]] = []
+        outdated_embargoed = 0
         for s in await superds.get_subdatasets():
             did = s["gitmodule_path"]
             if (remote := on_archive.get(did)) is None:
@@ -462,10 +464,19 @@ class DandiDatasetter(AsyncResource):
             # caches) them, rather than leave the mirror out of the total
             ds_size = (await ds.get_stats(config=self.config)).size
             size += ds_size
-            # The same test `update_dandiset()` uses to decide whether to sync
+            # The same tests `update_dandiset()` uses to decide whether to sync
             state = await ds.get_backup_state()
+            if state is not None and state.timestamp > remote.version.modified:
+                raise RuntimeError(
+                    f"Remote Dandiset {did} has 'modified' timestamp"
+                    f" {remote.version.modified} BEFORE last-recorded"
+                    f" {state.timestamp}"
+                )
             if state is None or state.timestamp < remote.version.modified:
-                outdated.append((did, max(remote.version.size - ds_size, 0)))
+                if remote.embargo_status is EmbargoStatus.OPEN:
+                    outdated.append((did, max(remote.version.size - ds_size, 0)))
+                else:
+                    outdated_embargoed += 1
         archive = await self.dandi_client.get_archive_stats()
         if archive.dandiset_count != len(on_archive):
             # The stats are recomputed only periodically, and the listing shows
@@ -475,11 +486,14 @@ class DandiDatasetter(AsyncResource):
                 archive.dandiset_count,
                 len(on_archive),
             )
-        if outdated:
+        if outdated or outdated_embargoed:
             log.info(
-                "%s behind the archive: %s",
-                quantify(len(outdated), "mirror is", "mirrors are"),
-                ", ".join(did for did, _ in sorted(outdated)),
+                "%s behind the archive: %s (and %d embargoed)",
+                quantify(
+                    len(outdated) + outdated_embargoed, "mirror is", "mirrors are"
+                ),
+                ", ".join(did for did, _ in sorted(outdated)) or "none public",
+                outdated_embargoed,
             )
         await self.manager.edit_github_repo(
             repo,
@@ -489,6 +503,7 @@ class DandiDatasetter(AsyncResource):
                 size=size,
                 archive_size=archive.size,
                 outdated=outdated,
+                outdated_embargoed=outdated_embargoed,
             ),
         )
 

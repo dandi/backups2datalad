@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
+from dandi.consts import EmbargoStatus
 from datalad.api import Dataset
 import httpx
 import pytest
@@ -54,7 +55,7 @@ def test_describe_superdataset_all_mirrored() -> None:
 
 @pytest.mark.ai_generated
 def test_describe_superdataset_outdated() -> None:
-    """Outdated mirrors explain the shortfall, those lacking the most first"""
+    """Outdated mirrors explain the shortfall, those furthest behind first"""
     assert describe_superdataset(
         mirrored=1194,
         on_archive=1194,
@@ -62,8 +63,8 @@ def test_describe_superdataset_outdated() -> None:
         archive_size=2_400_000_000_000_000,
         outdated=[("001412", 1_150_000_000_000_000)],
     ) == (
-        "1194 Dandisets (1.2 PB of the archive's 2.4 PB; 1 mirror outdated,"
-        " lacking 1.1 PB: 001412)." + TAIL
+        "1194 Dandisets (1.2 PB of the archive's 2.4 PB; 001412 outdated,"
+        " 1.1 PB behind)." + TAIL
     )
     assert describe_superdataset(
         mirrored=4,
@@ -78,13 +79,48 @@ def test_describe_superdataset_outdated() -> None:
         ],
     ) == (
         "4 of 5 Dandisets mirrored (3.0 MB of the archive's 10.0 MB; 4 mirrors"
-        " outdated, lacking 2.0 MB: 000002, 000004, 000001, ...)." + TAIL
+        " outdated, 2.0 MB behind: 000002, 000004, 000001, ...)." + TAIL
+    )
+
+
+@pytest.mark.ai_generated
+def test_describe_superdataset_outdated_not_behind() -> None:
+    """A mirror outdated without the draft having grown gets no size"""
+    assert describe_superdataset(
+        mirrored=1,
+        on_archive=1,
+        size=3_000_000,
+        archive_size=3_000_000,
+        outdated=[("000001", 0)],
+    ) == ("1 Dandiset (3.0 MB of the archive's 3.0 MB; 000001 outdated)." + TAIL)
+
+
+@pytest.mark.ai_generated
+def test_describe_superdataset_outdated_embargoed() -> None:
+    """Outdated embargoed mirrors are counted, but neither named nor sized"""
+    assert describe_superdataset(
+        mirrored=2,
+        on_archive=2,
+        size=3_000_000,
+        archive_size=10_000_000,
+        outdated_embargoed=1,
+    ) == ("2 Dandisets (3.0 MB of the archive's 10.0 MB; 1 mirror outdated)." + TAIL)
+    assert describe_superdataset(
+        mirrored=2,
+        on_archive=2,
+        size=3_000_000,
+        archive_size=10_000_000,
+        outdated=[("000001", 2_000_000)],
+        outdated_embargoed=1,
+    ) == (
+        "2 Dandisets (3.0 MB of the archive's 10.0 MB; 2 mirrors outdated,"
+        " 2.0 MB behind: 000001, ...)." + TAIL
     )
 
 
 def make_datasetter(
     tmp_path: Path,
-    on_archive: list[str] | dict[str, tuple[datetime, int]],
+    on_archive: list[str] | dict[str, tuple[datetime, int, EmbargoStatus]],
     archive_stats: ArchiveStats | Exception,
     list_error: Exception | None = None,
 ) -> tuple[DandiDatasetter, AsyncMock]:
@@ -95,9 +131,12 @@ def make_datasetter(
             d = MagicMock()
             d.identifier = did
             if isinstance(on_archive, dict):
-                d.version.modified, d.version.size = on_archive[did]
+                d.version.modified, d.version.size, d.embargo_status = on_archive[did]
             else:
-                d.version.modified, d.version.size = MODIFIED, 0
+                # As mirrored
+                d.version.modified = MODIFIED
+                d.version.size = SIZES.get(did, 0)
+                d.embargo_status = EmbargoStatus.OPEN
             yield cast(RemoteDandiset, d)
 
     client = MagicMock()
@@ -135,10 +174,15 @@ def make_superds(
 #: When the Dandisets on the archive were last modified unless stated otherwise
 MODIFIED = datetime(2026, 9, 1, tzinfo=timezone.utc)
 
-SIZES = {"000001": 1_000_000, "000002": 2_000_000, "000005": 4_000_000}
+SIZES = {
+    "000001": 1_000_000,
+    "000002": 2_000_000,
+    "000005": 4_000_000,
+    "000006": 8_000_000,
+}
 
 #: How far each mirror's backup got; a Dandiset absent here has no state
-BACKED_UP = {"000001": MODIFIED, "000002": MODIFIED}
+BACKED_UP = {"000001": MODIFIED, "000002": MODIFIED, "000006": MODIFIED}
 
 
 @pytest.fixture
@@ -185,34 +229,62 @@ async def test_set_superds_description(tmp_path: Path) -> None:
 async def test_set_superds_description_outdated(tmp_path: Path) -> None:
     """
     A mirror is outdated if the archive's draft was modified after the backup
-    recorded in it, or if it records none; it then lacks whatever its draft
-    on the archive holds beyond the mirror (never less than nothing).
+    recorded in it, or if it records none; it is then behind by however much
+    larger its draft on the archive is (never less than nothing).  Embargoed
+    ones are counted but neither named nor sized.
     """
+    open_ = EmbargoStatus.OPEN
     datasetter, edit = make_datasetter(
         tmp_path,
         {
             # Modified after the backup, & grown by 5 MB
-            "000001": (MODIFIED + timedelta(days=1), 6_000_000),
-            # Up to date (it being smaller on the archive is no matter)
-            "000002": (MODIFIED, 1_000_000),
+            "000001": (MODIFIED + timedelta(days=1), 6_000_000, open_),
+            # Up to date, the same instant in another timezone (it being
+            # smaller on the archive is no matter)
+            "000002": (
+                MODIFIED.astimezone(timezone(timedelta(hours=-4))),
+                1_000_000,
+                open_,
+            ),
             # No backup state recorded, & shrunk on the archive
-            "000005": (MODIFIED, 1_000),
+            "000005": (MODIFIED, 1_000, open_),
+            # Embargoed, & grown by a lot
+            "000006": (
+                MODIFIED + timedelta(days=1),
+                1_000_000_000,
+                EmbargoStatus.EMBARGOED,
+            ),
         },
-        ArchiveStats(dandiset_count=3, size=10_000_000),
+        ArchiveStats(dandiset_count=4, size=20_000_000),
     )
-    superds = make_superds(
-        tmp_path,
-        ["000001", "000002", "000005"],
-        installed=["000001", "000002", "000005"],
-    )
+    ids = ["000001", "000002", "000005", "000006"]
+    superds = make_superds(tmp_path, ids, installed=ids)
     await datasetter.set_superds_description(superds)
     edit.assert_awaited_once_with(
         "dandi/dandisets",
         description=(
-            "3 Dandisets (7.0 MB of the archive's 10.0 MB; 2 mirrors outdated,"
-            " lacking 5.0 MB: 000001, 000005)." + TAIL
+            "4 Dandisets (15.0 MB of the archive's 20.0 MB; 3 mirrors outdated,"
+            " 5.0 MB behind: 000001, 000005, ...)." + TAIL
         ),
     )
+
+
+@pytest.mark.ai_generated
+@pytest.mark.usefixtures("fake_stats")
+async def test_set_superds_description_backup_from_future(tmp_path: Path) -> None:
+    """
+    A backup recorded as later than the archive's draft was modified is an
+    error, as in `update_dandiset()`
+    """
+    datasetter, edit = make_datasetter(
+        tmp_path,
+        {"000001": (MODIFIED - timedelta(days=1), 1_000_000, EmbargoStatus.OPEN)},
+        ArchiveStats(dandiset_count=1, size=1_000_000),
+    )
+    superds = make_superds(tmp_path, ["000001"], installed=["000001"])
+    with pytest.raises(RuntimeError, match="000001 has 'modified' timestamp"):
+        await datasetter.set_superds_description(superds)
+    edit.assert_not_awaited()
 
 
 @pytest.mark.ai_generated

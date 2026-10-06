@@ -241,13 +241,19 @@ def describe_superdataset(
     size: int,
     archive_size: int,
     outdated: Sequence[tuple[str, int]] = (),
+    outdated_embargoed: int = 0,
 ) -> str:
     """
     The GitHub description of the superdataset: how many of the Dandisets on
     the archive are mirrored, how much data those mirrors hold next to the
     archive's own total, and -- as what explains a shortfall -- which mirrors
-    are behind the archive and how many bytes of its drafts they lack
-    (``outdated``, as pairs of Dandiset ID & bytes lacking).
+    are behind the archive and by how much.
+
+    ``outdated`` gives the mirrors of public Dandisets that are behind, as
+    pairs of Dandiset ID & bytes by which the archive's draft is larger than
+    the mirror (its net growth since, not all that the mirror is missing).
+    ``outdated_embargoed`` counts those of embargoed Dandisets, which are
+    neither named nor sized, as this description is public.
 
     The two sizes are not computed alike: a mirror counts the files in its
     draft (each Dandiset separately), while the archive counts every distinct
@@ -259,17 +265,23 @@ def describe_superdataset(
     else:
         count = f"{mirrored} of {quantify(on_archive, 'Dandiset')} mirrored"
     sizes = f"{naturalsize(size)} of the archive's {naturalsize(archive_size)}"
-    if outdated:
-        # Name the mirrors that lack the most, as those are what to look into
-        worst = sorted(outdated, key=lambda o: (-o[1], o[0]))
-        ids = ", ".join(did for did, _ in worst[:MAX_OUTDATED_NAMED])
-        if len(worst) > MAX_OUTDATED_NAMED:
-            ids += ", ..."
-        lacking = sum(lag for _, lag in outdated)
-        sizes += (
-            f"; {quantify(len(outdated), 'mirror')} outdated,"
-            f" lacking {naturalsize(lacking)}: {ids}"
-        )
+    if n_outdated := len(outdated) + outdated_embargoed:
+        behind = sum(lag for _, lag in outdated)
+        behind_str = f", {naturalsize(behind)} behind" if behind else ""
+        if n_outdated == 1 and outdated:
+            sizes += f"; {outdated[0][0]} outdated{behind_str}"
+        else:
+            sizes += f"; {quantify(n_outdated, 'mirror')} outdated{behind_str}"
+            if outdated:
+                # Name the mirrors furthest behind, as those are what to look
+                # into
+                worst = sorted(outdated, key=lambda o: (-o[1], o[0]))
+                named = worst[:MAX_OUTDATED_NAMED]
+                ids = ", ".join(did for did, _ in named)
+                if n_outdated > len(named):
+                    # More public ones, or embargoed ones
+                    ids += ", ..."
+                sizes += f": {ids}"
     return (
         f"{count} ({sizes})."
         "  DataLad super-dataset of all Dandisets from https://github.com/dandisets"
