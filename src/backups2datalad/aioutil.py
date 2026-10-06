@@ -9,6 +9,7 @@ from collections.abc import (
     Container,
     Mapping,
 )
+from concurrent.futures import Future
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
 import logging
@@ -34,6 +35,7 @@ from .consts import (
     GITHUB_MUTATION_SPACING,
     GITHUB_RATE_LIMIT_ATTEMPTS,
     GITHUB_RATE_LIMIT_FALLBACK,
+    GITHUB_RATE_LIMIT_FALLBACK_MAX,
 )
 from .logging import log
 from .util import exp_wait
@@ -168,9 +170,9 @@ class GitHubGate:
       least ``spacing`` seconds apart, as GitHub's guidelines ask.
     - A rate-limited response (`is_rate_limited()`) starts a cooldown shared
       by every worker: as long as `retry-after` / `x-ratelimit-reset` say,
-      or else ``fallback`` seconds doubling per consecutive hit.  Hits that
-      arrive while a cooldown is already running are the same incident and
-      do not escalate.
+      or else ``fallback`` seconds doubling per consecutive hit, up to
+      ``fallback_max``.  Hits that arrive while a cooldown is already running
+      are the same incident and do not escalate.
     - ``attempts`` consecutive rate-limited responses are each slept out and
       retried; on the next one the gate gives up for the rest of the process:
       further mutations raise `GitHubRateLimited` at once, and reads fall
@@ -186,6 +188,7 @@ class GitHubGate:
     attempts: int = GITHUB_RATE_LIMIT_ATTEMPTS
     spacing: float = GITHUB_MUTATION_SPACING
     fallback: float = GITHUB_RATE_LIMIT_FALLBACK
+    fallback_max: float = GITHUB_RATE_LIMIT_FALLBACK_MAX
     clock: Callable[[], float] = time.monotonic
     wall: Callable[[], float] = time.time
     sleep: Callable[[float], Awaitable[None]] = anyio.sleep
@@ -223,7 +226,7 @@ class GitHubGate:
             delay = max(float(reset) - self.wall(), 1.0)
             source = "x-ratelimit-reset"
         else:
-            delay = self.fallback * 2 ** (self.consecutive - 1)
+            delay = min(self.fallback * 2 ** (self.consecutive - 1), self.fallback_max)
             source = "fallback"
         self.cooldown_until = max(self.cooldown_until, now + delay)
         if self.consecutive > self.attempts:
@@ -282,6 +285,25 @@ class GitHubGate:
                 yield
             finally:
                 self._last_mutation_end = self.clock()
+
+
+async def wait_done(
+    fut: Future[Any],
+    timeout: float,
+    sleep: Callable[[float], Awaitable[None]] = anyio.sleep,
+    poll: float = 5,
+) -> bool:
+    """
+    Wait, polling every ``poll`` seconds with ``sleep``, until ``fut`` (e.g.
+    the outcome of an abandoned worker thread) is done or ``timeout`` seconds
+    have been slept.  Returns whether it is done.
+    """
+    waited = 0.0
+    while not fut.done() and waited < timeout:
+        delay = min(poll, timeout - waited)
+        await sleep(delay)
+        waited += delay
+    return fut.done()
 
 
 async def arequest(

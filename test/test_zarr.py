@@ -2,15 +2,18 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime, timezone
+import itertools
 import logging
 from pathlib import Path
 from shutil import rmtree
 import subprocess
+import threading
 from time import sleep
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 from conftest import Archive, SampleDandiset
+import anyio
 from datalad.api import Dataset
 import numpy as np
 import pytest
@@ -587,6 +590,193 @@ async def test_create_github_sibling_server_error_without_gate(
     with pytest.raises(requests.HTTPError):
         await ds2.create_github_sibling(owner="org", name="zarr2", backup_remote=None)
     assert len(calls) == 1
+
+
+def _stall_calls(
+    monkeypatch: pytest.MonkeyPatch, ds: AsyncDataset, stalled: set[int]
+) -> tuple[threading.Event, list[int]]:
+    """
+    Make the calls numbered in ``stalled`` (from 0) to the fake
+    ``create_sibling_github`` installed by `_fake_create_sibling` hang -- as
+    DataLad's untimed request may -- until the returned event is set (which
+    every test must do in the end).  A stalled call takes its outcome only
+    once released.  Also returns the numbers of the calls started so far.
+    """
+    fake = ds.ds.create_sibling_github
+    counter = itertools.count()
+    started: list[int] = []
+    release = threading.Event()
+
+    def stalling(**kwargs: Any) -> list[dict[str, Any]]:
+        n = next(counter)
+        started.append(n)
+        if n in stalled:
+            release.wait(60)
+        result = fake(**kwargs)
+        assert isinstance(result, list)
+        return result
+
+    monkeypatch.setattr(ds.ds, "create_sibling_github", stalling)
+    return release, started
+
+
+@pytest.fixture
+def short_create_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Real seconds: `move_on_after` runs on the event loop's clock, while the
+    # grace is slept with the gate's fake clock
+    monkeypatch.setattr("backups2datalad.adataset.GITHUB_CREATE_TIMEOUT", 0.2)
+
+
+@pytest.mark.ai_generated
+@pytest.mark.usefixtures("short_create_timeout")
+async def test_create_github_sibling_uses_late_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A creation that outlasts `GITHUB_CREATE_TIMEOUT` but finishes within the
+    grace period -- waited out with the gate's lock released -- counts as
+    done: DataLad is not called again, and our config is set.
+    """
+    ds = await _make_dataset(tmp_path / "ds")
+    bare = _make_bare(tmp_path / "bare.git")
+    calls = _fake_create_sibling(monkeypatch, ds, bare, ["ok"])
+    release, started = _stall_calls(monkeypatch, ds, {0})
+    clock = FakeClock()
+    gate = make_gate(clock)
+    gate.note_rate_limited({}, "an earlier hit")
+    await gate.wait()
+    locked_while_sleeping: list[bool] = []
+
+    async def sleep(delay: float) -> None:
+        locked_while_sleeping.append(gate.lock.locked())
+        release.set()
+        # Give the released thread (real) time to finish
+        await anyio.sleep(0.05)
+        await clock.sleep(delay)
+
+    gate.sleep = sleep
+    try:
+        created = await ds.create_github_sibling(
+            owner="org", name="zarr1", backup_remote=None, gate=gate
+        )
+    finally:
+        release.set()
+    assert created
+    assert started == [0]
+    assert len(calls) == 1
+    assert "did not finish within 0.2 s; waiting up to 600 s more" in caplog.text
+    assert locked_while_sleeping and not any(locked_while_sleeping)
+    assert gate.consecutive == 0, "a late success is a success"
+    assert await ds.has_github_remote()
+    assert (
+        await ds.get_repo_config("remote.github.pushurl") == "git@github.com:org/zarr1"
+    )
+    assert await ds.get_repo_config("branch.draft.remote") == "github"
+
+
+@pytest.mark.ai_generated
+@pytest.mark.usefixtures("short_create_timeout")
+async def test_create_github_sibling_late_rate_limit_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A late outcome that is a rate limit is retried after the cooldown."""
+    ds = await _make_dataset(tmp_path / "ds")
+    bare = _make_bare(tmp_path / "bare.git")
+    calls = _fake_create_sibling(monkeypatch, ds, bare, [RATE_LIMIT_MSG, "ok"])
+    release, started = _stall_calls(monkeypatch, ds, {0})
+    clock = FakeClock()
+    gate = make_gate(clock)
+
+    async def sleep(delay: float) -> None:
+        release.set()
+        await anyio.sleep(0.05)
+        await clock.sleep(delay)
+
+    gate.sleep = sleep
+    try:
+        assert await ds.create_github_sibling(
+            owner="org", name="zarr1", backup_remote=None, gate=gate
+        )
+    finally:
+        release.set()
+    assert started == [0, 1]
+    assert len(calls) == 2
+    assert clock.slept[-1] == 60.0
+    assert gate.consecutive == 0
+    assert await ds.has_github_remote()
+
+
+@pytest.mark.ai_generated
+@pytest.mark.usefixtures("short_create_timeout")
+async def test_create_github_sibling_retries_abandoned_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A creation still not finished after the grace period is abandoned and
+    retried, adopting the repository it created ("already exists").
+    """
+    ds = await _make_dataset(tmp_path / "ds")
+    bare = _make_bare(tmp_path / "bare.git")
+    calls = _fake_create_sibling(
+        monkeypatch,
+        ds,
+        bare,
+        [
+            # taken by the retry
+            {
+                "action": "create_sibling_github",
+                "status": "notneeded",
+                "message": "repository already exists",
+            },
+            # taken by the abandoned call once released at the end
+            RuntimeError("abandoned call"),
+        ],
+    )
+    release, started = _stall_calls(monkeypatch, ds, {0})
+    clock = FakeClock()
+    gate = make_gate(clock)
+    try:
+        assert await ds.create_github_sibling(
+            owner="org", name="zarr1", backup_remote=None, gate=gate
+        )
+    finally:
+        release.set()
+    assert started == [0, 1]
+    assert len(calls) == 1
+    assert calls[0]["existing"] == "reconfigure"
+    assert sum(clock.slept) == 600
+    assert "abandoning that call and trying again" in caplog.text
+    assert "GitHub repository org/zarr1 exists already" in caplog.text
+    assert gate.consecutive == 0
+    assert (
+        await ds.get_repo_config("remote.github.pushurl") == "git@github.com:org/zarr1"
+    )
+
+
+@pytest.mark.ai_generated
+@pytest.mark.usefixtures("short_create_timeout")
+async def test_create_github_sibling_timeout_gives_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ds = await _make_dataset(tmp_path / "ds")
+    bare = _make_bare(tmp_path / "bare.git")
+    _fake_create_sibling(
+        monkeypatch, ds, bare, [RuntimeError("abandoned call")] * 3
+    )
+    release, started = _stall_calls(monkeypatch, ds, {0, 1, 2})
+    clock = FakeClock()
+    gate = make_gate(clock)
+    try:
+        with pytest.raises(RuntimeError, match="did not finish within 600.2 s 3 times"):
+            await ds.create_github_sibling(
+                owner="org", name="zarr1", backup_remote=None, gate=gate
+            )
+    finally:
+        release.set()
+    assert started == [0, 1, 2]
+    assert sum(clock.slept) == 3 * 600
+    assert not gate.lock.locked()
+    assert not await ds.has_github_remote()
 
 
 @pytest.mark.ai_generated

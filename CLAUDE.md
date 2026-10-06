@@ -539,8 +539,11 @@ serialised ≥ 1 s apart, with a cooldown shared by every worker whenever GitHub
 answers 429, or 403 with `retry-after` / `x-ratelimit-remaining: 0` / a
 secondary-limit message.  The cooldown is whatever GitHub says (`retry-after`,
 else `x-ratelimit-reset`), else GitHub's documented fallback of a minute
-doubling per consecutive hit; after `GITHUB_RATE_LIMIT_ATTEMPTS` slept-out
-hits the gate gives up and mutations raise `GitHubRateLimited`.  Constants
+doubling per consecutive hit, capped at an hour
+(`GITHUB_RATE_LIMIT_FALLBACK_MAX`, the longest window GitHub documents for
+secondary limits); after `GITHUB_RATE_LIMIT_ATTEMPTS` (10, i.e. ~5 h of
+cooldowns) slept-out hits the gate gives up and mutations raise
+`GitHubRateLimited`.  Constants
 live in `consts.py`; there are no config/CLI knobs.  `arequest(gate=...)` is
 opt-in -- without a gate (DANDI API, S3) it behaves as before.
 
@@ -557,6 +560,20 @@ the repository (logged as "GitHub repository … exists already").  DataLad
 reports a 500 as an error record without its status code (since 1.5.0;
 earlier, and for other 5xx, as `requests.HTTPError`), so such a record is
 recognised by its message being a plain string, not a `(format, args)` tuple.
+
+A DataLad call that does not return within `GITHUB_CREATE_TIMEOUT` (120 s,
+the gate's lock held) is no failure either: it may well have created the
+repository -- 001412's Zarr `325e2654-…` was created on GitHub by a call
+that timed out right after a run of rate limits, and that timeout alone
+used to fail the Dandiset.  The call (DataLad's POST has no timeout of its
+own, and `siblings configure` follows it) is waited for up to
+`GITHUB_CREATE_GRACE` (600 s) more with the lock released; if it finishes,
+its outcome stands (`wait_done()` polls the `Future` its thread fills in).
+Otherwise it is abandoned and the creation retried, up to
+`GITHUB_CREATE_TIMEOUT_RETRIES` times, adopting the repository as after a
+5xx.  An abandoned call that wakes up later races the retry configuring the
+same sibling; after that long it is taken to be stuck for good.
+
 `sync_zarr()` converges on every visit: it pushes whenever HEAD has commits
 the `github` sibling lacks (`has_unpushed_commits()`, a plain push) and
 records the description whenever the `dandi.github-description` cache is

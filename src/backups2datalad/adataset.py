@@ -9,6 +9,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
+from concurrent.futures import Future
 from contextlib import aclosing
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
@@ -40,12 +41,15 @@ from .aioutil import (
     is_rate_limited,
     stream_lines_command,
     stream_null_command,
+    wait_done,
 )
 from .config import BackupConfig, Remote
 from .consts import (
     DEFAULT_BRANCH,
     GIT_OPTIONS,
+    GITHUB_CREATE_GRACE,
     GITHUB_CREATE_TIMEOUT,
+    GITHUB_CREATE_TIMEOUT_RETRIES,
     GITHUB_SERVER_ERROR_WAITS,
 )
 from .logging import log
@@ -69,6 +73,23 @@ class GitHubServerError(RuntimeError):
     GitHub answered a repository creation with a server error (5xx), which
     may or may not have created the repository
     """
+
+
+class GitHubCreateTimeout(RuntimeError):
+    """
+    DataLad's ``create_sibling_github`` did not finish within
+    `GITHUB_CREATE_TIMEOUT`.  Its thread keeps running -- it may yet create
+    the repository and configure the sibling -- and records its outcome in
+    ``call``.
+    """
+
+    def __init__(self, msg: str, call: Future[Any]) -> None:
+        super().__init__(msg, call)
+        self.msg = msg
+        self.call = call
+
+    def __str__(self) -> str:
+        return self.msg
 
 
 @dataclass
@@ -889,6 +910,14 @@ class AsyncDataset:
         rate limit, a 5xx may have created the repository after all; the
         retry is what finds out, since with ``existing="reconfigure"`` GitHub
         then answers "already exists" and DataLad adopts the repository.
+
+        Likewise a call that does not finish within `GITHUB_CREATE_TIMEOUT`
+        may well have created the repository, and may still be configuring
+        the sibling.  It is waited for up to `GITHUB_CREATE_GRACE` more
+        seconds with the gate's lock released, and its outcome is used if it
+        finishes; otherwise it is abandoned and the creation retried (up to
+        `GITHUB_CREATE_TIMEOUT_RETRIES` times), adopting the repository as
+        above.
         """
         config = [
             ("remote.github.pushurl", f"git@github.com:{owner}/{name}"),
@@ -919,37 +948,7 @@ class AsyncDataset:
                 on_failure="ignore",
                 return_type="list",
             )
-            desc = f"{owner}/{name}"
-            server_waits = iter(GITHUB_SERVER_ERROR_WAITS)
-            while True:
-                try:
-                    if gate is None:
-                        hit = await self._create_sibling_once(create, desc)
-                        if hit is not None:
-                            raise RuntimeError(hit[1])
-                    else:
-                        async with gate.mutation():
-                            while True:
-                                hit = await self._create_sibling_once(create, desc)
-                                if hit is None:
-                                    gate.note_success()
-                                    break
-                                gate.note_rate_limited(*hit)
-                                gate.raise_if_gave_up()
-                                await gate.wait()
-                except GitHubServerError as e:
-                    if (delay := next(server_waits, None)) is None:
-                        raise
-                    log.warning(
-                        "%s; retrying in %d s (adopting the repository if the"
-                        " failed request created it after all)",
-                        e,
-                        delay,
-                    )
-                    # The gate's sleep is the injectable one
-                    await (anyio.sleep if gate is None else gate.sleep)(delay)
-                else:
-                    break
+            await self._create_sibling(create, f"{owner}/{name}", gate)
             for key, value in config:
                 await self.set_repo_config(key, value)
             return True
@@ -965,13 +964,125 @@ class AsyncDataset:
                     await self.set_repo_config(key, value)
             return False
 
+    async def _create_sibling(
+        self, create: Callable[[], Any], desc: str, gate: GitHubGate | None
+    ) -> None:
+        """
+        Call ``create`` (DataLad's ``create_sibling_github`` for ``desc``)
+        until it succeeds, retrying as described in `create_github_sibling()`
+        """
+        # The gate's sleep is the injectable one
+        sleep = anyio.sleep if gate is None else gate.sleep
+        server_waits = iter(GITHUB_SERVER_ERROR_WAITS)
+        timeout_retries = GITHUB_CREATE_TIMEOUT_RETRIES
+        # A call that timed out but has finished since: its outcome stands in
+        # for the next attempt
+        late: Future[Any] | None = None
+        while True:
+            try:
+                if late is not None:
+                    call, late = late, None
+                    hit = self._sibling_outcome(call, desc)
+                    if hit is None:
+                        if gate is not None:
+                            gate.note_success()
+                        return
+                    if gate is None:
+                        raise RuntimeError(hit[1])
+                    # Rate-limited: retried below, after the cooldown
+                    gate.note_rate_limited(*hit)
+                    gate.raise_if_gave_up()
+                if gate is None:
+                    hit = await self._create_sibling_once(create, desc)
+                    if hit is not None:
+                        raise RuntimeError(hit[1])
+                    return
+                async with gate.mutation():
+                    while True:
+                        hit = await self._create_sibling_once(create, desc)
+                        if hit is None:
+                            gate.note_success()
+                            return
+                        gate.note_rate_limited(*hit)
+                        gate.raise_if_gave_up()
+                        await gate.wait()
+            except GitHubServerError as e:
+                if (delay := next(server_waits, None)) is None:
+                    raise
+                log.warning(
+                    "%s; retrying in %d s (adopting the repository if the"
+                    " failed request created it after all)",
+                    e,
+                    delay,
+                )
+                await sleep(delay)
+            except GitHubCreateTimeout as e:
+                # Raised with the gate's lock released, so other GitHub
+                # mutations proceed while we wait
+                log.warning(
+                    "%s; waiting up to %d s more for it (it may have created"
+                    " the repository)",
+                    e,
+                    GITHUB_CREATE_GRACE,
+                )
+                if await wait_done(e.call, GITHUB_CREATE_GRACE, sleep):
+                    late = e.call
+                elif timeout_retries > 0:
+                    timeout_retries -= 1
+                    # Should the abandoned call wake up after all, it races
+                    # the retry configuring the same sibling; after this long
+                    # it is most likely stuck on a dead connection for good.
+                    log.warning(
+                        "Creating GitHub sibling %s still has not finished;"
+                        " abandoning that call and trying again (adopting the"
+                        " repository if it was created)",
+                        desc,
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Creating GitHub sibling {desc} did not finish within"
+                        f" {GITHUB_CREATE_TIMEOUT + GITHUB_CREATE_GRACE} s"
+                        f" {GITHUB_CREATE_TIMEOUT_RETRIES + 1} times; giving up"
+                    ) from e
+
     async def _create_sibling_once(
         self, create: Callable[[], Any], desc: str
     ) -> tuple[Mapping[str, str], str] | None:
         """
-        Run DataLad's ``create_sibling_github`` once in a worker thread.
-        Returns None on success; on a rate-limited response returns the
-        response headers (if any) and a description of the failure for
+        Run DataLad's ``create_sibling_github`` once in a worker thread and
+        return its `_sibling_outcome()`, or raise `GitHubCreateTimeout` if it
+        does not finish within `GITHUB_CREATE_TIMEOUT`.
+        """
+        call: Future[Any] = Future()
+
+        def run() -> None:
+            try:
+                call.set_result(create())
+            except Exception as e:
+                call.set_exception(e)
+
+        # DataLad's request has no timeout; do not let a hung thread hold up
+        # the caller (or the gate's lock) indefinitely.  The thread is
+        # abandoned, not stopped: it may still create the repository and
+        # configure the sibling, and records its outcome in ``call``.
+        with anyio.move_on_after(GITHUB_CREATE_TIMEOUT):
+            await run_sync(run, abandon_on_cancel=True)
+        if not call.done():
+            raise GitHubCreateTimeout(
+                f"Creating GitHub sibling {desc} did not finish within"
+                f" {GITHUB_CREATE_TIMEOUT} s",
+                call,
+            )
+        return self._sibling_outcome(call, desc)
+
+    @staticmethod
+    def _sibling_outcome(
+        call: Future[Any], desc: str
+    ) -> tuple[Mapping[str, str], str] | None:
+        """
+        Interpret a finished ``create_sibling_github`` call.  Returns None on
+        success; on a rate-limited response returns the response headers (if
+        any) and a description of the failure for
         `GitHubGate.note_rate_limited()`; raises `GitHubServerError` for a
         server error (5xx), and some other exception for anything else.
 
@@ -981,18 +1092,7 @@ class AsyncDataset:
         so both shapes are handled.
         """
         try:
-            # DataLad's request has no timeout; do not let a hung thread hold
-            # up the caller (or the gate's lock) indefinitely.  An abandoned
-            # thread may still finish creating/configuring the sibling on its
-            # own -- outside the gate -- which `existing="reconfigure"` and
-            # the config restore above absorb on the next visit.
-            with anyio.move_on_after(GITHUB_CREATE_TIMEOUT) as scope:
-                results = await run_sync(create, abandon_on_cancel=True)
-            if scope.cancelled_caught:
-                raise RuntimeError(
-                    f"Creating GitHub sibling {desc} did not finish within"
-                    f" {GITHUB_CREATE_TIMEOUT} s"
-                )
+            results = call.result()
         except requests.HTTPError as e:
             resp = e.response
             if resp is not None and is_rate_limited(
