@@ -42,7 +42,12 @@ from .aioutil import (
     stream_null_command,
 )
 from .config import BackupConfig, Remote
-from .consts import DEFAULT_BRANCH, GIT_OPTIONS, GITHUB_CREATE_TIMEOUT
+from .consts import (
+    DEFAULT_BRANCH,
+    GIT_OPTIONS,
+    GITHUB_CREATE_TIMEOUT,
+    GITHUB_SERVER_ERROR_WAITS,
+)
 from .logging import log
 from .procedures import PROCEDURES_DIR
 from .procedures.cfg_dandiset import COMMIT_MESSAGE as POLICY_COMMIT_MESSAGE
@@ -57,6 +62,13 @@ from .util import custom_commit_env, exp_wait, is_meta_file, key2hash, quantify
 EMBARGO_STATUS_KEY = "dandi.dandiset.embargo-status"
 
 DATALAD_CREDS_REMOTE_UUID = "cf13d535-b47c-5df6-8590-0793cb08a90a"
+
+
+class GitHubServerError(RuntimeError):
+    """
+    GitHub answered a repository creation with a server error (5xx), which
+    may or may not have created the repository
+    """
 
 
 @dataclass
@@ -871,6 +883,12 @@ class AsyncDataset:
         cooldown GitHub asks for (a rate-limited creation did not create
         anything, so retrying is safe; a crash between creation and sibling
         configuration is healed by ``existing="reconfigure"``).
+
+        A server error (5xx) is retried after each of
+        `GITHUB_SERVER_ERROR_WAITS`, with the gate's lock released.  Unlike a
+        rate limit, a 5xx may have created the repository after all; the
+        retry is what finds out, since with ``existing="reconfigure"`` GitHub
+        then answers "already exists" and DataLad adopts the repository.
         """
         config = [
             ("remote.github.pushurl", f"git@github.com:{owner}/{name}"),
@@ -902,19 +920,36 @@ class AsyncDataset:
                 return_type="list",
             )
             desc = f"{owner}/{name}"
-            if gate is None:
-                if (hit := await self._create_sibling_once(create, desc)) is not None:
-                    raise RuntimeError(hit[1])
-            else:
-                async with gate.mutation():
-                    while True:
+            server_waits = iter(GITHUB_SERVER_ERROR_WAITS)
+            while True:
+                try:
+                    if gate is None:
                         hit = await self._create_sibling_once(create, desc)
-                        if hit is None:
-                            gate.note_success()
-                            break
-                        gate.note_rate_limited(*hit)
-                        gate.raise_if_gave_up()
-                        await gate.wait()
+                        if hit is not None:
+                            raise RuntimeError(hit[1])
+                    else:
+                        async with gate.mutation():
+                            while True:
+                                hit = await self._create_sibling_once(create, desc)
+                                if hit is None:
+                                    gate.note_success()
+                                    break
+                                gate.note_rate_limited(*hit)
+                                gate.raise_if_gave_up()
+                                await gate.wait()
+                except GitHubServerError as e:
+                    if (delay := next(server_waits, None)) is None:
+                        raise
+                    log.warning(
+                        "%s; retrying in %d s (adopting the repository if the"
+                        " failed request created it after all)",
+                        e,
+                        delay,
+                    )
+                    # The gate's sleep is the injectable one
+                    await (anyio.sleep if gate is None else gate.sleep)(delay)
+                else:
+                    break
             for key, value in config:
                 await self.set_repo_config(key, value)
             return True
@@ -937,11 +972,13 @@ class AsyncDataset:
         Run DataLad's ``create_sibling_github`` once in a worker thread.
         Returns None on success; on a rate-limited response returns the
         response headers (if any) and a description of the failure for
-        `GitHubGate.note_rate_limited()`; raises for anything else.
+        `GitHubGate.note_rate_limited()`; raises `GitHubServerError` for a
+        server error (5xx), and some other exception for anything else.
 
-        DataLad reports a 403 as an error result record (message text only)
-        but lets a 429 -- and any error on the ``existing="reconfigure"``
-        lookup -- escape as `requests.HTTPError`, so both shapes are handled.
+        DataLad reports a 403 -- and, since 1.5.0, a 500 -- as an error result
+        record (message text only) but lets a 429, other 5xx, and any error on
+        the ``existing="reconfigure"`` lookup escape as `requests.HTTPError`,
+        so both shapes are handled.
         """
         try:
             # DataLad's request has no timeout; do not let a hung thread hold
@@ -966,14 +1003,39 @@ class AsyncDataset:
                     f"HTTP {resp.status_code} creating GitHub sibling {desc}:"
                     f" {textwrap.shorten(resp.text, width=200)}",
                 )
+            if resp is not None and resp.status_code >= 500:
+                body = textwrap.shorten(resp.text, width=200)
+                raise GitHubServerError(
+                    f"HTTP {resp.status_code} creating GitHub sibling {desc}"
+                    + (f": {body}" if body else "")
+                ) from e
             raise
         for res in results:
             status = res.get("status")
             msg = format_result_message(res)
-            if status in ("ok", "notneeded"):
+            if status == "notneeded" and res.get("action") == "create_sibling_github":
+                log.info(
+                    "GitHub repository %s exists already; configuring it as the"
+                    " sibling",
+                    desc,
+                )
+            elif status in ("ok", "notneeded"):
                 log.debug("create_sibling_github(%s) %s: %s", status, desc, msg)
             elif is_rate_limited(403, {}, msg):
                 return ({}, f"create_sibling_github({status}) {desc}: {msg}")
+            elif (
+                status == "error"
+                and res.get("action") == "create_sibling_github"
+                and isinstance(res.get("message"), str)
+            ):
+                # DataLad's only creation error record with a plain-string
+                # message is the one for a 500 (GitHub's message, or "Server
+                # returned error code 500 without any further information");
+                # its others are `(format, *args)` tuples, and the status
+                # code itself is not kept.
+                raise GitHubServerError(
+                    f"create_sibling_github({status}) {desc}: {msg}"
+                )
             else:
                 raise RuntimeError(f"create_sibling_github({status}) {desc}: {msg}")
         return None
