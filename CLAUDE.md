@@ -546,7 +546,17 @@ opt-in -- without a gate (DANDI API, S3) it behaves as before.
 
 `AsyncDataset.create_github_sibling()` still uses DataLad's
 `create_sibling_github` but inspects its result records itself, passes a real
-`description=`, and retries a rate-limited creation through the gate.
+`description=`, and retries a rate-limited creation through the gate.  A
+server error (5xx) is retried too, after each of `GITHUB_SERVER_ERROR_WAITS`
+(10, 30, 90 s; the gate's lock is released while waiting, and it does not
+count as rate limiting).  Unlike a rate limit, a 5xx may have created the
+repository after all (seen as `Server returned error code 500 without any
+further information`); the retry is what checks, since with
+`existing="reconfigure"` GitHub answers "already exists" and DataLad adopts
+the repository (logged as "GitHub repository … exists already").  DataLad
+reports a 500 as an error record without its status code (since 1.5.0;
+earlier, and for other 5xx, as `requests.HTTPError`), so such a record is
+recognised by its message being a plain string, not a `(format, args)` tuple.
 `sync_zarr()` converges on every visit: it pushes whenever HEAD has commits
 the `github` sibling lacks (`has_unpushed_commits()`, a plain push) and
 records the description whenever the `dandi.github-description` cache is

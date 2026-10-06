@@ -321,14 +321,15 @@ def _fake_create_sibling(
     monkeypatch: pytest.MonkeyPatch,
     ds: AsyncDataset,
     bare: Path,
-    outcomes: list[str | Exception],
+    outcomes: list[str | Exception | dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """
     Replace ``ds.ds.create_sibling_github`` with a fake that consumes one
     outcome per call: ``"ok"`` configures ``bare`` as the sibling and returns
     an ok record, another string becomes DataLad's 403 error record (``("%s"
-    format, message)`` tuple), and an exception is raised.  Returns the list
-    of keyword arguments of each call.
+    format, message)`` tuple), a dict is returned as the result record (after
+    configuring ``bare`` if its status is ok or notneeded), and an exception
+    is raised.  Returns the list of keyword arguments of each call.
     """
     calls: list[dict[str, Any]] = []
 
@@ -337,6 +338,10 @@ def _fake_create_sibling(
         outcome = outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
+        if isinstance(outcome, dict):
+            if outcome["status"] in ("ok", "notneeded"):
+                _add_github_remote(ds, bare)
+            return [outcome]
         if outcome == "ok":
             _add_github_remote(ds, bare)
             return [
@@ -442,6 +447,146 @@ async def test_create_github_sibling_gives_up(
     assert len(calls) == 3
     assert clock.slept == [60.0, 120.0]
     assert gate.gave_up
+
+
+def _server_error_record(message: str | None = None) -> dict[str, Any]:
+    """DataLad's (>= 1.5.0) result record for a 500 creating the repository"""
+    return {
+        "action": "create_sibling_github",
+        "status": "error",
+        "message": message
+        or "Server returned error code 500 without any further information",
+    }
+
+
+@pytest.mark.ai_generated
+async def test_create_github_sibling_retries_server_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A 500 that DataLad reports as an error record (with or without GitHub's
+    message) and a 5xx that escapes as `requests.HTTPError` are retried after
+    `GITHUB_SERVER_ERROR_WAITS`, with the gate's lock released while waiting,
+    and do not count as rate limiting.
+    """
+    ds = await _make_dataset(tmp_path / "ds")
+    bare = _make_bare(tmp_path / "bare.git")
+    calls = _fake_create_sibling(
+        monkeypatch,
+        ds,
+        bare,
+        [
+            _server_error_record(),
+            _http_error(502, {}, "<html>Bad Gateway</html>"),
+            _server_error_record("Server Error"),
+            "ok",
+        ],
+    )
+    clock = FakeClock()
+    gate = make_gate(clock)
+    locked_while_sleeping: list[bool] = []
+
+    async def sleep(delay: float) -> None:
+        locked_while_sleeping.append(gate.lock.locked())
+        await clock.sleep(delay)
+
+    gate.sleep = sleep
+    created = await ds.create_github_sibling(
+        owner="org", name="zarr1", backup_remote=None, gate=gate
+    )
+    assert created
+    assert len(calls) == 4
+    assert all(c["existing"] == "reconfigure" for c in calls)
+    assert clock.slept == [10.0, 30.0, 90.0]
+    assert locked_while_sleeping == [False] * 3
+    assert gate.consecutive == 0
+    assert not gate.gave_up
+    assert (
+        await ds.get_repo_config("remote.github.pushurl") == "git@github.com:org/zarr1"
+    )
+
+
+@pytest.mark.ai_generated
+async def test_create_github_sibling_adopts_repo_created_despite_500(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    When the request answered with a 500 created the repository after all,
+    the retry finds it ("already exists", adopted by
+    ``existing="reconfigure"``) and the sibling is configured as if created.
+    """
+    ds = await _make_dataset(tmp_path / "ds")
+    bare = _make_bare(tmp_path / "bare.git")
+    calls = _fake_create_sibling(
+        monkeypatch,
+        ds,
+        bare,
+        [
+            _server_error_record(),
+            {
+                "action": "create_sibling_github",
+                "status": "notneeded",
+                "message": "repository already exists",
+            },
+        ],
+    )
+    clock = FakeClock()
+    created = await ds.create_github_sibling(
+        owner="org", name="zarr1", backup_remote=None, gate=make_gate(clock)
+    )
+    assert created
+    assert len(calls) == 2
+    assert calls[1]["existing"] == "reconfigure"
+    assert clock.slept == [10.0]
+    assert "error code 500" in caplog.text
+    assert "GitHub repository org/zarr1 exists already" in caplog.text
+    assert await ds.has_github_remote()
+    assert (
+        await ds.get_repo_config("remote.github.pushurl") == "git@github.com:org/zarr1"
+    )
+    assert await ds.get_repo_config("branch.draft.remote") == "github"
+
+
+@pytest.mark.ai_generated
+async def test_create_github_sibling_server_error_gives_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ds = await _make_dataset(tmp_path / "ds")
+    bare = _make_bare(tmp_path / "bare.git")
+    calls = _fake_create_sibling(monkeypatch, ds, bare, [_server_error_record()] * 4)
+    clock = FakeClock()
+    gate = make_gate(clock)
+    with pytest.raises(RuntimeError, match="error code 500"):
+        await ds.create_github_sibling(
+            owner="org", name="zarr1", backup_remote=None, gate=gate
+        )
+    assert len(calls) == 4
+    assert clock.slept == [10.0, 30.0, 90.0]
+    assert not gate.gave_up
+    assert not await ds.has_github_remote()
+
+
+@pytest.mark.ai_generated
+async def test_create_github_sibling_server_error_without_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a gate a 5xx is retried too; a 4xx `HTTPError` is not."""
+    monkeypatch.setattr("backups2datalad.adataset.GITHUB_SERVER_ERROR_WAITS", (0, 0, 0))
+    ds = await _make_dataset(tmp_path / "ds")
+    bare = _make_bare(tmp_path / "bare.git")
+    calls = _fake_create_sibling(
+        monkeypatch, ds, bare, [_http_error(503, {}, ""), "ok"]
+    )
+    assert await ds.create_github_sibling(owner="org", name="zarr1", backup_remote=None)
+    assert len(calls) == 2
+
+    ds2 = await _make_dataset(tmp_path / "ds2")
+    calls = _fake_create_sibling(
+        monkeypatch, ds2, bare, [_http_error(404, {}, '{"message": "Not Found"}')]
+    )
+    with pytest.raises(requests.HTTPError):
+        await ds2.create_github_sibling(owner="org", name="zarr2", backup_remote=None)
+    assert len(calls) == 1
 
 
 @pytest.mark.ai_generated

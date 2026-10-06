@@ -56,3 +56,9 @@ GITHUB_RATE_LIMIT_FALLBACK = 60
 # Seconds to allow DataLad's `create_sibling_github` (an untimed `requests`
 # call in a worker thread) before giving up on the attempt
 GITHUB_CREATE_TIMEOUT = 120
+
+# Seconds to wait before each retry of a GitHub repository creation that
+# failed with a server error (5xx); one retry per entry, then the error is
+# raised.  Such a failure may have created the repository after all, which
+# the retry adopts (`existing="reconfigure"`).
+GITHUB_SERVER_ERROR_WAITS = (10, 30, 90)
