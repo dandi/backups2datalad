@@ -387,12 +387,22 @@ these names rather than inventing plain ones when a test adds paths.
 ## Superdataset Description
 
 `DandiDatasetter.set_superds_description()` sets the GitHub description of
-the superdataset (`dandi/dandisets`) to e.g. "1190 of 1191 Dandisets
-mirrored (2.3 PB of the archive's 2.4 PB)." (`util.describe_superdataset()`):
+the superdataset (`dandi/dandisets`) to e.g. "1194 Dandisets (1.2 PB of the
+archive's 2.4 PB; 1 mirror outdated, lacking 1.1 PB: 001412)."
+(`util.describe_superdataset()`):
 
 - The Dandiset count compares the mirrors (submodules) against a fresh listing
   of the archive, so Dandisets deleted from the archive -- whose submodules
-  stay, with their backups made private -- are not counted.
+  stay, with their backups made private -- are not counted.  It is given as
+  "N of M Dandisets mirrored" only when some are not mirrored.
+- A mirror is *outdated* by the test `update_dandiset()` uses to decide to
+  sync: its `get_backup_state()` is missing or older than the archive draft's
+  `modified`.  It lacks whatever the draft (`version.size` from the listing)
+  holds beyond the mirror, floored at 0.  Up to `MAX_OUTDATED_NAMED` of them
+  are named, those lacking the most first, so a stalled mirror like 001412's
+  explains the shortfall in the description itself.  A Dandiset skipped by the
+  quiescent period shows up too, for good reason (it is behind), lacking
+  little.
 - The mirrored size sums each mirror's `get_stats()`, which recounts (and
   caches) the stats of a mirror whose cached `dandi.stats` are not for its
   HEAD; the old code counted such a mirror as 0, silently dropping it from the
@@ -407,9 +417,8 @@ mirrored (2.3 PB of the archive's 2.4 PB)." (`util.describe_superdataset()`):
   It counts every distinct blob/Zarr of every version (embargoed included),
   while a mirror counts its draft's files (and a blob shared by Dandisets once
   per Dandiset), so the two agree only roughly even when every mirror is
-  current; a large gap means something is not being mirrored -- in 2026 the
-  description read "1.1 PB" against 2.4 PB because 001412's 1.2 PB of Zarrs
-  was not being mirrored although its (stale) mirror existed and was counted.
+  current (the remainder is mostly data only in published versions); a large
+  gap with no outdated mirror named means something is not being counted.
 
 ## Dataset Stats
 

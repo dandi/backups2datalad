@@ -435,15 +435,19 @@ class DandiDatasetter(AsyncResource):
         # iterated over, which `--exclude` or explicit IDs may have narrowed.
         # (Failed requests are retried by `arequest()`; one that still fails
         # fails the run rather than leave the description out of date.)
-        on_archive: set[str] = set()
+        on_archive: dict[str, RemoteDandiset] = {}
         async with aclosing(self.dandi_client.get_dandisets()) as diter:
             async for d in diter:
-                on_archive.add(d.identifier)
+                on_archive[d.identifier] = d
         mirrored = 0
         size = 0
+        # Mirrors behind the archive, as (Dandiset ID, bytes in the archive's
+        # draft that the mirror lacks); they are what explains a mirrored size
+        # well short of the archive's
+        outdated: list[tuple[str, int]] = []
         for s in await superds.get_subdatasets():
             did = s["gitmodule_path"]
-            if did not in on_archive:
+            if (remote := on_archive.get(did)) is None:
                 # Deleted from the archive (its backup was made private), or
                 # not a Dandiset at all (such a path is never an identifier
                 # on the archive, so no `DANDISET_ID_REGEX` check is needed)
@@ -456,7 +460,12 @@ class DandiDatasetter(AsyncResource):
                 )
             # Uses the cached stats if they are for HEAD, else recounts (and
             # caches) them, rather than leave the mirror out of the total
-            size += (await ds.get_stats(config=self.config)).size
+            ds_size = (await ds.get_stats(config=self.config)).size
+            size += ds_size
+            # The same test `update_dandiset()` uses to decide whether to sync
+            state = await ds.get_backup_state()
+            if state is None or state.timestamp < remote.version.modified:
+                outdated.append((did, max(remote.version.size - ds_size, 0)))
         archive = await self.dandi_client.get_archive_stats()
         if archive.dandiset_count != len(on_archive):
             # The stats are recomputed only periodically, and the listing shows
@@ -466,6 +475,12 @@ class DandiDatasetter(AsyncResource):
                 archive.dandiset_count,
                 len(on_archive),
             )
+        if outdated:
+            log.info(
+                "%s behind the archive: %s",
+                quantify(len(outdated), "mirror is", "mirrors are"),
+                ", ".join(did for did, _ in sorted(outdated)),
+            )
         await self.manager.edit_github_repo(
             repo,
             description=describe_superdataset(
@@ -473,6 +488,7 @@ class DandiDatasetter(AsyncResource):
                 on_archive=len(on_archive),
                 size=size,
                 archive_size=archive.size,
+                outdated=outdated,
             ),
         )
 

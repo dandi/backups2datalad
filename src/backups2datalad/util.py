@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from difflib import unified_diff
@@ -231,22 +231,47 @@ def quiescence_wait(
     return period - (now - modified).total_seconds()
 
 
+#: How many outdated mirrors `describe_superdataset()` names
+MAX_OUTDATED_NAMED = 3
+
+
 def describe_superdataset(
-    mirrored: int, on_archive: int, size: int, archive_size: int
+    mirrored: int,
+    on_archive: int,
+    size: int,
+    archive_size: int,
+    outdated: Sequence[tuple[str, int]] = (),
 ) -> str:
     """
     The GitHub description of the superdataset: how many of the Dandisets on
-    the archive are mirrored, and how much data those mirrors hold next to the
-    archive's own total.
+    the archive are mirrored, how much data those mirrors hold next to the
+    archive's own total, and -- as what explains a shortfall -- which mirrors
+    are behind the archive and how many bytes of its drafts they lack
+    (``outdated``, as pairs of Dandiset ID & bytes lacking).
 
     The two sizes are not computed alike: a mirror counts the files in its
     draft (each Dandiset separately), while the archive counts every distinct
     blob and Zarr in any version.  They agree only roughly even when every
-    mirror is current; a large gap means something is not being mirrored.
+    mirror is current.
     """
+    if mirrored == on_archive:
+        count = quantify(on_archive, "Dandiset")
+    else:
+        count = f"{mirrored} of {quantify(on_archive, 'Dandiset')} mirrored"
+    sizes = f"{naturalsize(size)} of the archive's {naturalsize(archive_size)}"
+    if outdated:
+        # Name the mirrors that lack the most, as those are what to look into
+        worst = sorted(outdated, key=lambda o: (-o[1], o[0]))
+        ids = ", ".join(did for did, _ in worst[:MAX_OUTDATED_NAMED])
+        if len(worst) > MAX_OUTDATED_NAMED:
+            ids += ", ..."
+        lacking = sum(lag for _, lag in outdated)
+        sizes += (
+            f"; {quantify(len(outdated), 'mirror')} outdated,"
+            f" lacking {naturalsize(lacking)}: {ids}"
+        )
     return (
-        f"{mirrored} of {quantify(on_archive, 'Dandiset')} mirrored"
-        f" ({naturalsize(size)} of the archive's {naturalsize(archive_size)})."
+        f"{count} ({sizes})."
         "  DataLad super-dataset of all Dandisets from https://github.com/dandisets"
     )
 
