@@ -486,14 +486,16 @@ class DandiDatasetter(AsyncResource):
                 archive.dandiset_count,
                 len(on_archive),
             )
-        if outdated or outdated_embargoed:
+        if outdated:
             log.info(
-                "%s behind the archive: %s (and %d embargoed)",
-                quantify(
-                    len(outdated) + outdated_embargoed, "mirror is", "mirrors are"
-                ),
-                ", ".join(did for did, _ in sorted(outdated)) or "none public",
-                outdated_embargoed,
+                "%s of public Dandisets behind the archive: %s",
+                quantify(len(outdated), "mirror", "mirrors"),
+                ", ".join(did for did, _ in sorted(outdated)),
+            )
+        if outdated_embargoed:
+            log.info(
+                "%s of embargoed Dandisets behind the archive",
+                quantify(outdated_embargoed, "mirror", "mirrors"),
             )
         await self.manager.edit_github_repo(
             repo,
