@@ -387,12 +387,28 @@ these names rather than inventing plain ones when a test adds paths.
 ## Superdataset Description
 
 `DandiDatasetter.set_superds_description()` sets the GitHub description of
-the superdataset (`dandi/dandisets`) to e.g. "1190 of 1191 Dandisets
-mirrored (2.3 PB of the archive's 2.4 PB)." (`util.describe_superdataset()`):
+the superdataset (`dandi/dandisets`) to e.g. "1194 Dandisets (1.2 PB of the
+archive's 2.4 PB; 001412 outdated, 1.1 PB behind)."
+(`util.describe_superdataset()`):
 
 - The Dandiset count compares the mirrors (submodules) against a fresh listing
   of the archive, so Dandisets deleted from the archive -- whose submodules
-  stay, with their backups made private -- are not counted.
+  stay, with their backups made private -- are not counted.  It is given as
+  "N of M Dandisets mirrored" only when some are not mirrored.
+- A mirror is *outdated* by the tests `update_dandiset()` uses: its
+  `get_backup_state()` is missing or older than the archive draft's
+  `modified`; one *newer* than that raises, as there.  It is "behind" by how
+  much larger the draft (`version.size` from the listing) is than the mirror,
+  floored at 0 -- net growth, not all it is missing (a draft that swapped 1 TB
+  for another 1 TB is 0 behind, and then no size is given).  Up to
+  `MAX_OUTDATED_NAMED` are named, those furthest behind first, so a stalled
+  mirror like 001412's explains the shortfall in the description itself.
+- Outdated mirrors of embargoed (or unembargoing) Dandisets are counted but
+  neither named nor sized, as the description is public.
+- Anything modified on the archive since this run synced it shows up as
+  outdated -- including Dandisets the quiescent period skipped, which may be
+  mid-way through a mass upload and so far behind -- so the description
+  routinely names a few mirrors and changes from run to run.
 - The mirrored size sums each mirror's `get_stats()`, which recounts (and
   caches) the stats of a mirror whose cached `dandi.stats` are not for its
   HEAD; the old code counted such a mirror as 0, silently dropping it from the
@@ -407,9 +423,11 @@ mirrored (2.3 PB of the archive's 2.4 PB)." (`util.describe_superdataset()`):
   It counts every distinct blob/Zarr of every version (embargoed included),
   while a mirror counts its draft's files (and a blob shared by Dandisets once
   per Dandiset), so the two agree only roughly even when every mirror is
-  current; a large gap means something is not being mirrored -- in 2026 the
-  description read "1.1 PB" against 2.4 PB because 001412's 1.2 PB of Zarrs
-  was not being mirrored although its (stale) mirror existed and was counted.
+  current (the remainder is mostly data only in published versions).  A large
+  gap with no outdated mirror named means something is not being counted --
+  e.g. Zarr mirrors that lag or failed under a Dandiset mirror whose own state
+  is current: Zarr stats come from the Zarr mirror's HEAD
+  (`get_zarr_sub_stats()`), and such a Dandiset is not flagged.
 
 ## Dataset Stats
 
