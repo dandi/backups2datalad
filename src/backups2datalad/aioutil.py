@@ -9,7 +9,6 @@ from collections.abc import (
     Container,
     Mapping,
 )
-from concurrent.futures import Future
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
 import logging
@@ -285,25 +284,6 @@ class GitHubGate:
                 yield
             finally:
                 self._last_mutation_end = self.clock()
-
-
-async def wait_done(
-    fut: Future[Any],
-    timeout: float,
-    sleep: Callable[[float], Awaitable[None]] = anyio.sleep,
-    poll: float = 5,
-) -> bool:
-    """
-    Wait, polling every ``poll`` seconds with ``sleep``, until ``fut`` (e.g.
-    the outcome of an abandoned worker thread) is done or ``timeout`` seconds
-    have been slept.  Returns whether it is done.
-    """
-    waited = 0.0
-    while not fut.done() and waited < timeout:
-        delay = min(poll, timeout - waited)
-        await sleep(delay)
-        waited += delay
-    return fut.done()
 
 
 async def arequest(

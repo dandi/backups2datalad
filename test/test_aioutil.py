@@ -13,7 +13,6 @@ breakage if httpx changes how headers/body are surfaced.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from concurrent.futures import Future
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import logging
@@ -27,7 +26,6 @@ from backups2datalad.aioutil import (
     GitHubRateLimited,
     arequest,
     is_rate_limited,
-    wait_done,
 )
 
 pytestmark = pytest.mark.anyio
@@ -361,30 +359,6 @@ async def test_github_gate_fallback_is_capped() -> None:
     assert clock.slept == [60, 120, 240, 480, 960, 1920, 3600, 3600, 3600, 3600]
     gate.note_rate_limited({}, "hit 11")
     assert gate.gave_up
-
-
-@pytest.mark.ai_generated
-async def test_wait_done() -> None:
-    clock = FakeClock()
-    done: Future[int] = Future()
-    done.set_result(1)
-    assert await wait_done(done, 12, clock.sleep)
-    assert clock.slept == []
-
-    never: Future[int] = Future()
-    assert not await wait_done(never, 12, clock.sleep)
-    assert clock.slept == [5, 5, 2]
-
-    clock.slept.clear()
-    later: Future[int] = Future()
-
-    async def sleep(delay: float) -> None:
-        await clock.sleep(delay)
-        if len(clock.slept) == 2:
-            later.set_result(1)
-
-    assert await wait_done(later, 600, sleep)
-    assert clock.slept == [5, 5]
 
 
 @pytest.mark.ai_generated

@@ -560,20 +560,13 @@ the repository (logged as "GitHub repository … exists already").  DataLad
 reports a 500 as an error record without its status code (since 1.5.0;
 earlier, and for other 5xx, as `requests.HTTPError`), so such a record is
 recognised by its message being a plain string, not a `(format, args)` tuple.
-
-A DataLad call that does not return within `GITHUB_CREATE_TIMEOUT` (120 s,
-the gate's lock held) is no failure either: it may well have created the
-repository -- 001412's Zarr `325e2654-…` was created on GitHub by a call
-that timed out right after a run of rate limits, and that timeout alone
-used to fail the Dandiset.  The call (DataLad's POST has no timeout of its
-own, and `siblings configure` follows it) is waited for up to
-`GITHUB_CREATE_GRACE` (600 s) more with the lock released; if it finishes,
-its outcome stands (`wait_done()` polls the `Future` its thread fills in).
-Otherwise it is abandoned and the creation retried, up to
-`GITHUB_CREATE_TIMEOUT_RETRIES` times, adopting the repository as after a
-5xx.  An abandoned call that wakes up later races the retry configuring the
-same sibling; after that long it is taken to be stuck for good.
-
+A creation that got no response -- `requests.ConnectionError`/`Timeout`, or
+DataLad's call not returning within `GITHUB_CREATE_TIMEOUT` (120 s; DataLad's
+own requests have no timeout) -- is retried the same way, as it may have
+created the repository too: 001412's Zarr `325e2654-…` was created by a call
+that timed out, and that timeout used to fail the Dandiset.  A thread
+abandoned on that timeout keeps running, may race the retry configuring the
+same sibling, and keeps the process from exiting until it ends.
 `sync_zarr()` converges on every visit: it pushes whenever HEAD has commits
 the `github` sibling lacks (`has_unpushed_commits()`, a plain push) and
 records the description whenever the `dandi.github-description` cache is
