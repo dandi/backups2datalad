@@ -344,6 +344,24 @@ async def test_github_gate_fallback_escalates_and_resets() -> None:
 
 
 @pytest.mark.ai_generated
+async def test_github_gate_fallback_is_capped() -> None:
+    """
+    The doubling fallback stops at an hour, and by default ten consecutive
+    hits (about five hours of cooldowns) are slept out before the gate gives
+    up.
+    """
+    clock = FakeClock()
+    gate = make_gate(clock)
+    for i in range(10):
+        gate.note_rate_limited({}, f"hit {i + 1}")
+        assert not gate.gave_up
+        await gate.wait()
+    assert clock.slept == [60, 120, 240, 480, 960, 1920, 3600, 3600, 3600, 3600]
+    gate.note_rate_limited({}, "hit 11")
+    assert gate.gave_up
+
+
+@pytest.mark.ai_generated
 async def test_github_gate_header_precedence() -> None:
     """``Retry-After`` wins over ``x-ratelimit-reset``, which wins over the fallback."""
     clock = FakeClock(start=1_000.0)

@@ -66,8 +66,9 @@ DATALAD_CREDS_REMOTE_UUID = "cf13d535-b47c-5df6-8590-0793cb08a90a"
 
 class GitHubServerError(RuntimeError):
     """
-    GitHub answered a repository creation with a server error (5xx), which
-    may or may not have created the repository
+    A repository creation failed in a way that may or may not have created
+    the repository: GitHub answered with a server error (5xx), or did not
+    answer at all
     """
 
 
@@ -884,9 +885,11 @@ class AsyncDataset:
         anything, so retrying is safe; a crash between creation and sibling
         configuration is healed by ``existing="reconfigure"``).
 
-        A server error (5xx) is retried after each of
+        A server error (5xx), and a request that got no response (a
+        connection error, or the call not finishing within
+        `GITHUB_CREATE_TIMEOUT`), are retried after each of
         `GITHUB_SERVER_ERROR_WAITS`, with the gate's lock released.  Unlike a
-        rate limit, a 5xx may have created the repository after all; the
+        rate limit, these may have created the repository after all; the
         retry is what finds out, since with ``existing="reconfigure"`` GitHub
         then answers "already exists" and DataLad adopts the repository.
         """
@@ -973,7 +976,8 @@ class AsyncDataset:
         Returns None on success; on a rate-limited response returns the
         response headers (if any) and a description of the failure for
         `GitHubGate.note_rate_limited()`; raises `GitHubServerError` for a
-        server error (5xx), and some other exception for anything else.
+        server error (5xx) or no response, and some other exception for
+        anything else.
 
         DataLad reports a 403 -- and, since 1.5.0, a 500 -- as an error result
         record (message text only) but lets a 429, other 5xx, and any error on
@@ -982,17 +986,25 @@ class AsyncDataset:
         """
         try:
             # DataLad's request has no timeout; do not let a hung thread hold
-            # up the caller (or the gate's lock) indefinitely.  An abandoned
-            # thread may still finish creating/configuring the sibling on its
-            # own -- outside the gate -- which `existing="reconfigure"` and
-            # the config restore above absorb on the next visit.
+            # up the caller (or the gate's lock) indefinitely.  The call may
+            # well have created the repository (001412's Zarr 325e2654-...
+            # was), so it is retried like a 5xx.  The abandoned thread may
+            # still finish configuring the sibling on its own, racing the
+            # retry; `existing="reconfigure"` and the config restore above
+            # absorb that on the next visit.
             with anyio.move_on_after(GITHUB_CREATE_TIMEOUT) as scope:
                 results = await run_sync(create, abandon_on_cancel=True)
             if scope.cancelled_caught:
-                raise RuntimeError(
+                raise GitHubServerError(
                     f"Creating GitHub sibling {desc} did not finish within"
                     f" {GITHUB_CREATE_TIMEOUT} s"
                 )
+        except (requests.ConnectionError, requests.Timeout) as e:
+            # No response: the request may or may not have reached GitHub
+            raise GitHubServerError(
+                f"No response creating GitHub sibling {desc}:"
+                f" {type(e).__name__}: {e}"
+            ) from e
         except requests.HTTPError as e:
             resp = e.response
             if resp is not None and is_rate_limited(

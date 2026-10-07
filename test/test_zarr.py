@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from shutil import rmtree
 import subprocess
+import threading
 from time import sleep
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -587,6 +588,118 @@ async def test_create_github_sibling_server_error_without_gate(
     with pytest.raises(requests.HTTPError):
         await ds2.create_github_sibling(owner="org", name="zarr2", backup_remote=None)
     assert len(calls) == 1
+
+
+@pytest.mark.ai_generated
+@pytest.mark.parametrize(
+    "exc",
+    [
+        requests.ConnectionError("Connection reset by peer"),
+        requests.ReadTimeout("Read timed out"),
+    ],
+)
+async def test_create_github_sibling_retries_without_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exc: Exception
+) -> None:
+    """
+    A creation request that got no response may have created the repository
+    all the same; it is retried like a 5xx, adopting the repository.
+    """
+    ds = await _make_dataset(tmp_path / "ds")
+    bare = _make_bare(tmp_path / "bare.git")
+    calls = _fake_create_sibling(
+        monkeypatch,
+        ds,
+        bare,
+        [
+            exc,
+            {
+                "action": "create_sibling_github",
+                "status": "notneeded",
+                "message": "repository already exists",
+            },
+        ],
+    )
+    clock = FakeClock()
+    gate = make_gate(clock)
+    assert await ds.create_github_sibling(
+        owner="org", name="zarr1", backup_remote=None, gate=gate
+    )
+    assert len(calls) == 2
+    assert clock.slept == [10.0]
+    assert gate.consecutive == 0
+    assert (
+        await ds.get_repo_config("remote.github.pushurl") == "git@github.com:org/zarr1"
+    )
+
+
+@pytest.mark.ai_generated
+async def test_create_github_sibling_retries_after_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A DataLad call that does not finish within `GITHUB_CREATE_TIMEOUT` is
+    abandoned and retried like a 5xx, with the gate's lock released while
+    waiting, adopting the repository the abandoned call created.
+    """
+    # Real seconds (`move_on_after`); the call that is not stalled has to
+    # finish within it, git subprocesses and all
+    monkeypatch.setattr("backups2datalad.adataset.GITHUB_CREATE_TIMEOUT", 2)
+    ds = await _make_dataset(tmp_path / "ds")
+    bare = _make_bare(tmp_path / "bare.git")
+    calls = _fake_create_sibling(
+        monkeypatch,
+        ds,
+        bare,
+        [
+            # taken by the retry
+            {
+                "action": "create_sibling_github",
+                "status": "notneeded",
+                "message": "repository already exists",
+            },
+            # taken by the stalled call once released at the end
+            RuntimeError("abandoned call"),
+        ],
+    )
+    fake = ds.ds.create_sibling_github
+    release = threading.Event()
+    started = 0
+
+    def stalling(**kwargs: Any) -> Any:
+        nonlocal started
+        started += 1
+        if started == 1:
+            # As DataLad's untimed request may
+            release.wait(60)
+        return fake(**kwargs)
+
+    monkeypatch.setattr(ds.ds, "create_sibling_github", stalling)
+    clock = FakeClock()
+    gate = make_gate(clock)
+    locked_while_sleeping: list[bool] = []
+
+    async def sleep(delay: float) -> None:
+        locked_while_sleeping.append(gate.lock.locked())
+        await clock.sleep(delay)
+
+    gate.sleep = sleep
+    try:
+        assert await ds.create_github_sibling(
+            owner="org", name="zarr1", backup_remote=None, gate=gate
+        )
+        ncalls = len(calls)
+    finally:
+        release.set()
+    assert started == 2
+    assert ncalls == 1, "only the retry got through"
+    assert clock.slept == [10.0]
+    assert locked_while_sleeping == [False]
+    assert "did not finish within 2 s; retrying in 10 s" in caplog.text
+    assert "GitHub repository org/zarr1 exists already" in caplog.text
+    assert (
+        await ds.get_repo_config("remote.github.pushurl") == "git@github.com:org/zarr1"
+    )
 
 
 @pytest.mark.ai_generated

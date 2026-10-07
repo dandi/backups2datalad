@@ -360,11 +360,12 @@ encodes no GitHub quota numbers; it relays what GitHub says (§2.5):
   max(cooldown_until, now + delay)` with `delay` = `retry-after` if present
   (clamped to ≥ 1 s; GitHub may say 0); else until `x-ratelimit-reset` if
   `x-ratelimit-remaining` is 0; else GitHub's documented fallback for an
-  unannounced secondary limit: 60 s, doubling per consecutive hit.  A hit
+  unannounced secondary limit: 60 s, doubling per consecutive hit (capped at
+  an hour, `GITHUB_RATE_LIMIT_FALLBACK_MAX`, since 2026-10).  A hit
   that arrives while a cooldown is still running does not escalate (ten
   workers failing in the same second are *one* incident).  `wait()` loops
   until `cooldown_until` has passed.
-* **Give-up**: `GITHUB_RATE_LIMIT_ATTEMPTS` (5) consecutive rate-limited
+* **Give-up**: `GITHUB_RATE_LIMIT_ATTEMPTS` (5; 10 since 2026-10) consecutive rate-limited
   responses are each slept out and retried; on the next one the gate gives
   up for the rest of the process: mutations raise `GitHubRateLimited`
   immediately (so the run ends with N failed Zarrs instead of every worker
@@ -372,7 +373,10 @@ encodes no GitHub quota numbers; it relays what GitHub says (§2.5):
   retry policy instead of looping on the cooldown.  Any successful mutation
   resets the counter; reads never reset it (but a rate-limited read does
   count).  With the doubling fallback, 5 slept-out hits bound the wait at
-  ~31 min; a `retry-after` from GitHub is honoured as given.
+  ~31 min; a `retry-after` from GitHub is honoured as given.  (2026-10: a
+  run of 001412's Zarr creations hit the limit five times in a row, so the
+  attempts went up to 10 with the fallback capped at an hour, bounding the
+  wait at ~5 h -- and with it the stall of all Zarr work described below.)
 * **Serialisation + spacing**: an `anyio.Lock` plus ≥ 1 s between the *end*
   of one mutation and the start of the next — GitHub's own guidance — for
   repo creation, `edit_repo` and `create_release` alike.  This is what turns
@@ -416,7 +420,9 @@ next visit.
   GITHUB_CREATE_TIMEOUT)` with `run_sync(..., abandon_on_cancel=True)` so a
   hung `requests.post` (no timeout in DataLad) cannot pin the lock or block
   cancellation; a timeout is a `RuntimeError`, and the rerun is safe via
-  `existing="reconfigure"`.
+  `existing="reconfigure"`.  (Since 2026-10 a timeout, like a connection
+  error, is retried as a `GitHubServerError`: such a call created 001412's
+  Zarr `325e2654-…`, and failing on it failed the Dandiset.)
 * Pass a real `description=` — `Zarr <id> of Dandiset <nnnnnn>` /
   `Dandiset <nnnnnn>` — so repositories are never born as `some default`.
   No interim text and no cache seeding: a fresh Zarr is described on the
