@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from difflib import unified_diff
@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import random
+import shlex
 import sys
 import textwrap
 from types import TracebackType
@@ -286,6 +287,41 @@ def describe_superdataset(
         f"{count} ({sizes})."
         "  DataLad super-dataset of all Dandisets from https://github.com/dandisets"
     )
+
+
+#: How many failed Dandisets `describe_failed_dandisets()` names
+MAX_FAILED_NAMED = 10
+
+
+def describe_failed_dandisets(
+    failed: Iterable[str], logfile: Path | None = None
+) -> str:
+    """
+    The error with which ``update-from-backup`` ends when backing up some
+    Dandisets failed: how many, and -- so that what to look into is in the
+    error itself rather than buried in the log -- which, up to
+    `MAX_FAILED_NAMED` of them.  When there are more, it gives a command that
+    lists them all from ``logfile`` (the run's log), relying on `pool_amap()`
+    logging each failure as ``Job failed on input <Dandiset 000123/draft>:``.
+    """
+    ids = sorted(failed)
+    named = ids[:MAX_FAILED_NAMED]
+    msg = f"Backups for {quantify(len(ids), 'Dandiset')} failed: {', '.join(named)}"
+    if len(ids) > len(named):
+        msg += f", ... ({len(ids) - len(named)} more)"
+        if logfile is not None:
+            cmd = shlex.join(
+                [
+                    "sed",
+                    "-nE",
+                    r"/Job failed/s,.*Dandiset ([0-9]{6})/.*,\1,gp",
+                    str(logfile),
+                ]
+            )
+            msg += f"\nList them all with: {cmd}"
+        else:
+            msg += "; see the 'Job failed' lines in the log for the rest"
+    return msg
 
 
 def quantify(qty: int, singular: str, plural: str | None = None) -> str:
