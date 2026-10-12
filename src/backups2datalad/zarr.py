@@ -154,6 +154,9 @@ class ZarrSyncer:
         last_sync = self.read_sync_file()
         async with aclosing(self.annex.list_files()) as fileiter:
             to_delete = {f async for f in fileiter if not is_meta_file(f)}
+        # `to_delete` is whittled down as the listing is walked; this is what
+        # the backup had to begin with.
+        local_paths = frozenset(to_delete)
         async with get_session().create_client(
             "s3",
             config=AioConfig(signature_version=UNSIGNED),
@@ -164,6 +167,7 @@ class ZarrSyncer:
                 return
             self.log.info("sync needed")
             i = 0
+            hold_last_sync = False
             while True:
                 orig_checksum = await self.get_local_checksum()
                 zcc = ZarrChecksumTree()
@@ -179,9 +183,15 @@ class ZarrSyncer:
                         zcc.add_leaf(Path(entry.path), entry.size, entry.md5_digest)
                         to_delete.discard(str(entry))
                         if self.mode is ZarrMode.TIMESTAMP:
+                            # An entry the backup lacks is never "not modified
+                            # since last backup", however old it is: a listing
+                            # taken while the Zarr was being written can miss
+                            # it while recording a later `last_modified`, and
+                            # it would then be skipped on every visit.
                             if (
                                 last_sync is not None
                                 and entry.last_modified < last_sync
+                                and str(entry) in local_paths
                             ):
                                 self.log.debug(
                                     "%s: file not modified since last backup", entry
@@ -287,10 +297,18 @@ class ZarrSyncer:
                     if changed_during_sync:
                         self.log.warning(
                             "Zarr was modified during backup and there is a"
-                            " checksum mismatch: local=%s, remote=%s",
+                            " checksum mismatch: local=%s, remote=%s; keeping"
+                            " the last-sync timestamp at %s so that the next"
+                            " backup re-examines what changed since",
                             final_checksum,
                             remote_checksum,
+                            last_sync,
                         )
+                        # The listing raced the writes, so the newest
+                        # `LastModified` it saw does not mean that everything
+                        # older was seen: an entry overwritten behind the
+                        # listing would be skipped as unmodified forever.
+                        hold_last_sync = True
                     else:
                         i += 1
                         if i < MAX_ZARR_SYNCS:
@@ -326,7 +344,7 @@ class ZarrSyncer:
                     " old checksum file present, but we are in verify mode"
                 )
             await self.ds.remove(str(OLD_CHECKSUM_FILE))
-        self.write_sync_file()
+        self.write_sync_file(last_sync if hold_last_sync else self.last_timestamp)
         await self.ds.add(str(SYNC_FILE))
 
     def read_sync_file(self) -> datetime | None:
@@ -348,11 +366,11 @@ class ZarrSyncer:
             )
         return data.last_modified
 
-    def write_sync_file(self) -> None:
+    def write_sync_file(self, last_modified: datetime | None) -> None:
         data = SyncData(
             bucket=self.s3bucket,
             prefix=self.s3prefix,
-            last_modified=self.last_timestamp,
+            last_modified=last_modified,
         )
         (self.repo / SYNC_FILE).parent.mkdir(exist_ok=True)
         (self.repo / SYNC_FILE).write_text(data.model_dump_json(indent=4) + "\n")
@@ -380,8 +398,25 @@ class ZarrSyncer:
                     try:
                         local_paths.remove(path)
                     except KeyError:
-                        self.check_change(f"entry {path!r} added")
-                        self.log.info("%s on server but not in backup", path)
+                        if obj["LastModified"] <= last_sync:
+                            # Not a change on the server: the entry was there
+                            # before our last sync, which missed it.
+                            self.check_backup_complete(
+                                f"entry {path!r} (last modified"
+                                f" {obj['LastModified']}) is missing from the"
+                                " backup although it predates the last sync"
+                                f" at {last_sync}"
+                            )
+                            self.log.info(
+                                "%s on server but not in backup, although last"
+                                " modified at %s, before last sync at %s",
+                                path,
+                                obj["LastModified"],
+                                last_sync,
+                            )
+                        else:
+                            self.check_change(f"entry {path!r} added")
+                            self.log.info("%s on server but not in backup", path)
                         return True
                     if obj["LastModified"] > last_sync:
                         self.check_change(f"entry {path!r} modified")
@@ -506,6 +541,17 @@ class ZarrSyncer:
                 f"Dandiset {self.asset.dandiset_id}: Zarr {self.zarr_id}:"
                 f" {event}, but Dandiset draft timestamp was not updated on"
                 " server"
+            )
+
+    def check_backup_complete(self, problem: str) -> None:
+        # Like `check_change()`, but for a backup that diverged from a server
+        # that did not change: verify reports it rather than repairing it, and
+        # says so instead of blaming the server's timestamp.
+        if self.error_on_change:
+            raise UnexpectedChangeError(
+                f"Dandiset {self.asset.dandiset_id}: Zarr {self.zarr_id}:"
+                f" {problem}; the backup is incomplete.  Repair it with"
+                f" `update-from-backup --mode force {self.asset.dandiset_id}`"
             )
 
 
