@@ -1,6 +1,8 @@
 # Plan: `--mode verify` failures of the 2026-10-09 and 2026-10-10 runs
 
-Status: **v1 — proposal** (2026-10-12).  Nothing here is implemented yet.
+Status: **v2 — code fixes implemented** (2026-10-12): F1a, F1b, F1c (§2.4)
+and F3a, F3b, F3c (§4.3).  Not done: F3d, which F3a makes largely moot, and
+the operational and upstream items (§2.5, §3.3, §4.4, §5 steps 3-6).
 
 Logs reviewed (both `update-from-backup --workers 5 --mode verify -e
 '00(1412|1411)$'`, backups2datalad `0.20260921.1.dev56+g3defbea09`, i.e.

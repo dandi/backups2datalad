@@ -250,7 +250,9 @@ a plain file read.
 What this deliberately does *not* catch: staged or unstaged junk on a mirror
 whose recorded state is current on both sides, since nothing then makes it look
 stale.  Everything an interrupted sync leaves behind does make it look stale,
-because the sync writes the state last.  For the rest there is
+because the sync writes the state last.  A sync that runs to its commit
+stages its leftovers before sealing the state (see "Index Writes During a
+Dandiset Sync").  For the rest there is
 `tools/find-INVISIBLE-changed.sh` on drogon, a fleet-wide sweep
 (`git diff-index --cached --quiet HEAD` per mirror, ~12 s for all of them).
 
@@ -343,6 +345,57 @@ that many times over, and file descriptors run out (`EMFILE`):
 
 Per-asset work that needs a subprocess or an open file has to happen behind
 such a bound.
+
+## Index Writes During a Dandiset Sync
+
+While a Dandiset syncs, git-annex's batch processes (`fromkey`, `addurl
+--with-files`) stage the files they create themselves, flushing `git
+update-index` on their own schedule, concurrently with whatever Git commands
+we run.  We retry a command that finds `.git/index.lock` taken
+(`AsyncDataset._retry_on_git_lock()`); git-annex does not, and a file it fails
+to stage that way is silently left out.  Hence (000571, #72, #62):
+
+- `Downloader.process_blob()` runs `git rm` only for a file whose content is
+  being replaced, never for a new one.  It used to run one per new file: each
+  rewrites the whole index under our lock, so 000571's 177k new files took
+  15.5 h of `git rm`, and each opened a window for git-annex to lose the
+  lock.
+- Before the commit that records a backup as complete, `async_assets()` runs
+  `AsyncDataset.stage_unstaged_files()`, which `git add`s whatever is untracked
+  or modified but unstaged, and logs a WARNING naming them.  Deletions,
+  submodules, and nested repositories are left alone, so that `commit()`'s
+  dirtiness check still reports them, now with `describe_dirt()`.  In a
+  normal sync nothing is unstaged there, since the old `commit()` would have
+  failed otherwise.  So the WARNING means something else lost a write, and
+  the files themselves are complete annex symlinks or downloaded text.
+
+## Zarr Timestamp Mode
+
+In `--zarr-mode timestamp` (the default), `.dandi/s3sync.json`'s
+`last_modified` is a watermark.  `needs_sync()` lists the Zarr and asks for a
+sync if an entry is missing locally, is newer than the watermark, or is gone
+from S3.  The sync then skips entries older than the watermark as "not
+modified since last backup".  An S3 listing is paginated, not a snapshot: a
+Zarr written to while we list it can have an entry missed behind the cursor
+while newer ones are seen, so the watermark ends up past it.  Hence (000108,
+001246, 001769; #66, #90):
+
+- The sync skips an old entry only if the backup has it (`local_paths`).  It
+  used to skip it regardless, so a missing entry was never added back:
+  `needs_sync()` asked for a sync, the sync skipped the entry, and every
+  `--mode verify` run raised.
+- In verify, an entry missing locally that predates the watermark is reported
+  by `check_backup_complete()` as an incomplete backup, with the repair
+  (`update-from-backup --mode force <id>`), not as a server change.  Verify
+  reports it and does not repair it, like any divergence.
+- When the Zarr changed on the server during the sync
+  (`changed_during_sync`) and the result does not match the server's
+  checksum, the previous watermark is written back, so that the next visit
+  re-examines whatever changed since.  An entry *overwritten* behind the
+  cursor would otherwise stay stale: it is present locally, so nothing above
+  catches it.
+- The stored `.dandi/zarr-checksum` is computed from the server listing, not
+  from the local files, so it cannot reveal a missing entry by itself.
 
 ## Asset Paths on Command Lines
 
