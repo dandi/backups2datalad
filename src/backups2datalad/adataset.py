@@ -309,6 +309,54 @@ class AsyncDataset:
             desc += f"\n... and {len(lines) - limit} more"
         return desc
 
+    async def stage_unstaged_files(self) -> list[str]:
+        """
+        ``git add`` the files that are untracked or changed in the working
+        tree but not staged, and return their paths.  Deletions, submodules,
+        and untracked directories that ``git status`` will not descend into
+        (nested repositories) are left alone, so they still make the dataset
+        dirty.
+
+        git-annex stages the files that its ``fromkey`` and ``addurl`` create
+        itself, and unlike us does not retry when the index is locked, so a
+        file it failed to stage would otherwise be left out of the commit
+        that records a backup as complete (#72).
+        """
+        fields = (
+            await self.read_git(
+                "status",
+                "--porcelain",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=all",
+                strip=False,
+            )
+        ).split("\0")
+        paths: list[str] = []
+        fiter = iter(fields)
+        for f in fiter:
+            if not f:
+                continue
+            xy, path = f[:2], f[3:]
+            if xy[0] in "RC":
+                # A rename or copy is followed by its source path.
+                next(fiter, None)
+            if (xy == "??" or xy[1] in "MT") and not path.endswith("/"):
+                paths.append(path)
+        if paths:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as fp:
+                for p in paths:
+                    print(p, end="\0", file=fp)
+                fp.flush()
+                # `--literal-pathspecs`: see `remove()`
+                await self.call_git(
+                    "--literal-pathspecs",
+                    "add",
+                    f"--pathspec-from-file={fp.name}",
+                    "--pathspec-file-nul",
+                )
+        return paths
+
     async def reset_hard_clean(self, check_clean: bool = False) -> None:
         """
         Discard everything not committed: ``git reset --hard`` followed by
@@ -538,7 +586,8 @@ class AsyncDataset:
         if check_dirty and await self.is_dirty():
             raise RuntimeError(
                 f"{self.path} is still dirty after committing."
-                "  Please check if all changes were staged."
+                "  Please check if all changes were staged;"
+                f" {await self.describe_dirt()}"
             )
 
     async def commit_if_changed(

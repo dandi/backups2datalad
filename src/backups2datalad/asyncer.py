@@ -294,8 +294,12 @@ class Downloader:
                     )
                     to_update = True
                     self.report.updated += 1
+                    # Only a file being replaced needs a `git rm`.  One per
+                    # *new* file rewrote the whole index each time -- 177k of
+                    # them took 000571 15.5 h -- and raced git-annex's own
+                    # index updates, which do not retry on a held lock (#72).
+                    await self.ds.remove(blob.path)
             if to_update:
-                await self.ds.remove(blob.path)
                 # Text files above the size limit are annexed as well; cf. the
                 # `.gitattributes` policy set by `cfg_dandiset`.
                 if blob.is_binary() or blob.asset.size > size_limit_bytes():
@@ -679,6 +683,16 @@ async def async_assets(
                         quantify(dm.report.downloaded, "asset"),
                     )
                     assert timestamp is not None
+                    # The commit below records this backup as complete, so
+                    # nothing may be left out of it (see
+                    # `AsyncDataset.stage_unstaged_files()`).
+                    if unstaged := await ds.stage_unstaged_files():
+                        manager.log.warning(
+                            "%s left unstaged; staging them before committing: %s%s",
+                            quantify(len(unstaged), "file"),
+                            ", ".join(map(shlex.quote, unstaged[:10])),
+                            " ..." if len(unstaged) > 10 else "",
+                        )
                     if done_flag.is_set():
                         ts = dandiset.version.modified
                     else:
