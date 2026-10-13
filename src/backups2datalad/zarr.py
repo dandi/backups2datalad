@@ -164,6 +164,7 @@ class ZarrSyncer:
                 return
             self.log.info("sync needed")
             i = 0
+            hold_last_sync = False
             while True:
                 orig_checksum = await self.get_local_checksum()
                 zcc = ZarrChecksumTree()
@@ -294,14 +295,33 @@ class ZarrSyncer:
                 remote_checksum = modern_asset.get_digest_value()
                 if remote_checksum is None:
                     self.log.info("Checksum still not available from server")
+                    if changed_during_sync:
+                        # Nothing to check the result against; as below.
+                        self.log.info(
+                            "Keeping the last-sync timestamp (%s) so that the"
+                            " next backup re-examines what changed since",
+                            last_sync if last_sync is not None else "unset",
+                        )
+                        hold_last_sync = True
                 elif final_checksum != remote_checksum:
                     if changed_during_sync:
                         self.log.warning(
                             "Zarr was modified during backup and there is a"
-                            " checksum mismatch: local=%s, remote=%s",
+                            " checksum mismatch: local=%s, remote=%s; keeping"
+                            " the last-sync timestamp (%s) so that the next"
+                            " backup re-examines what changed since",
                             final_checksum,
                             remote_checksum,
+                            last_sync if last_sync is not None else "unset",
                         )
+                        # The listing raced the writes, so the newest
+                        # `LastModified` it saw does not mean that everything
+                        # older was seen: an entry overwritten behind the
+                        # listing would be skipped as unmodified forever.
+                        # (Only a race in which the asset's `modified` moved
+                        # shows up at all; see "Zarr Timestamp Mode" in
+                        # CLAUDE.md.)
+                        hold_last_sync = True
                     else:
                         i += 1
                         if i < MAX_ZARR_SYNCS:
@@ -337,7 +357,7 @@ class ZarrSyncer:
                     " old checksum file present, but we are in verify mode"
                 )
             await self.ds.remove(str(OLD_CHECKSUM_FILE))
-        self.write_sync_file()
+        self.write_sync_file(last_sync if hold_last_sync else self.last_timestamp)
         await self.ds.add(str(SYNC_FILE))
 
     def read_sync_file(self) -> datetime | None:
@@ -359,11 +379,11 @@ class ZarrSyncer:
             )
         return data.last_modified
 
-    def write_sync_file(self) -> None:
+    def write_sync_file(self, last_modified: datetime | None) -> None:
         data = SyncData(
             bucket=self.s3bucket,
             prefix=self.s3prefix,
-            last_modified=self.last_timestamp,
+            last_modified=last_modified,
         )
         (self.repo / SYNC_FILE).parent.mkdir(exist_ok=True)
         (self.repo / SYNC_FILE).write_text(data.model_dump_json(indent=4) + "\n")

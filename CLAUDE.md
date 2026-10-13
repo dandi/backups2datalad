@@ -346,6 +346,24 @@ while newer ones are seen, so the watermark ends up past it.  Hence (000108,
   reported by `check_backup_complete()` as an incomplete backup, with the
   repair (`update-from-backup --mode force <id>`), not as a server change.
   Verify reports it and does not repair it, like any divergence.
+- An entry *overwritten* behind the cursor is present locally, so nothing
+  above catches it, and with the watermark past its new `LastModified` it
+  stays stale.  The race the sync can see is one with an ingest that
+  completes meanwhile: the Zarr asset's `modified` moved since the
+  Dandiset's asset listing (`changed_during_sync`).  Unless the server's
+  checksum then confirms the result, the previous watermark is written back,
+  so the next visit re-examines whatever changed since.  A sync that
+  overlaps an upload still in flight sees no such change (dandi-archive
+  clears the checksum for the whole upload and bumps `modified` only at
+  ingest), so the watermark still advances there: a watermark capped at the
+  listing's start, less a margin, would close that, and a verify comparing
+  content rather than timestamps would find mirrors already left stale.  A
+  Zarr whose server checksum is wrong for good is, once held, synced again on
+  every visit and fails after `MAX_ZARR_SYNCS` passes -- failing its Dandiset
+  on every run until the archive re-ingests it, where it used to warn once.
+  And should the archive move the Zarr asset's `modified` but not the
+  Dandiset's, the next `--mode verify` blames an entry newer than the held
+  watermark, though it is backed up.
 - The stored `.dandi/zarr-checksum` is computed from the server listing, not
   from the local files, so it cannot reveal a missing entry by itself.
 
