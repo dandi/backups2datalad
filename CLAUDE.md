@@ -594,7 +594,13 @@ own requests have no timeout) -- is retried the same way, as it may have
 created the repository too: 001412's Zarr `325e2654-…` was created by a call
 that timed out, and that timeout used to fail the Dandiset.  A thread
 abandoned on that timeout keeps running, may race the retry configuring the
-same sibling, and keeps the process from exiting until it ends.
+same sibling, and keeps the process from exiting until it ends.  After any
+such failure, a 404 on DataLad's lookup (`GET /repos/…`, which it makes only
+once the creation was answered "already exists") is retried the same way:
+GitHub not serving the just-created repository yet.  Without an earlier
+failure, that 404 (an existing repository we cannot see) still fails at once,
+as does a 404 on the creation `POST` (no such organization, or no access); the
+two are told apart by the HTTP method of the `requests.HTTPError`'s request.
 `sync_zarr()` converges on every visit: it pushes whenever HEAD has commits
 the `github` sibling lacks (`has_unpushed_commits()`, a plain push) and
 records the description whenever the `dandi.github-description` cache is
