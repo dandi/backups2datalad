@@ -366,6 +366,28 @@ that many times over, and file descriptors run out (`EMFILE`):
 Per-asset work that needs a subprocess or an open file has to happen behind
 such a bound.
 
+## Index Writes During a Dandiset Sync
+
+While a Dandiset syncs, git-annex's batch processes (`fromkey`, `addurl
+--with-files`) stage the files they create themselves: they queue them and
+run `git update-index` when the queue fills (`annex.queuesize`, 10240 by
+default) and when they exit, concurrently with whatever Git commands we run.
+If `.git/index.lock` is taken at that moment, the whole queued batch is left
+unstaged, yet git-annex has already reported success for each file and still
+exits 0, so nothing we parse notices (#72).  Our `git rm`
+(`AsyncDataset.remove()`) is retried when it finds the lock taken
+(`_retry_on_git_lock()`); git-annex's flush is not.  So any Git command of
+ours that takes the lock during the asset loop -- even one that ends up
+writing nothing -- can cost git-annex a batch of files:
+
+- `Downloader.process_blob()` runs `git rm` only for a file whose content is
+  being replaced, never for a new one.  It used to run one per new file, each
+  taking the lock and reading the whole index (~0.2 s at 177k entries) with
+  nothing to remove: 000571's 177k new files took 15.5 h of it (#62), and the
+  run ended "still dirty after committing".  This narrows the window rather
+  than closing it: replaced files still take the lock, and `fromkey` and
+  `addurl` take it themselves.
+
 ## Asset Paths on Command Lines
 
 Asset paths come from the archive and are passed to Git and git-annex as they
