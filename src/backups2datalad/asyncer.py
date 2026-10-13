@@ -131,6 +131,8 @@ class Downloader:
     download_receiver: MemoryObjectReceiveStream[ToDownload] = field(init=False)
     zarrs: dict[str, ZarrLink] = field(init=False, default_factory=dict)
     need_add: list[str] = field(init=False, default_factory=list)
+    #: Paths handed to git-annex (`fromkey`, `addurl`) to add and stage
+    annex_paths: set[str] = field(init=False, default_factory=set)
 
     def __post_init__(self) -> None:
         (
@@ -302,6 +304,7 @@ class Downloader:
                     # that lock (#72).
                     await self.ds.remove(blob.path)
             if to_update:
+                self.annex_paths.add(blob.path)
                 # Text files above the size limit are annexed as well; cf. the
                 # `.gitattributes` policy set by `cfg_dandiset`.
                 if blob.is_binary() or blob.asset.size > size_limit_bytes():
@@ -617,6 +620,19 @@ async def async_assets(
             await ds.add(".dandi/assets.json")
 
             dm.report.failed += await git_add_manually(ds, dm.need_add, manager.log)
+
+            # git-annex may have failed to stage some of the files it added;
+            # stage them, and refuse to go on past any other unstaged change,
+            # before a commit (here, or `sync_dataset()`'s for a release)
+            # records the backup state (see `AsyncDataset.stage_unstaged()`).
+            if dm.annex_paths and (unstaged := await ds.stage_unstaged(dm.annex_paths)):
+                # Led by a token, so that runs can be audited with `grep`.
+                manager.log.warning(
+                    "ANNEX-UNSTAGED: %s left unstaged by git-annex; staged: %s%s",
+                    quantify(len(unstaged), "file"),
+                    ", ".join(map(shlex.quote, unstaged[:10])),
+                    " ..." if len(unstaged) > 10 else "",
+                )
 
             timestamp = dm.last_timestamp
             for zarr_id, zarrlink in dm.zarrs.items():
