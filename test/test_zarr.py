@@ -20,6 +20,7 @@ import pytest
 import requests
 from test_aioutil import FakeClock, make_gate
 from test_util import GitRepo, zarr_format_of
+from zarr_checksum.tree import ZarrChecksumTree
 
 from backups2datalad.adandi import RemoteZarrAsset
 from backups2datalad.adataset import AsyncDataset, DatasetStats
@@ -1086,3 +1087,97 @@ async def test_sync_zarr_readds_entry_predating_last_sync(
     listing.put("0/2", b"chunk 2\n", t0 + timedelta(minutes=4))
     with pytest.raises(UnexpectedChangeError, match="timestamp was not updated"):
         await visit(error_on_change=True)
+
+
+@pytest.mark.ai_generated
+async def test_sync_zarr_keeps_last_sync_when_modified_during_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An entry overwritten behind the cursor of a listing that raced an upload
+    is repaired by the next sync: when the Zarr's ingest completed during the
+    sync and the server's checksum does not confirm the result, `s3sync.json`
+    keeps the previous last-sync timestamp instead of one past the
+    overwritten entry's, which would have had it skipped as unmodified.
+    """
+    config = BackupConfig(
+        backup_root=tmp_path,
+        zarrs=ResourceConfig(path="zarrs"),
+        dandisets=ResourceConfig(path="dandisets"),
+    )
+    manager = Manager(config=config, gh=None, log=plog, token="token")
+    t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    asset = MagicMock(spec=RemoteZarrAsset)
+    asset.zarr = "zarr1"
+    asset.dandiset_id = "000001"
+    asset.path = "sample.zarr"
+    asset.created = t0
+    asset.modified = t0
+    asset.aclient = MagicMock(api_url="https://api.example")
+    dsdir = tmp_path / "zarrs" / "zarr1"
+    listing = FakeZarrListing(monkeypatch)
+
+    def server_checksum() -> str:
+        zcc = ZarrChecksumTree()
+        for e in listing.entries.values():
+            zcc.add_leaf(Path(e.path), e.size, e.md5_digest)
+        return str(zcc.process())
+
+    def last_modified() -> str:
+        data = json.loads((dsdir / SYNC_FILE).read_text())
+        assert isinstance(data["last_modified"], str)
+        return data["last_modified"]
+
+    def annexed_md5(path: str) -> str:
+        return (dsdir / path).resolve().name.split("--")[1]
+
+    listing.put("0/0", b"chunk 0\n", t0 + timedelta(minutes=1))
+    asset.refetch = AsyncMock(
+        return_value=MagicMock(modified=t0, get_digest_value=server_checksum)
+    )
+    await sync_zarr(asset, None, dsdir, manager)
+    assert last_modified().startswith("2024-01-01T00:01:00")
+
+    # An upload overwrites `0/0` after the listing has passed it and adds
+    # `0/1`, which the listing does see; its ingest completes before the sync
+    # ends.
+    old_00 = listing.entries["0/0"]
+    listing.put("0/0", b"chunk 0, rewritten\n", t0 + timedelta(minutes=2))
+    listing.put("0/1", b"chunk 1\n", t0 + timedelta(minutes=3))
+    new_00 = listing.entries["0/0"]
+    final_checksum = server_checksum()
+    listing.entries["0/0"] = old_00
+    asset.refetch.return_value = MagicMock(
+        modified=t0 + timedelta(minutes=5), get_digest_value=lambda: final_checksum
+    )
+    await sync_zarr(asset, None, dsdir, manager)
+    assert (dsdir / "0" / "1").is_symlink()
+    assert annexed_md5("0/0") == old_00.md5_digest
+    assert last_modified().startswith("2024-01-01T00:01:00")
+
+    # The next sync sees the overwritten entry as newer than the last sync,
+    # repairs it, matches the server's checksum, and moves the timestamp on.
+    listing.entries["0/0"] = new_00
+    asset.modified = t0 + timedelta(minutes=5)
+    asset.refetch.return_value = MagicMock(
+        modified=t0 + timedelta(minutes=5), get_digest_value=server_checksum
+    )
+    await sync_zarr(asset, None, dsdir, manager)
+    assert annexed_md5("0/0") == new_00.md5_digest
+    assert last_modified().startswith("2024-01-01T00:03:00")
+
+    # Likewise when the Zarr changes during a sync and its checksum is not
+    # available yet: nothing confirms the result.
+    listing.put("0/2", b"chunk 2\n", t0 + timedelta(minutes=4))
+    asset.refetch.return_value = MagicMock(
+        modified=t0 + timedelta(minutes=6), get_digest_value=lambda: None
+    )
+    await sync_zarr(asset, None, dsdir, manager)
+    assert (dsdir / "0" / "2").is_symlink()
+    assert last_modified().startswith("2024-01-01T00:03:00")
+    asset.modified = t0 + timedelta(minutes=6)
+    asset.refetch.return_value = MagicMock(
+        modified=t0 + timedelta(minutes=6), get_digest_value=server_checksum
+    )
+    await sync_zarr(asset, None, dsdir, manager)
+    assert last_modified().startswith("2024-01-01T00:04:00")
