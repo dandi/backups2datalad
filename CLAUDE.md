@@ -384,6 +384,16 @@ dandi-archive admits one, because DataLad 1.6.5's `status` (hence
 output use `-z` (`GitRepo.readcmd_z()`), since Git quotes such paths.  Use
 these names rather than inventing plain ones when a test adds paths.
 
+## Failed Dandisets
+
+`update-from-backup` ends with a `RuntimeError` naming the Dandisets whose
+backups failed (`util.describe_failed_dandisets()`), sorted, up to
+`MAX_FAILED_NAMED` (10) of them.  Past that, it gives a `sed` command listing
+them all from the run's log file (`DandiDatasetter.logfile`), which relies on
+`pool_amap()` logging each failure as `Job failed on input <Dandiset
+000123/draft>:` -- change that line or `RemoteDandiset.__repr__()` and the
+hint breaks (`test/test_failed_dandisets.py` runs it against a real log).
+
 ## Superdataset Description
 
 `DandiDatasetter.set_superds_description()` sets the GitHub description of

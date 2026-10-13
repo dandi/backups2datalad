@@ -439,6 +439,8 @@ async def pool_amap(
                 try:
                     outp = await func(inp)
                 except Exception:
+                    # `describe_failed_dandisets()` tells users how to find
+                    # these lines in the log
                     log.exception("Job failed on input %r:", inp)
                     report.failed.append(inp)
                 else:

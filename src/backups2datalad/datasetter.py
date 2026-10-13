@@ -38,6 +38,7 @@ from .util import (
     MirrorMissingError,
     assets_eq,
     custom_commit_env,
+    describe_failed_dandisets,
     describe_superdataset,
     quantify,
     quiescence_wait,
@@ -158,7 +159,9 @@ class DandiDatasetter(AsyncResource):
             )
         if report.failed:
             raise RuntimeError(
-                f"Backups for {quantify(len(report.failed), 'Dandiset')} failed"
+                describe_failed_dandisets(
+                    (d.identifier for d in report.failed), self.logfile
+                )
             )
         elif self.config.gh_org is not None:
             await self.set_superds_description(superds)
