@@ -5,6 +5,7 @@ from collections.abc import (
     AsyncGenerator,
     Awaitable,
     Callable,
+    Collection,
     Iterable,
     Mapping,
     Sequence,
@@ -309,6 +310,83 @@ class AsyncDataset:
             desc += f"\n... and {len(lines) - limit} more"
         return desc
 
+    async def stage_unstaged(self, paths: Collection[str]) -> list[str]:
+        """
+        Stage those of ``paths`` that are untracked, or changed in the working
+        tree but not staged, and return them.  If anything else is not staged
+        (submodules are not looked at), raise `RuntimeError` naming it, and
+        stage nothing.
+
+        For `async_assets()`, which passes the paths it handed to git-annex's
+        ``fromkey`` and ``addurl``.  Those stage their files themselves: they
+        queue them and run ``git update-index`` when the queue fills and when
+        they exit, and if ``.git/index.lock`` is taken at that moment, the
+        whole queued batch is left unstaged, though git-annex has reported
+        success for each file and exits 0 (#72).  Anything else unstaged at
+        that point -- a stray file, a deletion, a nested repository -- is not
+        what such a lost write leaves, and committing the backup state past
+        it would hide it: later runs skip a mirror whose state is current.
+
+        The files are staged with ``git annex add``, as `add()` does, so that
+        ``annex.largefiles`` decides between Git and git-annex, and annexed
+        files are locked like all others in the mirrors.  As ``git annex add``
+        gives up just as silently on a taken lock, the result is checked.
+        """
+        wanted = set(paths)
+        stage: list[str] = []
+        other: list[str] = []
+        for f in await self._unstaged_entries():
+            xy, path = f[:2], f[3:]
+            if (xy == "??" or xy[1] in "MT") and path in wanted:
+                stage.append(path)
+            else:
+                other.append(f)
+        if other:
+            raise RuntimeError(
+                f"{self.path} has unstaged changes besides files git-annex"
+                f" failed to stage: {self._describe_entries(other)}\nClean"
+                " them up (or commit them), reset or commit what this run has"
+                " staged, and run again"
+            )
+        for k in range(0, len(stage), 1000):
+            # git-annex takes paths literally, but `-foo` for an option
+            # without `--`
+            await self.call_annex("add", "--quiet", "--", *stage[k : k + 1000])
+        if stage and (left := await self._unstaged_entries()):
+            raise RuntimeError(
+                f"{self.path}: could not stage files git-annex failed to"
+                f" stage: {self._describe_entries(left)}\nIs something else"
+                " using the repository?  Reset or commit what this run has"
+                " staged, and run again"
+            )
+        return stage
+
+    async def _unstaged_entries(self) -> list[str]:
+        """
+        The ``git status --porcelain -z`` entries with changes in the working
+        tree that are not staged, submodules aside
+        """
+        fields = (
+            await self.read_git(
+                "status",
+                "--porcelain",
+                "-z",
+                # So that no entry carries a second path
+                "--no-renames",
+                "--untracked-files=all",
+                "--ignore-submodules=all",
+                strip=False,
+            )
+        ).split("\0")
+        return [f for f in fields if f and f[1] != " "]
+
+    @staticmethod
+    def _describe_entries(entries: list[str], limit: int = 10) -> str:
+        desc = f"{quantify(len(entries), 'path')}:\n" + "\n".join(entries[:limit])
+        if len(entries) > limit:
+            desc += f"\n... and {len(entries) - limit} more"
+        return desc
+
     async def reset_hard_clean(self, check_clean: bool = False) -> None:
         """
         Discard everything not committed: ``git reset --hard`` followed by
@@ -538,7 +616,8 @@ class AsyncDataset:
         if check_dirty and await self.is_dirty():
             raise RuntimeError(
                 f"{self.path} is still dirty after committing."
-                "  Please check if all changes were staged."
+                "  Please check if all changes were staged;"
+                f" {await self.describe_dirt()}"
             )
 
     async def commit_if_changed(
