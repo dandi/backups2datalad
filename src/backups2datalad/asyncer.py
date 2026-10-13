@@ -294,8 +294,14 @@ class Downloader:
                     )
                     to_update = True
                     self.report.updated += 1
+                    # Only a file being replaced needs a `git rm`.  One per
+                    # *new* file took `.git/index.lock` and read the whole
+                    # index even with nothing to remove -- 177k of them took
+                    # 000571 15.5 h -- and git-annex's own index updates,
+                    # which are not retried, lose their files while we hold
+                    # that lock (#72).
+                    await self.ds.remove(blob.path)
             if to_update:
-                await self.ds.remove(blob.path)
                 # Text files above the size limit are annexed as well; cf. the
                 # `.gitattributes` policy set by `cfg_dandiset`.
                 if blob.is_binary() or blob.asset.size > size_limit_bytes():
