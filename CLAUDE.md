@@ -327,6 +327,28 @@ what a reset costs is the wall clock of re-registering keys, not bytes.  What is
 genuinely lost is uncommitted work, irrecoverably -- there is no evidence kept
 today.
 
+## Zarr Timestamp Mode
+
+In `--zarr-mode timestamp` (the default), `.dandi/s3sync.json`'s
+`last_modified` is a watermark.  `needs_sync()` lists the Zarr and asks for a
+sync if an entry is missing locally, is newer than the watermark, or is gone
+from S3.  The sync then skips entries older than the watermark as "not
+modified since last backup".  An S3 listing is paginated, not a snapshot: a
+Zarr written to while we list it can have an entry missed behind the cursor
+while newer ones are seen, so the watermark ends up past it.  Hence (000108,
+001246, 001769; #66, #90):
+
+- The sync skips an old entry only if the backup has it (`in_backup`).  It
+  used to skip it regardless, so a missing entry was never added back:
+  `needs_sync()` asked for a sync, the sync skipped the entry, and every
+  `--mode verify` run raised.
+- In verify, an entry missing locally that is not newer than the watermark is
+  reported by `check_backup_complete()` as an incomplete backup, with the
+  repair (`update-from-backup --mode force <id>`), not as a server change.
+  Verify reports it and does not repair it, like any divergence.
+- The stored `.dandi/zarr-checksum` is computed from the server listing, not
+  from the local files, so it cannot reveal a missing entry by itself.
+
 ## Per-Asset Fan-Out
 
 `Downloader.asset_loop()` is handed the whole asset listing at once
