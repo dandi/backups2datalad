@@ -177,11 +177,22 @@ class ZarrSyncer:
                             )
                         self.log.debug("%s: Syncing", entry)
                         zcc.add_leaf(Path(entry.path), entry.size, entry.md5_digest)
+                        # `to_delete` starts out as the files in the backup.
+                        # (On a re-run pass, entries seen by the first one are
+                        # no longer in it, so they get hash-checked below,
+                        # while ones it pruned still are, until next visit.)
+                        in_backup = str(entry) in to_delete
                         to_delete.discard(str(entry))
                         if self.mode is ZarrMode.TIMESTAMP:
+                            # An entry the backup lacks is never "not modified
+                            # since last backup", however old it is: a listing
+                            # taken while the Zarr was being written can miss
+                            # it while recording a later `last_modified`, and
+                            # it would then be skipped on every visit.
                             if (
                                 last_sync is not None
                                 and entry.last_modified < last_sync
+                                and in_backup
                             ):
                                 self.log.debug(
                                     "%s: file not modified since last backup", entry
@@ -380,8 +391,25 @@ class ZarrSyncer:
                     try:
                         local_paths.remove(path)
                     except KeyError:
-                        self.check_change(f"entry {path!r} added")
-                        self.log.info("%s on server but not in backup", path)
+                        if obj["LastModified"] <= last_sync:
+                            # Not a change on the server: the entry was there
+                            # by the time of our last sync, which missed it.
+                            self.check_backup_complete(
+                                f"entry {path!r} (last modified"
+                                f" {obj['LastModified']}) is missing from the"
+                                " backup although it is not newer than the"
+                                f" last sync at {last_sync}"
+                            )
+                            self.log.info(
+                                "%s on server but not in backup, although last"
+                                " modified at %s, not after last sync at %s",
+                                path,
+                                obj["LastModified"],
+                                last_sync,
+                            )
+                        else:
+                            self.check_change(f"entry {path!r} added")
+                            self.log.info("%s on server but not in backup", path)
                         return True
                     if obj["LastModified"] > last_sync:
                         self.check_change(f"entry {path!r} modified")
@@ -506,6 +534,17 @@ class ZarrSyncer:
                 f"Dandiset {self.asset.dandiset_id}: Zarr {self.zarr_id}:"
                 f" {event}, but Dandiset draft timestamp was not updated on"
                 " server"
+            )
+
+    def check_backup_complete(self, problem: str) -> None:
+        # Like `check_change()`, but for a backup that diverged from a server
+        # that did not change: verify reports it rather than repairing it, and
+        # says so instead of blaming the server's timestamp.
+        if self.error_on_change:
+            raise UnexpectedChangeError(
+                f"Dandiset {self.asset.dandiset_id}: Zarr {self.zarr_id}:"
+                f" {problem}; the backup is incomplete.  Repair it with"
+                f" `update-from-backup --mode force {self.asset.dandiset_id}`"
             )
 
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-from datetime import datetime, timezone
+from collections.abc import AsyncGenerator, Callable
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
 import logging
 from pathlib import Path
 from shutil import rmtree
@@ -26,7 +28,8 @@ from backups2datalad.config import BackupConfig, Mode, ResourceConfig, ZarrDirty
 from backups2datalad.datasetter import DandiDatasetter
 from backups2datalad.logging import log as plog
 from backups2datalad.manager import Manager
-from backups2datalad.zarr import ZarrLink, sync_zarr
+from backups2datalad.util import UnexpectedChangeError, maxdatetime
+from backups2datalad.zarr import SYNC_FILE, ZarrEntry, ZarrLink, ZarrSyncer, sync_zarr
 
 log = logging.getLogger("test_backups2datalad.test_zarr")
 
@@ -958,3 +961,128 @@ async def test_zarr_dirty_reset_clean(
         with pytest.raises(RuntimeError, match=r"(?s)is dirty.*stray\.txt"):
             await visit(error_on_change=eoc)
         assert (ds.pathobj / "stray.txt").exists()
+
+
+class FakeZarrListing:
+    """
+    Stand-in for a Zarr's S3 listing, patched over `ZarrSyncer`'s two listing
+    methods so that `ZarrSyncer.run()` can be exercised without S3
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.entries: dict[str, ZarrEntry] = {}
+        listing = self
+
+        async def aiter_objects(
+            self: ZarrSyncer, _client: Any
+        ) -> AsyncGenerator[dict[str, Any], None]:
+            for e in sorted(listing.entries.values(), key=str):
+                yield {"Key": self.s3prefix + e.path, "LastModified": e.last_modified}
+
+        async def aiter_file_entries(
+            self: ZarrSyncer, _client: Any
+        ) -> AsyncGenerator[ZarrEntry, None]:
+            for e in sorted(listing.entries.values(), key=str):
+                self.last_timestamp = maxdatetime(self.last_timestamp, e.last_modified)
+                yield e
+
+        monkeypatch.setattr(ZarrSyncer, "aiter_objects", aiter_objects)
+        monkeypatch.setattr(ZarrSyncer, "aiter_file_entries", aiter_file_entries)
+
+    def put(self, path: str, content: bytes, last_modified: datetime) -> None:
+        self.entries[path] = ZarrEntry(
+            path=path,
+            size=len(content),
+            md5_digest=hashlib.md5(content).hexdigest(),
+            last_modified=last_modified,
+            bucket_url=f"https://bucket.example/{path}",
+        )
+
+
+@pytest.mark.ai_generated
+async def test_sync_zarr_readds_entry_predating_last_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A Zarr backup lacking an entry whose S3 `LastModified` is not newer than
+    the last sync gets it back on the next timestamp-mode sync -- it used to be
+    skipped as "not modified since last backup" on every visit, so the backup
+    stayed incomplete for good (000108, 001246, 001769; #66) -- and verify
+    reports it as an incomplete backup rather than as a server-side change.
+    """
+    config = BackupConfig(
+        backup_root=tmp_path,
+        zarrs=ResourceConfig(path="zarrs"),
+        dandisets=ResourceConfig(path="dandisets"),
+    )
+    manager = Manager(config=config, gh=None, log=plog, token="token")
+    t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    asset = MagicMock(spec=RemoteZarrAsset)
+    asset.zarr = "zarr1"
+    asset.dandiset_id = "000001"
+    asset.path = "sample.zarr"
+    asset.created = t0
+    asset.modified = t0
+    asset.aclient = MagicMock(api_url="https://api.example")
+    # Same `modified` and no checksum: the Zarr did not change during a sync.
+    asset.refetch = AsyncMock(
+        return_value=MagicMock(modified=t0, get_digest_value=lambda: None)
+    )
+    dsdir = tmp_path / "zarrs" / "zarr1"
+    repo = GitRepo(dsdir)
+    listing = FakeZarrListing(monkeypatch)
+    listing.put(".zattrs", b"{}\n", t0 + timedelta(minutes=1))
+    listing.put("0/0", b"chunk 0\n", t0 + timedelta(minutes=2))
+    listing.put("0/1", b"chunk 1\n", t0 + timedelta(minutes=3))
+
+    def sync_file() -> dict[str, Any]:
+        data = json.loads((dsdir / SYNC_FILE).read_text())
+        assert isinstance(data, dict)
+        return data
+
+    async def visit(error_on_change: bool = False) -> None:
+        await sync_zarr(asset, None, dsdir, manager, error_on_change=error_on_change)
+
+    def tracked() -> set[str]:
+        return set(repo.readcmd_z("ls-tree", "-rz", "--name-only", "HEAD"))
+
+    await visit()
+    assert {".zattrs", "0/0", "0/1"} <= tracked()
+    assert sync_file()["last_modified"].startswith("2024-01-01T00:03:00")
+
+    def lose(path: str) -> None:
+        # As a listing that raced the upload of `path` would have left it
+        repo.runcmd("rm", "-q", "--", path, check=True)
+        repo.runcmd("commit", "-q", "-m", f"Lose {path}", check=True)
+        assert path not in tracked()
+
+    lose(".zattrs")
+    caplog.clear()
+    await visit()
+    assert ".zattrs" in tracked()
+    assert not await AsyncDataset(dsdir).is_dirty()
+    head = repo.readcmd("log", "-1", "--format=%s")
+    assert head == "[backups2datalad] 1 file added"
+    # Old entries the backup has are still skipped.
+    assert "0/0: file not modified since last backup" in caplog.text
+
+    # Verify does not repair it, and says what is wrong instead of blaming
+    # the server's timestamp -- also for an entry exactly as old as the last
+    # sync, which that sync's listing must have included.
+    for path in [".zattrs", "0/1"]:
+        lose(path)
+        with pytest.raises(UnexpectedChangeError) as excinfo:
+            await visit(error_on_change=True)
+        msg = str(excinfo.value)
+        assert repr(path) in msg
+        assert "missing from the backup although it is not newer than" in msg
+        assert "--mode force 000001" in msg
+        assert "timestamp was not updated" not in msg
+        assert path not in tracked()
+        await visit()
+        assert path in tracked()
+
+    # An entry that is new on the server is still a server-side change.
+    listing.put("0/2", b"chunk 2\n", t0 + timedelta(minutes=4))
+    with pytest.raises(UnexpectedChangeError, match="timestamp was not updated"):
+        await visit(error_on_change=True)
