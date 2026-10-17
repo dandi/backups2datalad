@@ -1172,23 +1172,25 @@ class AsyncDataset:
         log.info("%s: Counting up files ...", self.path)
         files = 0
         size = 0
-        # Annexed files are symlinks and, if unlocked, pointer files in Git
-        # (the mirrors never unlock files themselves, but a plain `git add`
-        # does), sized by git-annex below, less the annexed metadata files
+        # Annexed files are symlinks (but for unlocked files, below), sized by
+        # git-annex below, less the annexed metadata files
         symlinks = 0
-        # Blobs to read as links to keys: those small enough to be pointer
-        # files, and the symlinks of metadata files, whose keys size them
+        annexed_meta: list[str] = []
+        # Blobs small enough to be pointer files, i.e. unlocked annexed files
         maybe_unlocked: list[FileStat] = []
-        maybe_meta: list[FileStat] = []
         submodules: list[str] = []
         async with aclosing(self.aiter_file_stats(commit)) as fstats:
             async for filestat in fstats:
-                small = filestat.size is not None and filestat.size <= MAX_POINTER_SIZE
+                if (
+                    filestat.type is ObjectType.BLOB
+                    and filestat.mode != SYMLINK_MODE
+                    and filestat.size is not None
+                    and filestat.size <= MAX_POINTER_SIZE
+                ):
+                    maybe_unlocked.append(filestat)
                 if is_meta_file(filestat.path, dandiset=True):
-                    if filestat.mode == SYMLINK_MODE or (
-                        filestat.type is ObjectType.BLOB and small
-                    ):
-                        maybe_meta.append(filestat)
+                    if filestat.mode == SYMLINK_MODE:
+                        annexed_meta.append(filestat.object)
                 elif filestat.type is ObjectType.COMMIT:
                     submodules.append(filestat.path)
                 else:
@@ -1198,23 +1200,12 @@ class AsyncDataset:
                     else:
                         assert filestat.size is not None
                         size += filestat.size
-                        if small:
-                            maybe_unlocked.append(filestat)
-        keys = await self.get_pointer_keys(
-            f.object for f in maybe_meta + maybe_unlocked
-        )
-        unlocked = [f for f in maybe_unlocked if f.object in keys]
-        for f in unlocked:
-            # Not in Git after all
-            assert f.size is not None
-            size -= f.size
-        annexed_meta = [f for f in maybe_meta if f.object in keys]
-        if symlinks or unlocked or annexed_meta:
+        if symlinks or annexed_meta:
             annexed = await self.get_annexed_tree_stats(commit)
-            for f in annexed_meta:
+
+            def subtract_meta(key: str) -> None:
                 # E.g. .dandi/assets.json, or dandiset.yaml under a low
                 # BACKUPS2DATALAD_TEXT_SIZE_LIMIT
-                key = keys[f.object]
                 if (keysize := AnnexRepo.get_size_from_key(key)) is None:
                     raise RuntimeError(
                         f"{self.path}: cannot size annexed metadata file with"
@@ -1222,11 +1213,34 @@ class AsyncDataset:
                     )
                 annexed.files -= 1
                 annexed.size -= keysize
-            if annexed.files != symlinks + len(unlocked):
+
+            for blob in annexed_meta:
+                # Few, so read one by one.  A symlink's blob is its target,
+                # which ends in the key.
+                subtract_meta(Path(await self.read_git("cat-file", "blob", blob)).name)
+            unlocked = 0
+            if annexed.files != symlinks:
+                # Then look for unlocked files, pointer files in Git that
+                # git-annex counts too: a plain `git add` makes them (e.g.
+                # 000026's .dandi/assets.json).  Only then, as it reads every
+                # blob small enough to be one; when the counts match, there are
+                # none, barring as many symlinks not into the annex.
+                keys = await self.get_pointer_keys(f.object for f in maybe_unlocked)
+                for f in maybe_unlocked:
+                    if (key := keys.get(f.object)) is None:
+                        continue
+                    if is_meta_file(f.path, dandiset=True):
+                        subtract_meta(key)
+                    else:
+                        # Sized by git-annex, not as a blob in Git
+                        assert f.size is not None
+                        size -= f.size
+                        unlocked += 1
+            if annexed.files != symlinks + unlocked:
                 raise RuntimeError(
                     f"{self.path}: git-annex counts {annexed.files} annexed"
                     f" files in {commit}, but it has {symlinks} symlinks and"
-                    f" {len(unlocked)} unlocked files"
+                    f" {unlocked} unlocked files"
                 )
             size += annexed.size
         for path in submodules:
