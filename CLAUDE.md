@@ -526,20 +526,14 @@ its own mirror's stats, and caches the result in `dandi.stats` as
   top-level file.)  A key without a size makes `git annex info` report e.g.
   `5500 (+ 1 unknown size)`, which is an error.
 - An annexed file is told apart in `ls-tree` by being a symlink or, if
-  unlocked, a pointer file: a blob of up to `MAX_POINTER_SIZE` (32 KiB,
-  git-annex's own limit) that `pointer_key()` reads as a link to a key, by
-  git-annex's rules.  The mirrors do not unlock files themselves, but a plain
-  `git add` of a file matching `annex.largefiles` does -- metadata too, since
-  `annex.dotfiles=true` -- and such a file can stay unlocked: 000026's
-  `.dandi/assets.json` went from pointer to pointer in a later commit.  An
-  unlocked file is sized by its key (in git-annex's total), not as its
-  pointer's blob, and an unlocked metadata file is subtracted like a locked
-  one.
-- The count is checked against git-annex's: a symlink not into the annex, or
-  a link to a key that was not recognised, fails the count rather than skews
-  it, and the error names those files (`describe_annexed_mismatch()`, a
-  `git annex find --branch` pass made only then).  A key shared by several
-  files is no mismatch: both count it once per file.
+  unlocked, a pointer file: a blob of up to `MAX_POINTER_SIZE` (1 KiB) that
+  `pointer_key()` reads as a link to a key, by git-annex's rules.  The mirrors
+  do not unlock files themselves, but a plain `git add` of a file matching
+  `annex.largefiles` does -- metadata too, since `annex.dotfiles=true` (as
+  000026's `.dandi/assets.json` was).  An unlocked file is sized by its key,
+  not as its pointer's blob.  The count is checked against git-annex's: a
+  symlink not into the annex, or a link to a key not recognised, fails the
+  count rather than skews it.
 - Zarr URLs come from the commit's `.gitmodules`
   (`get_repo_config(..., blob="<commit>:.gitmodules")`), following the
   submodule-name-is-path convention used throughout.
@@ -547,10 +541,9 @@ its own mirror's stats, and caches the result in `dandi.stats` as
   took ~7 s; reading the symlinks with `git cat-file --batch` and parsing the
   keys would take ~0.6 s, but would duplicate git-annex's and DataLad's
   (`AnnexRepo.get_size_from_key()`) key handling), plus one
-  `git cat-file --batch` over every blob that could be a pointer file and the
-  symlinks of metadata files (`get_pointer_keys()`; 0.12 s for 000026's
-  19,390 blobs up to 2 KiB).  The stats are cached, so only a changed mirror
-  is recounted.
+  `git cat-file --batch` over the blobs that could be pointer files and the
+  symlinks of metadata files (`get_pointer_keys()`).  The stats are cached, so
+  only a changed mirror is recounted.
 - A Zarr's stats are those of its mirror's `HEAD`, not of the commit the
   Dandiset records for it (see the TODO in `get_zarr_sub_stats()`).
 

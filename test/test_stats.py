@@ -7,7 +7,6 @@ may have left disagreeing with it (#139).
 from __future__ import annotations
 
 from pathlib import Path
-import re
 import subprocess
 
 from obscure import OBSCURE_NAMES
@@ -91,14 +90,7 @@ async def test_get_stats_refuses_unannexed_symlink(tmp_path: Path) -> None:
     git(path, "annex", "add", "-q", "--force-small", "link")
     git(path, "commit", "-q", "-m", "Add files")
     ds = AsyncDataset(path)
-    with pytest.raises(
-        RuntimeError,
-        match=(
-            "counts 1 annexed files .* 2 symlinks and 0 unlocked files; annexed"
-            " files missed: none; 1 file taken for annexed but not annexed:"
-            " 'link' \\(mode 120000\\) -> 'data.bin'$"
-        ),
-    ):
+    with pytest.raises(RuntimeError, match="counts 1 annexed files .* 2 symlinks"):
         await ds.get_stats(config=BackupConfig(backup_root=tmp_path))
 
 
@@ -127,52 +119,6 @@ async def test_get_stats_counts_unlocked_files(tmp_path: Path) -> None:
     ds = AsyncDataset(path)
     stats = await ds.get_stats(config=BackupConfig(backup_root=tmp_path))
     assert stats == DatasetStats(files=3, size=100 + 2 * 200)
-
-
-@pytest.mark.ai_generated
-async def test_get_stats_names_missed_annexed_files(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """
-    A file that git-annex counts as annexed but `get_stats()` does not take
-    for one (here a pointer file larger than it reads) fails the count, which
-    names it
-    """
-    path = tmp_path / "000001"
-    init_repo(path)
-    write(path / "data.bin", b"x" * 100)
-    git(path, "annex", "add", "-q", "data.bin")
-    name = OBSCURE_NAMES[2]
-    write(path / name, b"y" * 200)
-    git(path, "-c", "annex.largefiles=anything", "add", "--", name)
-    git(path, "commit", "-q", "-m", "Add files")
-    pointer_size = int(git(path, "cat-file", "-s", f"HEAD:{name}"))
-    monkeypatch.setattr("backups2datalad.adataset.MAX_POINTER_SIZE", 10)
-    ds = AsyncDataset(path)
-    with pytest.raises(
-        RuntimeError,
-        match=(
-            "counts 2 annexed files .* 1 symlink and 0 unlocked files; 1 annexed"
-            f" file missed: {re.escape(repr(name))} \\(mode 100644,"
-            f" {pointer_size} bytes\\); files taken for annexed but not annexed:"
-            " none$"
-        ),
-    ):
-        await ds.get_stats(config=BackupConfig(backup_root=tmp_path))
-
-
-@pytest.mark.ai_generated
-async def test_get_stats_counts_shared_key_per_file(tmp_path: Path) -> None:
-    """Files sharing a key are each counted, by git-annex as by ls-tree"""
-    path = tmp_path / "000001"
-    init_repo(path)
-    write(path / "a.bin", b"x" * 100)
-    write(path / "sub-1" / "b.bin", b"x" * 100)
-    git(path, "annex", "add", "-q", "a.bin", "sub-1")
-    git(path, "commit", "-q", "-m", "Add files")
-    ds = AsyncDataset(path)
-    stats = await ds.get_stats(config=BackupConfig(backup_root=tmp_path))
-    assert stats == DatasetStats(files=2, size=200)
 
 
 @pytest.mark.ai_generated

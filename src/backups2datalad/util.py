@@ -350,8 +350,7 @@ def pointer_key(content: bytes) -> str | None:
     git-annex 10.20260901: a single line (with or without a final newline,
     and a trailing CR dropped) containing ``/annex/objects/`` and ending in a
     key -- a pointer file (``/annex/objects/<key>``, i.e. an unlocked file),
-    or a symlink's target.  git-annex reads only blobs of up to
-    `MAX_POINTER_SIZE` bytes so.
+    or a symlink's target.
     """
     line, _, rest = content.partition(b"\n")
     line = line.removesuffix(b"\r")
