@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 
+from obscure import OBSCURE_NAMES
 import pytest
 
 from backups2datalad.adataset import AsyncDataset, DatasetStats
@@ -91,6 +92,33 @@ async def test_get_stats_refuses_unannexed_symlink(tmp_path: Path) -> None:
     ds = AsyncDataset(path)
     with pytest.raises(RuntimeError, match="counts 1 annexed files .* 2 symlinks"):
         await ds.get_stats(config=BackupConfig(backup_root=tmp_path))
+
+
+@pytest.mark.ai_generated
+async def test_get_stats_counts_unlocked_files(tmp_path: Path) -> None:
+    """
+    A plain ``git add`` of a file matching ``annex.largefiles`` (with
+    ``annex.dotfiles``, a metadata file too) annexes it unlocked, as a pointer
+    file in Git, which is counted as annexed like a symlink, and sized by its
+    key rather than as a blob
+    """
+    path = tmp_path / "000001"
+    init_repo(path)
+    write(path / "data.bin", b"x" * 100)
+    git(path, "annex", "add", "-q", "data.bin")
+    # Two files sharing a key, hence a pointer blob too
+    names = OBSCURE_NAMES[1:]
+    for name in names:
+        write(path / "sub-1" / name, b"y" * 200)
+    write(path / ".dandi" / "assets.json", b"[]" * 50)
+    git(path, "-c", "annex.largefiles=anything", "add", "--", "sub-1", ".dandi")
+    git(path, "commit", "-q", "-m", "Add files")
+    unlocked = [f"sub-1/{name}" for name in names] + [".dandi/assets.json"]
+    for p in unlocked:
+        assert git(path, "ls-files", "-s", "--", p).startswith("100644 ")
+    ds = AsyncDataset(path)
+    stats = await ds.get_stats(config=BackupConfig(backup_root=tmp_path))
+    assert stats == DatasetStats(files=3, size=100 + 2 * 200)
 
 
 @pytest.mark.ai_generated

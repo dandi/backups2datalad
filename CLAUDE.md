@@ -525,10 +525,18 @@ its own mirror's stats, and caches the result in `dandi.stats` as
   options for a tree, and `<commit>:.dandi` would cover directories but not a
   top-level file.)  A key without a size makes `git annex info` report e.g.
   `5500 (+ 1 unknown size)`, which is an error.
-- An annexed file is told apart in `ls-tree` by being a symlink (the mirrors
-  never unlock files), and the count is checked against git-annex's: a symlink
-  not into the annex, or an unlocked file, fails the count rather than skews
-  it.
+- An annexed file is told apart in `ls-tree` by being a symlink, and the
+  count is checked against git-annex's.  If they differ, unlocked files are
+  looked for: pointer files, blobs of up to `MAX_POINTER_SIZE` (1 KiB) that
+  `pointer_key()` reads as links to keys, by git-annex's rules, read with one
+  `git cat-file --batch` (`get_pointer_keys()`).  The mirrors do not unlock
+  files themselves, but a plain `git add` of a file matching
+  `annex.largefiles` does -- metadata too, since `annex.dotfiles=true` (as
+  000026's `.dandi/assets.json` was).  An unlocked file is sized by its key,
+  not as its pointer's blob.  Matching counts are taken to mean there are no
+  unlocked files (barring as many symlinks not into the annex), which saves
+  the read.  A symlink not into the annex, or a link to a key not recognised,
+  fails the count rather than skews it.
 - Zarr URLs come from the commit's `.gitmodules`
   (`get_repo_config(..., blob="<commit>:.gitmodules")`), following the
   submodule-name-is-path convention used throughout.

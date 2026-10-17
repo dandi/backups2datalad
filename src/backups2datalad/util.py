@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import shlex
 import sys
 import textwrap
@@ -335,6 +336,28 @@ def quantify(qty: int, singular: str, plural: str | None = None) -> str:
 
 def key2hash(key: str) -> str:
     return key.split("-")[-1].partition(".")[0]
+
+
+#: A git-annex key, as `pointer_key()` tells one: a backend, fields such as
+#: ``-s<size>``, then ``--`` and the name
+ANNEX_KEY_RGX = re.compile(r"[A-Z0-9]+(?:-[a-zA-Z][0-9]+)*--.*", flags=re.DOTALL)
+
+
+def pointer_key(content: bytes) -> str | None:
+    """
+    The key linked to by a blob with content ``content``, if git-annex would
+    take the blob for an annexed file, or else `None`.  That is, as with
+    git-annex 10.20260901: a single line (with or without a final newline,
+    and a trailing CR dropped) containing ``/annex/objects/`` and ending in a
+    key -- a pointer file (``/annex/objects/<key>``, i.e. an unlocked file),
+    or a symlink's target.
+    """
+    line, _, rest = content.partition(b"\n")
+    line = line.removesuffix(b"\r")
+    if rest or b"/annex/objects/" not in line:
+        return None
+    key = line.rpartition(b"/")[2].decode("utf-8", "surrogateescape")
+    return key if ANNEX_KEY_RGX.fullmatch(key) else None
 
 
 def format_errors(messages: list[str]) -> str:
