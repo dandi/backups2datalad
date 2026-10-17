@@ -528,7 +528,12 @@ its own mirror's stats, and caches the result in `dandi.stats` as
 - An annexed file is told apart in `ls-tree` by being a symlink (the mirrors
   never unlock files), and the count is checked against git-annex's: a symlink
   not into the annex, or an unlocked file, fails the count rather than skews
-  it.
+  it.  The error names those files (`describe_annexed_mismatch()`, a
+  `git annex find --branch` pass made only then).  An unlocked file is what a
+  plain `git add` makes of a file matching `annex.largefiles` -- metadata too,
+  since `annex.dotfiles=true` -- where `git annex add` makes a symlink (and
+  relocks an unlocked file).  A key shared by several files is no mismatch:
+  both count it once per file.
 - Zarr URLs come from the commit's `.gitmodules`
   (`get_repo_config(..., blob="<commit>:.gitmodules")`), following the
   submodule-name-is-path convention used throughout.

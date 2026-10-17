@@ -768,6 +768,78 @@ class AsyncDataset:
             )
         return DatasetStats(files=info["annexed files in tree"], size=int(size))
 
+    async def describe_annexed_mismatch(self, commit: str, limit: int = 10) -> str:
+        """
+        Name the files of ``commit`` that ``git annex info`` and `get_stats()`
+        disagree on, for the error raised when their counts of annexed files
+        differ: annexed files that are not symlinks, i.e. unlocked (a pointer
+        file in Git, which `get_stats()` sizes as a blob, or, for a metadata
+        file, does not subtract), and symlinks that are not annexed.  Each
+        file is counted, so a key shared by two files is no mismatch.
+
+        ``git annex find --branch`` reads the tree as ``git annex info`` does,
+        i.e. every blob that parses as a link to a key, whatever its mode.  It
+        is a second pass over all annexed files, so it is left to errors.
+        """
+        annexed: set[str] = set()
+        async with aclosing(
+            stream_lines_command(
+                "git",
+                *GIT_OPTIONS,
+                # A read-only query: no need to merge git-annex branches
+                "-c",
+                "annex.merge-annex-branches=false",
+                "annex",
+                "find",
+                "--include=*",
+                f"--branch={commit}",
+                "--json",
+                cwd=self.pathobj,
+            )
+        ) as p:
+            async for line in p:
+                annexed.add(json.loads(line)["file"])
+        unlocked: list[FileStat] = []
+        unannexed: list[FileStat] = []
+        async with aclosing(self.aiter_file_stats(commit)) as fstats:
+            async for fst in fstats:
+                if fst.path in annexed:
+                    if fst.mode != SYMLINK_MODE:
+                        unlocked.append(fst)
+                elif fst.mode == SYMLINK_MODE:
+                    unannexed.append(fst)
+
+        def describe(singular: str, plural: str, entries: list[str], total: int) -> str:
+            if not entries:
+                return f"{plural}: none"
+            desc = f"{quantify(total, singular, plural)}: " + ", ".join(entries)
+            if total > len(entries):
+                desc += f", ... ({total - len(entries)} more)"
+            return desc
+
+        unlocked_desc = [f"{f.path!r} (mode {f.mode})" for f in unlocked[:limit]]
+        unannexed_desc = [
+            # A symlink's blob is its target
+            f"{f.path!r} -> {await self.read_git('cat-file', 'blob', f.object)!r}"
+            for f in unannexed[:limit]
+        ]
+        return "; ".join(
+            [
+                describe(
+                    "annexed file not a symlink",
+                    "annexed files not symlinks",
+                    unlocked_desc,
+                    len(unlocked),
+                ),
+                describe(
+                    "symlink not annexed",
+                    "symlinks not annexed",
+                    unannexed_desc,
+                    len(unannexed),
+                ),
+            ]
+        )
+
     async def aiter_annexed_files(self) -> AsyncGenerator[AnnexedFile, None]:
         async with aclosing(
             stream_lines_command(
@@ -1155,7 +1227,8 @@ class AsyncDataset:
             if annexed.files != symlinks:
                 raise RuntimeError(
                     f"{self.path}: git-annex counts {annexed.files} annexed"
-                    f" files in {commit}, but it has {symlinks} symlinks"
+                    f" files in {commit}, but it has {symlinks} symlinks; "
+                    + await self.describe_annexed_mismatch(commit)
                 )
             size += annexed.size
         for path in submodules:

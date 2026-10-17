@@ -7,8 +7,10 @@ may have left disagreeing with it (#139).
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import subprocess
 
+from obscure import OBSCURE_NAMES
 import pytest
 
 from backups2datalad.adataset import AsyncDataset, DatasetStats
@@ -89,8 +91,58 @@ async def test_get_stats_refuses_unannexed_symlink(tmp_path: Path) -> None:
     git(path, "annex", "add", "-q", "--force-small", "link")
     git(path, "commit", "-q", "-m", "Add files")
     ds = AsyncDataset(path)
-    with pytest.raises(RuntimeError, match="counts 1 annexed files .* 2 symlinks"):
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "counts 1 annexed files .* 2 symlinks; annexed files not symlinks:"
+            " none; 1 symlink not annexed: 'link' -> 'data.bin'$"
+        ),
+    ):
         await ds.get_stats(config=BackupConfig(backup_root=tmp_path))
+
+
+@pytest.mark.ai_generated
+async def test_get_stats_names_unlocked_files(tmp_path: Path) -> None:
+    """
+    A plain ``git add`` of a file matching ``annex.largefiles`` (with
+    ``annex.dotfiles``, a metadata file too) annexes it unlocked, as a pointer
+    file in Git: git-annex counts it, but it is not a symlink, so the count
+    fails and names it
+    """
+    path = tmp_path / "000001"
+    init_repo(path)
+    write(path / "data.bin", b"x" * 100)
+    git(path, "annex", "add", "-q", "data.bin")
+    name = OBSCURE_NAMES[2]
+    write(path / name, b"y" * 200)
+    write(path / ".dandi" / "assets.json", b"[]" * 50)
+    git(path, "-c", "annex.largefiles=anything", "add", "--", name, ".dandi")
+    git(path, "commit", "-q", "-m", "Add files")
+    assert git(path, "ls-files", "-s", "--", ".dandi").startswith("100644 ")
+    ds = AsyncDataset(path)
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "counts 3 annexed files .* 1 symlinks; 2 annexed files not symlinks:"
+            f" {re.escape(repr(name))} \\(mode 100644\\),"
+            " '.dandi/assets.json' \\(mode 100644\\); symlinks not annexed: none$"
+        ),
+    ):
+        await ds.get_stats(config=BackupConfig(backup_root=tmp_path))
+
+
+@pytest.mark.ai_generated
+async def test_get_stats_counts_shared_key_per_file(tmp_path: Path) -> None:
+    """Files sharing a key are each counted, by git-annex as by ls-tree"""
+    path = tmp_path / "000001"
+    init_repo(path)
+    write(path / "a.bin", b"x" * 100)
+    write(path / "sub-1" / "b.bin", b"x" * 100)
+    git(path, "annex", "add", "-q", "a.bin", "sub-1")
+    git(path, "commit", "-q", "-m", "Add files")
+    ds = AsyncDataset(path)
+    stats = await ds.get_stats(config=BackupConfig(backup_root=tmp_path))
+    assert stats == DatasetStats(files=2, size=200)
 
 
 @pytest.mark.ai_generated
