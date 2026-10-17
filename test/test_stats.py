@@ -94,20 +94,49 @@ async def test_get_stats_refuses_unannexed_symlink(tmp_path: Path) -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            "counts 1 annexed files .* 2 symlinks; annexed files not symlinks:"
-            " none; 1 symlink not annexed: 'link' -> 'data.bin'$"
+            "counts 1 annexed files .* 2 symlinks and 0 unlocked files; annexed"
+            " files missed: none; 1 file taken for annexed but not annexed:"
+            " 'link' \\(mode 120000\\) -> 'data.bin'$"
         ),
     ):
         await ds.get_stats(config=BackupConfig(backup_root=tmp_path))
 
 
 @pytest.mark.ai_generated
-async def test_get_stats_names_unlocked_files(tmp_path: Path) -> None:
+async def test_get_stats_counts_unlocked_files(tmp_path: Path) -> None:
     """
     A plain ``git add`` of a file matching ``annex.largefiles`` (with
     ``annex.dotfiles``, a metadata file too) annexes it unlocked, as a pointer
-    file in Git: git-annex counts it, but it is not a symlink, so the count
-    fails and names it
+    file in Git, which is counted as annexed like a symlink, and sized by its
+    key rather than as a blob
+    """
+    path = tmp_path / "000001"
+    init_repo(path)
+    write(path / "data.bin", b"x" * 100)
+    git(path, "annex", "add", "-q", "data.bin")
+    # Two files sharing a key, hence a pointer blob too
+    names = OBSCURE_NAMES[1:]
+    for name in names:
+        write(path / "sub-1" / name, b"y" * 200)
+    write(path / ".dandi" / "assets.json", b"[]" * 50)
+    git(path, "-c", "annex.largefiles=anything", "add", "--", "sub-1", ".dandi")
+    git(path, "commit", "-q", "-m", "Add files")
+    unlocked = [f"sub-1/{name}" for name in names] + [".dandi/assets.json"]
+    for p in unlocked:
+        assert git(path, "ls-files", "-s", "--", p).startswith("100644 ")
+    ds = AsyncDataset(path)
+    stats = await ds.get_stats(config=BackupConfig(backup_root=tmp_path))
+    assert stats == DatasetStats(files=3, size=100 + 2 * 200)
+
+
+@pytest.mark.ai_generated
+async def test_get_stats_names_missed_annexed_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A file that git-annex counts as annexed but `get_stats()` does not take
+    for one (here a pointer file larger than it reads) fails the count, which
+    names it
     """
     path = tmp_path / "000001"
     init_repo(path)
@@ -115,17 +144,18 @@ async def test_get_stats_names_unlocked_files(tmp_path: Path) -> None:
     git(path, "annex", "add", "-q", "data.bin")
     name = OBSCURE_NAMES[2]
     write(path / name, b"y" * 200)
-    write(path / ".dandi" / "assets.json", b"[]" * 50)
-    git(path, "-c", "annex.largefiles=anything", "add", "--", name, ".dandi")
+    git(path, "-c", "annex.largefiles=anything", "add", "--", name)
     git(path, "commit", "-q", "-m", "Add files")
-    assert git(path, "ls-files", "-s", "--", ".dandi").startswith("100644 ")
+    pointer_size = int(git(path, "cat-file", "-s", f"HEAD:{name}"))
+    monkeypatch.setattr("backups2datalad.adataset.MAX_POINTER_SIZE", 10)
     ds = AsyncDataset(path)
     with pytest.raises(
         RuntimeError,
         match=(
-            "counts 3 annexed files .* 1 symlinks; 2 annexed files not symlinks:"
-            f" {re.escape(repr(name))} \\(mode 100644\\),"
-            " '.dandi/assets.json' \\(mode 100644\\); symlinks not annexed: none$"
+            "counts 2 annexed files .* 1 symlink and 0 unlocked files; 1 annexed"
+            f" file missed: {re.escape(repr(name))} \\(mode 100644,"
+            f" {pointer_size} bytes\\); files taken for annexed but not annexed:"
+            " none$"
         ),
     ):
         await ds.get_stats(config=BackupConfig(backup_root=tmp_path))

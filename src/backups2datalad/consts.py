@@ -32,6 +32,11 @@ USER_AGENT = "backups2datalad ({}) httpx/{} {}/{}".format(
 
 GIT_OPTIONS = ["-c", "receive.autogc=0", "-c", "gc.auto=0"]
 
+# The largest blob that git-annex reads to see whether it links to a key, i.e.
+# is a pointer file (an unlocked annexed file) -- its `maxPointerSz`, as found
+# by trial with git-annex 10.20260901
+MAX_POINTER_SIZE = 32768
+
 # Maximum number of times to repeatedly sync a Zarr in case of local-vs.-server
 # checksum mismatch
 MAX_ZARR_SYNCS = 5
