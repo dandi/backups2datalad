@@ -250,7 +250,10 @@ a plain file read.
 What this deliberately does *not* catch: staged or unstaged junk on a mirror
 whose recorded state is current on both sides, since nothing then makes it look
 stale.  Everything an interrupted sync leaves behind does make it look stale,
-because the sync writes the state last.  For the rest there is
+because the sync writes the state last; and in a segment that handed
+git-annex files to add, it stages what git-annex failed to stage before
+writing the state, and refuses to go on past any other unstaged change (see
+"Index Writes During a Dandiset Sync").  For the rest there is
 `tools/find-INVISIBLE-changed.sh` on drogon, a fleet-wide sweep
 (`git diff-index --cached --quiet HEAD` per mirror, ~12 s for all of them).
 
@@ -405,6 +408,21 @@ writing nothing -- can cost git-annex a batch of files:
   run ended "still dirty after committing".  This narrows the window rather
   than closing it: replaced files still take the lock, and `fromkey` and
   `addurl` take it themselves.
+- After each segment's downloads, `async_assets()` runs
+  `AsyncDataset.stage_unstaged()` on the paths it handed to `fromkey` and
+  `addurl` (`Downloader.annex_paths`).  It `git annex add`s those left
+  untracked or modified but unstaged, logging a WARNING led by
+  `ANNEX-UNSTAGED:` that names them.  It raises instead if anything else is
+  unstaged (a stray file, a deletion, a nested repository; submodules are
+  not looked at), before the segment's commit -- or, for a release,
+  `sync_dataset()`'s -- writes the backup state, since later runs skip a
+  mirror whose state is current and its dirt would go unreported.  As `git
+  annex add` gives up as silently on a taken lock, it checks the result.  In
+  a normal sync nothing is unstaged there, so the WARNING means git-annex
+  lost a write.  A segment that handed git-annex nothing (only Zarrs or
+  metadata) is not checked; there `commit()`'s "still dirty after
+  committing" still comes after the state is written, naming the dirt now
+  (`describe_dirt()`).
 
 ## Asset Paths on Command Lines
 

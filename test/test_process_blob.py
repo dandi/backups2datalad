@@ -105,6 +105,8 @@ async def test_process_blob_removes_only_replaced_files(
             await dm.process_blob(blob, sender)
     # `fromkey` stages its files when it exits, i.e. by here.
     assert removed == ([path] if case == "modified" else [])
+    # What `async_assets()` checks for files git-annex failed to stage
+    assert dm.annex_paths == (set() if case == "unchanged" else {path})
     status = git(repo, "status", "--porcelain", "-z")
     assert (
         status
