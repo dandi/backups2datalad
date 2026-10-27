@@ -13,7 +13,6 @@ import os
 import os.path
 from pathlib import Path, PurePosixPath
 import shlex
-import subprocess
 from types import TracebackType
 
 import anyio
@@ -130,6 +129,9 @@ class Downloader:
     download_sender: MemoryObjectSendStream[ToDownload] = field(init=False)
     download_receiver: MemoryObjectReceiveStream[ToDownload] = field(init=False)
     zarrs: dict[str, ZarrLink] = field(init=False, default_factory=dict)
+    #: Files to `git add` once git-annex's processes are done: those `addurl`
+    #: failed to add, and those it and `fromkey` added and staged themselves,
+    #: as they may have failed to (see `git_add_manually()`)
     need_add: list[str] = field(init=False, default_factory=list)
 
     def __post_init__(self) -> None:
@@ -294,13 +296,14 @@ class Downloader:
                     )
                     to_update = True
                     self.report.updated += 1
-                    # Only a file being replaced needs a `git rm`.  One per
-                    # *new* file took `.git/index.lock` and read the whole
-                    # index even with nothing to remove -- 177k of them took
-                    # 000571 15.5 h -- and git-annex's own index updates,
-                    # which are not retried, lose their files while we hold
-                    # that lock (#72).
-                    await self.ds.remove(blob.path)
+                    # Delete the old file from the working tree only:
+                    # `fromkey` and `addurl --with-files` stage the new one
+                    # over its index entry.  A `git rm` here took
+                    # `.git/index.lock` once per replaced file, and git-annex's
+                    # own index updates, which are not retried, lose their
+                    # whole queued batch if they find it taken (#72); the
+                    # commit then recorded those files as deleted (001550).
+                    dest.unlink()
             if to_update:
                 # Text files above the size limit are annexed as well; cf. the
                 # `.gitattributes` policy set by `cfg_dandiset`.
@@ -314,7 +317,8 @@ class Downloader:
                         blob.asset.size,
                         blob.sha256_digest,
                     )
-                    await self.annex.from_key(key, blob.path)
+                    if await self.annex.from_key(key, blob.path):
+                        self.need_add.append(blob.path)
                     if not self.embargoed:
                         bucket_url = await blob.get_file_bucket_url(self.s3client)
                         await blob.register_url(self.annex, key, bucket_url)
@@ -508,6 +512,7 @@ class Downloader:
                 key = data.get("key")
                 self.log.info("%s: Finished downloading (key = %s)", path, key)
                 self.report.downloaded += 1
+                self.need_add.append(path)
                 dl = self.pop_in_progress(path)
                 self.tracker.finish_asset(dl.blob.path)
                 self.nursery.start_soon(
@@ -561,19 +566,27 @@ async def git_add_manually(
     ds: AsyncDataset, paths: Iterable[str], log: PrefixedLogger
 ) -> int:
     """
-    `git add` each of ``paths``, which `addurl` failed to add, and return how
-    many of them failed again.  Pulled out of `async_assets()` so that a test
-    can reach it without making `addurl` fail.
+    `git add` ``paths`` -- files that `addurl` failed to add, and those that it
+    and `fromkey` added -- and return how many of them were missing.  Pulled
+    out of `async_assets()` so that a test can reach it without making
+    `addurl` fail.
+
+    git-annex stages the files it adds itself, in batches (of
+    ``annex.queuesize``, 10240 by default), and if `.git/index.lock` is taken
+    at that moment, the whole batch is left unstaged, though it has reported
+    success for each file and still exits 0 (#72).  Even a `git status` takes
+    the lock, so every such file is added again once git-annex is done, which
+    changes nothing for those it did stage.
     """
+    present: list[str] = []
     failed = 0
     for fpath in paths:
-        log.info("Manually running `git add %s`", shlex.quote(fpath))
-        try:
-            # `--literal-pathspecs`: see `AsyncDataset.remove()`
-            await ds.call_git("--literal-pathspecs", "add", "--", fpath)
-        except subprocess.CalledProcessError:
-            log.error("Manual `git add %s` failed", shlex.quote(fpath))
+        if os.path.lexists(ds.pathobj / fpath):
+            present.append(fpath)
+        else:
+            log.error("Cannot `git add %s`: no such file", shlex.quote(fpath))
             failed += 1
+    await ds.stage_files(present)
     return failed
 
 

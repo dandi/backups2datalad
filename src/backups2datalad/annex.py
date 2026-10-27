@@ -61,7 +61,8 @@ class AsyncAnnex:
                     if p is not None:
                         await p.force_aclose()
 
-    async def from_key(self, key: str, path: str) -> None:
+    async def from_key(self, key: str, path: str) -> bool:
+        """Returns whether `fromkey` reported success"""
         async with self.locks["fromkey"]:
             if self.pfromkey is None:
                 self.pfromkey = await open_git_annex(
@@ -83,6 +84,7 @@ class AsyncAnnex:
                 format_errors(r["error-messages"]),
             )
             ### TODO: Raise an exception?
+        return bool(r["success"])
 
     async def mkkey(self, filename: str, size: int, digest: str) -> str:
         async with self.locks["examinekey"]:

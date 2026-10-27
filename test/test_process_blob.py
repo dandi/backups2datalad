@@ -1,11 +1,14 @@
 """
-`Downloader.process_blob()` runs `git rm` only for a file it replaces.
+`Downloader.process_blob()` runs no `git rm`, not even for a file it replaces.
 
 It used to run one before adding *every* asset, new ones included, each
 holding `.git/index.lock` while reading the whole index: 000571's 177k new
 files took 15.5 h of that (#62), and git-annex's own index updates, which are
 not retried, left files unstaged while we held the lock, so the sync failed
-"still dirty after committing" (#72).
+"still dirty after committing" (#72).  Then only replaced files had one, and
+001550's 10,991 replacements lost files that way all the same, the commit
+recording them as deleted.  A replaced file is now deleted from the working
+tree only, and git-annex stages the new one over its index entry.
 """
 
 from __future__ import annotations
@@ -41,13 +44,14 @@ def git(repo: Path, *args: str) -> str:
 
 @pytest.mark.ai_generated
 @pytest.mark.parametrize("case", ["new", "modified", "unchanged"])
-async def test_process_blob_removes_only_replaced_files(
+async def test_process_blob_runs_no_git_rm(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
     """
-    A new asset is registered without a `git rm` before it, a modified one
-    with one, and an unchanged one is left alone -- in a real git-annex
-    repository, so that the resulting index is checked too.
+    New and modified assets are registered without a `git rm` before them,
+    and an unchanged one is left alone -- in a real git-annex repository, so
+    that the resulting index is checked too: a modified one must be staged as
+    modified, not as deleted and re-added, nor left with its old content.
     """
     repo = tmp_path / "ds"
     repo.mkdir()
@@ -104,7 +108,8 @@ async def test_process_blob_removes_only_replaced_files(
         async with receiver:
             await dm.process_blob(blob, sender)
     # `fromkey` stages its files when it exits, i.e. by here.
-    assert removed == ([path] if case == "modified" else [])
+    assert removed == []
+    assert dm.need_add == ([] if case == "unchanged" else [path])
     status = git(repo, "status", "--porcelain", "-z")
     assert (
         status

@@ -392,19 +392,39 @@ run `git update-index` when the queue fills (`annex.queuesize`, 10240 by
 default) and when they exit, concurrently with whatever Git commands we run.
 If `.git/index.lock` is taken at that moment, the whole queued batch is left
 unstaged, yet git-annex has already reported success for each file and still
-exits 0, so nothing we parse notices (#72).  Our `git rm`
-(`AsyncDataset.remove()`) is retried when it finds the lock taken
-(`_retry_on_git_lock()`); git-annex's flush is not.  So any Git command of
-ours that takes the lock during the asset loop -- even one that ends up
-writing nothing -- can cost git-annex a batch of files:
+exits 0 (#72).  All that shows is git-annex's `fatal: Unable to create
+'.../index.lock': File exists.` on its stderr, which is not in our log.  Our
+own index writes are retried when they find the lock taken
+(`_retry_on_git_lock()`); git-annex's flush is not.  Hence:
 
-- `Downloader.process_blob()` runs `git rm` only for a file whose content is
-  being replaced, never for a new one.  It used to run one per new file, each
-  taking the lock and reading the whole index (~0.2 s at 177k entries) with
-  nothing to remove: 000571's 177k new files took 15.5 h of it (#62), and the
-  run ended "still dirty after committing".  This narrows the window rather
-  than closing it: replaced files still take the lock, and `fromkey` and
-  `addurl` take it themselves.
+- `Downloader.process_blob()` runs no Git command that takes the lock.  For a
+  file being replaced it deletes the old file from the working tree only, and
+  `fromkey` or `addurl --with-files` stages the new one over its index entry
+  (checked with git-annex 10.20240129, 10.20250605 and 10.20261026).  It used
+  to `git rm` every file it (re)added, each taking the lock and reading the
+  whole index (~0.2 s at 177k entries): 000571's 177k new files took 15.5 h of
+  it (#62).  Then only replaced files had one, and 001550's 10,991
+  replacements (2026-10-27) still lost a batch: `fromkey`'s queue filled amid
+  them.  As each lost file's `git rm` was staged, the commit recorded those
+  files as deleted, together with an `assets-state.json` saying the backup
+  was current, so that the next run would skip the mirror.
+- The lock need not be ours: `git status` takes it too, to write refreshed
+  stat info back, so an operator's `git status` in a mirror mid-sync can cost
+  a batch, as can `fromkey` and `addurl` flushing at once.  The files they
+  report added therefore go into `Downloader.need_add`, with those `addurl`
+  failed to add, and once the batch processes have exited,
+  `git_add_manually()` adds them all again, which changes nothing for those
+  git-annex did stage.  It does so in one `git update-index --stdin`
+  (`AsyncDataset.stage_files()`), retried if it finds the lock taken
+  (`_retry_on_git_lock()`): one `git add` per file would read the whole index
+  for each, as the `git rm`s did, and one `git add` taking them all as
+  pathspecs matches each against every file -- re-adding all of a 50k-file
+  repository took it 51 s, against 0.1 s.  A batch healed this way leaves no
+  trace in our log; git-annex's `fatal:` line is all there is.
+- A replaced file for which `fromkey` itself fails is left deleted in the
+  working tree only (and not in `need_add`), so the commit keeps the old one
+  and `AsyncDataset.commit()`'s "still dirty after committing" check reports
+  it.  With the `git rm`, its deletion used to be committed silently.
 
 ## Asset Paths on Command Lines
 
