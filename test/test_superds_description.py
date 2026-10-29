@@ -328,20 +328,6 @@ async def test_set_superds_description_api_fails(
 
 
 @pytest.mark.ai_generated
-@pytest.mark.usefixtures("fake_stats")
-async def test_set_superds_description_not_installed(tmp_path: Path) -> None:
-    datasetter, edit = make_datasetter(
-        tmp_path, ["000001"], ArchiveStats(dandiset_count=1, size=1)
-    )
-    # An uninstalled submodule leaves an empty directory
-    (tmp_path / "000001").mkdir()
-    superds = make_superds(tmp_path, ["000001"], installed=[])
-    with pytest.raises(RuntimeError, match="000001.* is not installed"):
-        await datasetter.set_superds_description(superds)
-    edit.assert_not_awaited()
-
-
-@pytest.mark.ai_generated
 async def test_set_superds_description_from_gitmodules(tmp_path: Path) -> None:
     """
     Without the mirrors installed (a CI checkout), sizes and backup states come
@@ -388,21 +374,44 @@ async def test_set_superds_description_from_gitmodules(tmp_path: Path) -> None:
 
 
 @pytest.mark.ai_generated
-async def test_set_superds_description_stale_gitmodules_stats(tmp_path: Path) -> None:
-    """Stats recorded for another commit than the gitlinked one do not count"""
+async def test_set_superds_description_unsized(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A public mirror that is not installed and has no stats in .gitmodules for
+    its gitlinked commit (none at all, or for another commit) is left out of
+    the total with a warning naming it, rather than fail the run -- `record`
+    has pushed by then
+    """
     datasetter, edit = make_datasetter(
-        tmp_path, ["000001"], ArchiveStats(dandiset_count=1, size=1)
+        tmp_path,
+        {
+            "000001": (MODIFIED, 1_000_000, EmbargoStatus.OPEN),
+            "000002": (MODIFIED, 2_000_000, EmbargoStatus.OPEN),
+        },
+        ArchiveStats(dandiset_count=2, size=3_000_000),
     )
-    (tmp_path / "000001").mkdir()
+    for did in ["000001", "000002"]:
+        (tmp_path / did).mkdir()
     superds = make_superds(
         tmp_path,
-        ["000001"],
+        ["000001", "000002"],
         installed=[],
-        gitmodules={"000001": {KEY_STATS: "older,1,1000000"}},
+        gitmodules={
+            "000001": {
+                KEY_STATS: "older,1,1000000",
+                KEY_LAST_MODIFIED: MODIFIED.isoformat(),
+            },
+            "000002": {KEY_LAST_MODIFIED: MODIFIED.isoformat()},
+        },
     )
-    with pytest.raises(RuntimeError, match="no stats for the commit"):
-        await datasetter.set_superds_description(superds)
-    edit.assert_not_awaited()
+    await datasetter.set_superds_description(superds)
+    edit.assert_awaited_once_with(
+        "dandi/dandisets",
+        description="2 Dandisets (0 Bytes of the archive's 3.0 MB)." + TAIL,
+    )
+    assert "2 mirrors not installed and with no stats" in caplog.text
+    assert "000001, 000002" in caplog.text
 
 
 @pytest.mark.ai_generated

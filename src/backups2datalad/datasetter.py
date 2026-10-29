@@ -146,7 +146,16 @@ class DandiDatasetter(AsyncResource):
                 log.debug("Committing superdataset")
                 superds.assert_no_duplicates_in_gitmodules()
                 msg = await self.get_superds_commit_message(superds, to_save)
-                await superds.save(message=msg, path=to_save)
+                # The state of the mirrors registered already goes into the
+                # same commit as their new gitlinks
+                paths: list[str] = list(to_save)
+                if await self.update_mirror_state_keys(
+                    superds,
+                    [self.results[did] for did in to_save if did in self.results],
+                    gitlinks=None,
+                ):
+                    paths.append(".gitmodules")
+                await superds.save(message=msg, path=paths)
                 superds.assert_no_duplicates_in_gitmodules()
                 log.debug("Superdataset committed")
             if access_status:
@@ -206,20 +215,40 @@ class DandiDatasetter(AsyncResource):
     async def record_mirror_state(
         self, superds: AsyncDataset, results: Iterable[MirrorResult]
     ) -> None:
-        """Bring the mirrors' state keys in ``.gitmodules`` up to date"""
-        current = await superds.read_gitmodules()
-        changed = False
-        for r in results:
-            if r.identifier in current:
-                changed |= await superds.update_gitmodules_keys(
-                    r.identifier, r.keys, current[r.identifier]
-                )
-        if changed:
+        """
+        Commit the state keys in ``.gitmodules`` of the mirrors whose state
+        differs from the one recorded for their gitlinked commits
+        """
+        if await self.update_mirror_state_keys(
+            superds, results, gitlinks=await superds.get_gitlinks()
+        ):
             await superds.commit_if_changed(
                 "[backups2datalad] Record mirror state in .gitmodules",
                 paths=[".gitmodules"],
                 check_dirty=False,
             )
+
+    @staticmethod
+    async def update_mirror_state_keys(
+        superds: AsyncDataset,
+        results: Iterable[MirrorResult],
+        gitlinks: Mapping[str, str] | None,
+    ) -> bool:
+        # Writes the state keys of the mirrors registered in .gitmodules (and,
+        # if `gitlinks` is given, only of those whose result is for the
+        # gitlinked commit, as the state of another commit would be
+        # misleading); returns whether any changed
+        current = await superds.read_gitmodules()
+        changed = False
+        for r in results:
+            if r.identifier not in current:
+                continue
+            if gitlinks is not None and gitlinks.get(r.identifier) != r.commit:
+                continue
+            changed |= await superds.update_gitmodules_keys(
+                r.identifier, r.keys, current[r.identifier]
+            )
+        return changed
 
     async def init_dataset(
         self,
@@ -352,7 +381,10 @@ class DandiDatasetter(AsyncResource):
         # get updated:
         stats = await ds.get_stats(config=dmanager.config)
         if self.config.gh_org is not None:
-            if changed:
+            # A fresh clone may have got commits that are not about the
+            # assets (e.g., a policy migration); its gitlink will be
+            # recorded, so it must be pushed
+            if changed or (cloned and await ds.has_unpushed_commits()):
                 dmanager.log.info("Pushing to sibling")
                 await ds.push(
                     to="github",
@@ -418,20 +450,19 @@ class DandiDatasetter(AsyncResource):
         )
         if self.config.results_dir is not None:
             superds = AsyncDataset(self.config.dandiset_root)
-            recorded = (
-                await superds.read_git(
-                    "ls-files", "-s", "--", f":(literal){dandiset.identifier}"
-                )
-            ).split()
-            if recorded:
-                since = [f"{recorded[1]}..{commit}"]
+            recorded = (await superds.get_gitlinks()).get(dandiset.identifier)
+            since = [commit]
+            if recorded is not None:
+                if await ds.has_commit(recorded):
+                    since = [f"{recorded}..{commit}"]
             else:
-                since = [commit]
+                # Not `git remote get-url`, which applies `insteadOf` and so
+                # would hand out the token CI rewrites URLs with
                 result.url = (
-                    await ds.read_git("remote", "get-url", "github")
+                    await ds.get_repo_config("remote.github.url")
                     if self.config.gh_org is not None
-                    else f"./{dandiset.identifier}"
-                )
+                    else None
+                ) or f"./{dandiset.identifier}"
                 result.datalad_id = await ds.get_datalad_id()
             result.subjects = (
                 await ds.read_git("log", "--format=%s", "-n", "100", *since)
@@ -564,8 +595,7 @@ class DandiDatasetter(AsyncResource):
                 if attempt == RECORD_PUSH_ATTEMPTS:
                     raise
                 log.info(
-                    "Push of superdataset rejected; recording again on top of"
-                    " %s/%s",
+                    "Push of superdataset rejected; recording again on top of" " %s/%s",
                     remote,
                     branch,
                 )
@@ -585,17 +615,7 @@ class DandiDatasetter(AsyncResource):
         # Commits `results` to the superdataset's HEAD; returns whether there
         # was anything to commit
         current = await superds.read_gitmodules()
-        gitlinks = {
-            path: sha
-            for mode, sha, _, path in (
-                line.replace("\t", " ", 1).split(" ", 3)
-                for line in (
-                    await superds.read_git("ls-files", "-s", "-z", strip=False)
-                ).split("\0")
-                if line
-            )
-            if mode == "160000"
-        }
+        gitlinks = await superds.get_gitlinks()
         added: dict[str, list[str]] = {}
         modified: dict[str, list[str]] = {}
         for r in results:
@@ -653,11 +673,7 @@ class DandiDatasetter(AsyncResource):
         remote: list[RemoteInfo] = []
         async with aclosing(self.get_dandisets(dandiset_ids, exclude)) as diter:
             async for d in diter:
-                remote.append(
-                    RemoteInfo.from_listing(
-                        d.identifier, d._data, d.version.modified, d.version.size
-                    )
-                )
+                remote.append(RemoteInfo.from_dandiset(d))
         plan = plan_updates(
             remote,
             await superds.read_gitmodules(),
@@ -713,6 +729,7 @@ class DandiDatasetter(AsyncResource):
         outdated: list[tuple[str, int]] = []
         outdated_embargoed = 0
         gitmodules = await superds.read_gitmodules()
+        unsized: list[str] = []
         for s in await superds.get_subdatasets():
             did = s["gitmodule_path"]
             if (remote := on_archive.get(did)) is None:
@@ -738,14 +755,14 @@ class DandiDatasetter(AsyncResource):
                 recorded = stats_from_key(entry.get(KEY_STATS), s.get("gitshasum"))
                 if recorded is not None:
                     ds_size = recorded[1]
-                elif remote.embargo_status is EmbargoStatus.OPEN:
-                    raise RuntimeError(
-                        f"Mirror of Dandiset {did} at {ds.path} is not"
-                        " installed, and .gitmodules has no stats for the"
-                        " commit recorded for it"
-                    )
                 else:
-                    # Not recorded publicly, so not in the total
+                    # Embargoed mirrors' stats are not recorded publicly; a
+                    # public one's are missing if no run has visited it with
+                    # this version (e.g. one excluded from runs), or it has
+                    # commits its gitlink lacks.  Either way, leave it out of
+                    # the total rather than fail `record` after its push.
+                    if remote.embargo_status is EmbargoStatus.OPEN:
+                        unsized.append(did)
                     ds_size = 0
                 lm = entry.get(KEY_LAST_MODIFIED)
                 state = (
@@ -765,6 +782,13 @@ class DandiDatasetter(AsyncResource):
                     outdated.append((did, max(remote.version.size - ds_size, 0)))
                 else:
                     outdated_embargoed += 1
+        if unsized:
+            log.warning(
+                "%s not installed and with no stats in .gitmodules for"
+                " their recorded commits, so not in the total: %s",
+                quantify(len(unsized), "mirror", "mirrors"),
+                ", ".join(sorted(unsized)),
+            )
         archive = await self.dandi_client.get_archive_stats()
         if archive.dandiset_count != len(on_archive):
             # The stats are recomputed only periodically, and the listing shows

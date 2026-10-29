@@ -358,7 +358,8 @@ async def update_from_backup(
 @click.option(
     "--max",
     "max_dandisets",
-    type=click.IntRange(min=1),
+    # A GitHub Actions matrix takes at most 256 jobs
+    type=click.IntRange(min=1, max=256),
     help="Plan at most this many Dandisets; the rest wait for a later run",
 )
 @click.option(

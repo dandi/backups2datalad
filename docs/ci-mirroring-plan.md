@@ -122,8 +122,16 @@ What dandi/backups2datalad#69 proposed, finished and extended
   then, `plan` sees `no-state` for every Dandiset.
 * #69's problems are avoided: only real changes get gitlinks (`changed`),
   `last_modified` is the state in `HEAD` (`get_committed_assets_state()`), not
-  the working tree, and the keys go in their own commit so existing commit
-  counts in the tests hold.
+  the working tree, and on drogon the keys go into the same commit as the
+  gitlinks they describe (a separate one only when no gitlink changed, e.g.
+  at bootstrap).
+* Keys are only written for the commit the gitlink records: a tag merge
+  moves a mirror's `HEAD` without a gitlink update today, and the next sync
+  that does update it records the keys.
+* Embargoed Dandisets do get a public `dandiset-last-modified`: the exact
+  time of their last change, which the gitlink alone does not give.  Without
+  it `plan --embargoed only` would see every embargoed Dandiset as stale on
+  every run; dropping it is an option if that is judged a leak.
 
 ### 3.2 Is dropping the per-Dandiset `/versions/` call safe?
 
@@ -190,7 +198,10 @@ Each is useful on drogon as well.  Status in brackets.
    remote branch and records again, up to `RECORD_PUSH_ATTEMPTS` (5) times.
    Then it sets the superdataset's description from `.gitmodules`
    (`set_superds_description()` now falls back to the keys for mirrors that
-   are not installed).  The make-private pass is GitHub-side and done once,
+   are not installed, leaving a public mirror without them out of the total
+   with a warning, since `record` has pushed by then).  The URL of a new
+   Dandiset is taken from `remote.github.url`, not `git remote get-url`,
+   which would apply CI's token-bearing `insteadOf`.  The make-private pass is GitHub-side and done once,
    before the retries; its `.gitmodules` edits are re-applied with the rest.
 6. **Graceful time limit** [next] (`--time-limit SECONDS`, §5.4): stop
    taking new assets once the deadline passes, commit what is done, push,
@@ -225,8 +236,8 @@ Each is useful on drogon as well.  Status in brackets.
 
 ## 5. The workflow
 
-Prototype: `dandi/dandisets` `.github/workflows/mirror.yml` (branch
-`claude/jolly-meitner-v8jo47`).
+Prototype: [`docs/ci/mirror.yml`](ci/mirror.yml), to become
+`.github/workflows/mirror.yml` in `dandi/dandisets`.
 
 ### 5.1 Shape
 
@@ -414,8 +425,8 @@ the claim (§5.4), graceful deadline (§4.6), runner pre-check and fork policy
 
 ## 12. Changes since v2
 
-* Prototyped §3.1, §4.3-4.5 in backups2datalad and the workflow in
-  `dandi/dandisets`.
+* Prototyped §3.1, §4.3-4.5 in backups2datalad, and the workflow for
+  `dandi/dandisets` (§5).
 * Embargo: no stats keys for embargoed Dandisets; `plan` names them only
   with `--embargoed include|only` (both found by review).
 * Updated for what landed on `main` since v2: the superdataset description

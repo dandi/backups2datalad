@@ -407,6 +407,29 @@ class AsyncDataset:
             )
         )
 
+    async def get_gitlinks(self) -> dict[str, str]:
+        """The commits the index records for submodules, by path"""
+        gitlinks: dict[str, str] = {}
+        listing = await self.read_git("ls-files", "-s", "-z", strip=False)
+        for entry in listing.split("\0"):
+            if entry:
+                info, _, path = entry.partition("\t")
+                mode, sha, _ = info.split(" ")
+                if mode == "160000":
+                    gitlinks[path] = sha
+        return gitlinks
+
+    async def has_commit(self, commit: str) -> bool:
+        try:
+            await self.call_git(
+                "cat-file", "-e", f"{commit}^{{commit}}", quiet_rcs=[128]
+            )
+        except subprocess.CalledProcessError as e:
+            if e.returncode == 128:
+                return False
+            raise
+        return True
+
     async def update_gitmodules_keys(
         self,
         name: str,
@@ -1347,7 +1370,8 @@ class AsyncDataset:
         assert config.zarr_root is not None
         zarr_ds = AsyncDataset(config.zarr_root / zarr_id)
         if config.clone_missing and not zarr_ds.ds.is_installed():
-            zarr_ds = await AsyncDataset.clone_mirror(url, zarr_ds.pathobj)
+            async with config.zarr_limit:
+                zarr_ds = await AsyncDataset.clone_mirror(url, zarr_ds.pathobj)
         # here we assume that HEAD among dandisets is the same as of
         # submodule, which might not necessarily be the case.
         # TODO: get for the specific commit

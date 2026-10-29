@@ -584,9 +584,12 @@ keep the logic here.
   `dandiset-tagged-releases`, `dandiset-stats` (`<commit>,<files>,<bytes>`,
   like `dandi.stats`).  `update_dandiset()` notes a `MirrorResult` per mirror
   it gets to the end of (`note_result()`), and `update_from_backup()` writes
-  the keys that differ after its superdataset commit
-  (`record_mirror_state()`, a commit of its own).  **Embargoed Dandisets get
-  no `dandiset-stats`**: `.gitmodules` is public.
+  the keys that differ: those of mirrors whose gitlink it updates in the same
+  commit, the rest (e.g. at bootstrap) in a commit of their own
+  (`record_mirror_state()`), and then only where the result is for the
+  gitlinked commit -- a tag merge moves a mirror's `HEAD` without a gitlink
+  update, and its state would not describe the recorded commit.
+  **Embargoed Dandisets get no `dandiset-stats`**: `.gitmodules` is public.
 - **`plan`** (`plan_updates()`, pure): which Dandisets need a sync, by the
   tests `update_dandiset()` applies but against the keys; also untagged
   releases (`most_recent_published_version`) and embargo status vs
@@ -609,7 +612,12 @@ keep the logic here.
   the remote branch and redoes it (`RECORD_PUSH_ATTEMPTS`).  It then sets the
   superdataset description, which for mirrors not installed reads the keys
   (stats only if for the gitlinked commit; embargoed ones count but add 0
-  bytes) and fails for a public one without them, as before.
+  bytes).  A public one without them is left out of the total with a
+  warning naming it -- unlike an installed mirror that cannot be counted,
+  which still fails the run -- since `record` has pushed by then.
+- The URL recorded for a Dandiset new to the superdataset is
+  `remote.github.url` as configured, **not** `git remote get-url`, which
+  applies `insteadOf` and in CI would put the token into `.gitmodules`.
 
 The keys are bootstrapped by the first `update-from-backup` on drogon, which
 visits every mirror; until then `plan` reports every Dandiset as `no-state`.

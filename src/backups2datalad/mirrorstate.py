@@ -8,13 +8,14 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 import json
 import re
 from typing import Any
 
 from dandi.consts import DANDISET_ID_REGEX, EmbargoStatus
+from dandi.dandiapi import RemoteDandiset
 
 from .util import quiescence_wait
 
@@ -150,16 +151,15 @@ class RemoteInfo:
     latest_published: str | None = None
 
     @classmethod
-    def from_listing(
-        cls, identifier: str, data: Mapping[str, Any], modified: datetime, size: int
-    ) -> RemoteInfo:
-        mrpv = data.get("most_recent_published_version")
+    def from_dandiset(cls, d: RemoteDandiset) -> RemoteInfo:
+        """From a Dandiset as listed (its draft version), at no API cost"""
+        mrpv = d.most_recent_published_version
         return cls(
-            identifier=identifier,
-            modified=modified,
-            embargo_status=EmbargoStatus(data["embargo_status"]),
-            size=size,
-            latest_published=mrpv["version"] if mrpv else None,
+            identifier=d.identifier,
+            modified=d.version.modified,
+            embargo_status=d.embargo_status,
+            size=d.version.size,
+            latest_published=mrpv.identifier if mrpv is not None else None,
         )
 
     @property
@@ -291,9 +291,13 @@ def plan_updates(
         )
     by_size = sorted(candidates, key=lambda d: (d.size, d.identifier))
     if max_dandisets is not None and len(candidates) > max_dandisets:
+        # Those with no recorded state at all count as stale longest
         oldest = sorted(
-            (d for d in candidates if d.last_modified is not None),
-            key=lambda d: (d.last_modified, d.identifier),
+            candidates,
+            key=lambda d: (
+                d.last_modified or datetime.min.replace(tzinfo=UTC),
+                d.identifier,
+            ),
         )[: max_dandisets // 4]
         chosen = {d.identifier for d in oldest}
         for d in by_size:

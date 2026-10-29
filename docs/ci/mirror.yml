@@ -1,0 +1,198 @@
+# Prototype of the mirror update in CI (dandi/backups2datalad,
+# docs/ci-mirroring-plan.md).  Each job is a thin wrapper around one
+# backups2datalad subcommand; the logic lives there:
+#
+#   plan    -- which Dandisets changed, from .gitmodules + the archive listing
+#   sync    -- one job per Dandiset: clone its mirror (and Zarrs) on demand,
+#              update and push it, leave the superdataset alone
+#   record  -- commit the new gitlinks and state keys to the superdataset and
+#              push, rebasing over concurrent pushes
+#
+# Public Dandisets only: this repository's logs are public, so `plan` only
+# counts embargoed Dandisets, and those stay with the cron on drogon for now.
+name: Mirror Dandisets
+
+on:
+  # Dispatch-only while the cron on drogon still runs: the two must not
+  # update the same Dandisets at once.  Then every 15 minutes, until the
+  # archive notifies us of changes itself:
+  # schedule:
+  #   - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      ids:
+        description: "Dandiset IDs, space-separated (blank: plan from .gitmodules)"
+        default: ""
+      mode:
+        description: "update-from-backup --mode"
+        type: choice
+        options: [timestamp, force, verify]
+        default: timestamp
+      zarr_mode:
+        description: "update-from-backup --zarr-mode"
+        type: choice
+        options: [asset_checksum, timestamp, checksum, force]
+        default: asset_checksum
+      max:
+        description: "Most Dandisets one run takes on (plan --max)"
+        default: "20"
+      exclude:
+        description: "Dandisets to skip (regex)"
+        default: '00(0571|1412|1411)$'
+      extra_args:
+        description: "Appended to update-from-backup, e.g. --gc-assets"
+        default: ""
+
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # TODO: pin to a release once the CI subcommands are released
+  BACKUPS2DATALAD: "git+https://github.com/dandi/backups2datalad@claude/jolly-meitner-v8jo47"
+  # Inputs reach the shell through the environment only, never inline
+  IDS: ${{ inputs.ids }}
+  MODE: ${{ inputs.mode || 'timestamp' }}
+  ZARR_MODE: ${{ inputs.zarr_mode || 'asset_checksum' }}
+  MAX: ${{ inputs.max || '20' }}
+  EXCLUDE: ${{ inputs.exclude || '00(0571|1412|1411)$' }}
+  EXTRA_ARGS: ${{ inputs.extra_args }}
+  DANDI_API_KEY: ${{ secrets.DANDI_API_KEY }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      ids: ${{ steps.plan.outputs.ids }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dandisets
+          # The superdataset of record, whichever branch this runs from
+          ref: draft
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install "$BACKUPS2DATALAD" git-annex
+      - id: plan
+        run: |
+          set -eu
+          # No clone made here may record itself in a git-annex branch
+          git config --global annex.private true
+          args=(--max "$MAX" -e "$EXCLUDE")
+          # Given IDs are taken on regardless of what .gitmodules says
+          if [ -n "$IDS" ]; then args+=(--mode force); fi
+          # shellcheck disable=SC2086
+          backups2datalad -B "$GITHUB_WORKSPACE" -c dandisets/tools/backups2datalad.cfg.yaml \
+            plan "${args[@]}" $IDS > plan.json
+          echo "ids=$(jq -c '[.dandisets[].id]' plan.json)" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Plan"
+            jq -r '"\(.dandisets | length) to sync, \(.deferred) deferred,"
+              + " \(.embargoed_skipped) embargoed skipped, \(.quiescent) quiescent,"
+              + " \(.deleted | length) deleted"' plan.json
+            echo
+            echo "| Dandiset | reason | size |"
+            echo "| --- | --- | ---: |"
+            jq -r '.dandisets[] | "| \(.id) | \(.reason) | \(.size) |"' plan.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  sync:
+    needs: plan
+    if: needs.plan.outputs.ids != '[]'
+    runs-on: ubuntu-latest
+    # Hosted runners allow 6 h; a Dandiset that needs longer is for a
+    # self-hosted runner (plan §5.4)
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      # GitHub API mutations are throttled per process; this is the only
+      # throttle across jobs
+      max-parallel: 5
+      matrix:
+        id: ${{ fromJSON(needs.plan.outputs.ids) }}
+    env:
+      GITHUB_TOKEN: ${{ secrets.MIRROR_GITHUB_TOKEN }}
+      DATALAD_CREDENTIAL_GITHUB_TOKEN: ${{ secrets.MIRROR_GITHUB_TOKEN }}
+      ID: ${{ matrix.id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dandisets
+          # The superdataset of record, whichever branch this runs from
+          ref: draft
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install "$BACKUPS2DATALAD" git-annex
+      - name: Configure Git
+        run: |
+          git config --global user.name "DANDI Mirror Bot"
+          git config --global user.email "team@dandiarchive.org"
+          git config --global annex.private true
+          # Mirrors are cloned and pushed over HTTPS with the token, whatever
+          # URL .gitmodules records
+          base="https://x-access-token:${GITHUB_TOKEN}@github.com/"
+          git config --global url."$base".insteadOf "https://github.com/"
+          git config --global --add url."$base".insteadOf "git@github.com:"
+      - name: Sync ${{ matrix.id }}
+        run: |
+          # shellcheck disable=SC2086
+          backups2datalad -B "$GITHUB_WORKSPACE" -c dandisets/tools/backups2datalad.cfg.yaml \
+            update-from-backup --clone-missing --results-dir results \
+            --mode "$MODE" --zarr-mode "$ZARR_MODE" $EXTRA_ARGS "$ID"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result-${{ matrix.id }}
+          path: results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  record:
+    needs: [plan, sync]
+    # Record whatever succeeded, even if some Dandisets failed, and also when
+    # nothing was planned: `record` also makes the mirrors of deleted
+    # Dandisets private and updates the superdataset's description
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GITHUB_TOKEN: ${{ secrets.MIRROR_GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dandisets
+          # The superdataset of record, whichever branch this runs from
+          ref: draft
+          token: ${{ secrets.MIRROR_GITHUB_TOKEN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install "$BACKUPS2DATALAD" git-annex
+      - uses: actions/download-artifact@v4
+        if: needs.sync.result != 'skipped'
+        with:
+          pattern: result-*
+          path: results
+          merge-multiple: true
+      - name: Record
+        run: |
+          shopt -s nullglob
+          results=(results/*.json)
+          git config --global user.name "DANDI Mirror Bot"
+          git config --global user.email "team@dandiarchive.org"
+          git config --global annex.private true
+          # As on drogon, which is what the description update looks for
+          git -C dandisets remote rename origin github
+          backups2datalad -B "$GITHUB_WORKSPACE" -c dandisets/tools/backups2datalad.cfg.yaml \
+            record -e "$EXCLUDE" "${results[@]}"
