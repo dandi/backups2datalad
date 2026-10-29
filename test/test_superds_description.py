@@ -22,6 +22,7 @@ from backups2datalad.adataset import AssetsState, AsyncDataset, DatasetStats
 from backups2datalad.config import BackupConfig
 from backups2datalad.datasetter import DandiDatasetter
 from backups2datalad.manager import Manager
+from backups2datalad.mirrorstate import KEY_LAST_MODIFIED, KEY_STATS
 from backups2datalad.util import describe_superdataset
 
 pytestmark = pytest.mark.anyio
@@ -156,7 +157,10 @@ def make_datasetter(
 
 
 def make_superds(
-    tmp_path: Path, submodules: list[str], installed: list[str]
+    tmp_path: Path,
+    submodules: list[str],
+    installed: list[str],
+    gitmodules: dict[str, dict[str, str]] | None = None,
 ) -> AsyncDataset:
     for did in installed:
         Dataset(tmp_path / did).create(annex=False, result_renderer="disabled")
@@ -165,9 +169,15 @@ def make_superds(
     superds.get_ghrepo = AsyncMock(return_value="dandi/dandisets")
     superds.get_subdatasets = AsyncMock(
         return_value=[
-            {"gitmodule_path": did, "path": str(tmp_path / did)} for did in submodules
+            {
+                "gitmodule_path": did,
+                "path": str(tmp_path / did),
+                "gitshasum": f"sha-{did}",
+            }
+            for did in submodules
         ]
     )
+    superds.read_gitmodules = AsyncMock(return_value=gitmodules or {})
     return cast(AsyncDataset, superds)
 
 
@@ -318,17 +328,90 @@ async def test_set_superds_description_api_fails(
 
 
 @pytest.mark.ai_generated
-@pytest.mark.usefixtures("fake_stats")
-async def test_set_superds_description_not_installed(tmp_path: Path) -> None:
+async def test_set_superds_description_from_gitmodules(tmp_path: Path) -> None:
+    """
+    Without the mirrors installed (a CI checkout), sizes and backup states come
+    from the state recorded in .gitmodules -- stats only if recorded for the
+    gitlinked commit, and none for embargoed Dandisets, whose sizes are not
+    recorded publicly
+    """
     datasetter, edit = make_datasetter(
-        tmp_path, ["000001"], ArchiveStats(dandiset_count=1, size=1)
+        tmp_path,
+        {
+            "000001": (MODIFIED, 1_000_000, EmbargoStatus.OPEN),
+            # Modified since
+            "000002": (MODIFIED + timedelta(days=1), 3_000_000, EmbargoStatus.OPEN),
+            "000006": (MODIFIED, 8_000_000, EmbargoStatus.EMBARGOED),
+        },
+        ArchiveStats(dandiset_count=3, size=20_000_000),
     )
-    # An uninstalled submodule leaves an empty directory
-    (tmp_path / "000001").mkdir()
-    superds = make_superds(tmp_path, ["000001"], installed=[])
-    with pytest.raises(RuntimeError, match="000001.* is not installed"):
-        await datasetter.set_superds_description(superds)
-    edit.assert_not_awaited()
+    for did in ["000001", "000002", "000006"]:
+        (tmp_path / did).mkdir()
+    superds = make_superds(
+        tmp_path,
+        ["000001", "000002", "000006"],
+        installed=[],
+        gitmodules={
+            "000001": {
+                KEY_STATS: "sha-000001,1,1000000",
+                KEY_LAST_MODIFIED: MODIFIED.isoformat(),
+            },
+            "000002": {
+                KEY_STATS: "sha-000002,1,2000000",
+                KEY_LAST_MODIFIED: MODIFIED.isoformat(),
+            },
+            "000006": {KEY_LAST_MODIFIED: MODIFIED.isoformat()},
+        },
+    )
+    await datasetter.set_superds_description(superds)
+    edit.assert_awaited_once_with(
+        "dandi/dandisets",
+        description=(
+            "3 Dandisets (3.0 MB of the archive's 20.0 MB; 000002 outdated,"
+            " 1.0 MB behind)." + TAIL
+        ),
+    )
+
+
+@pytest.mark.ai_generated
+async def test_set_superds_description_unsized(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A public mirror that is not installed and has no stats in .gitmodules for
+    its gitlinked commit (none at all, or for another commit) is left out of
+    the total with a warning naming it, rather than fail the run -- `record`
+    has pushed by then
+    """
+    datasetter, edit = make_datasetter(
+        tmp_path,
+        {
+            "000001": (MODIFIED, 1_000_000, EmbargoStatus.OPEN),
+            "000002": (MODIFIED, 2_000_000, EmbargoStatus.OPEN),
+        },
+        ArchiveStats(dandiset_count=2, size=3_000_000),
+    )
+    for did in ["000001", "000002"]:
+        (tmp_path / did).mkdir()
+    superds = make_superds(
+        tmp_path,
+        ["000001", "000002"],
+        installed=[],
+        gitmodules={
+            "000001": {
+                KEY_STATS: "older,1,1000000",
+                KEY_LAST_MODIFIED: MODIFIED.isoformat(),
+            },
+            "000002": {KEY_LAST_MODIFIED: MODIFIED.isoformat()},
+        },
+    )
+    await datasetter.set_superds_description(superds)
+    edit.assert_awaited_once_with(
+        "dandi/dandisets",
+        description="2 Dandisets (0 Bytes of the archive's 3.0 MB)." + TAIL,
+    )
+    assert "2 mirrors not installed and with no stats" in caplog.text
+    assert "000001, 000002" in caplog.text
 
 
 @pytest.mark.ai_generated

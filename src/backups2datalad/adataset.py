@@ -53,14 +53,15 @@ from .consts import (
     MAX_POINTER_SIZE,
 )
 from .logging import log
+from .mirrorstate import parse_gitmodules_config
 from .procedures import PROCEDURES_DIR
-from .procedures.cfg_dandiset import COMMIT_MESSAGE as POLICY_COMMIT_MESSAGE
 from .procedures.cfg_dandiset import (
     SIZE_LIMIT_ENVVAR,
     apply_policy,
     ensure_dotfiles,
     get_size_limit,
 )
+from .procedures.cfg_dandiset import COMMIT_MESSAGE as POLICY_COMMIT_MESSAGE
 from .util import (
     custom_commit_env,
     exp_wait,
@@ -395,6 +396,83 @@ class AsyncDataset:
             key,
             value,
         )
+
+    async def read_gitmodules(self) -> dict[str, dict[str, str]]:
+        """The working tree's ``.gitmodules``, by submodule name"""
+        if not (self.pathobj / ".gitmodules").exists():
+            return {}
+        return parse_gitmodules_config(
+            await self.read_git(
+                "config", "--file", ".gitmodules", "-z", "--list", strip=False
+            )
+        )
+
+    async def get_gitlinks(self) -> dict[str, str]:
+        """The commits the index records for submodules, by path"""
+        gitlinks: dict[str, str] = {}
+        listing = await self.read_git("ls-files", "-s", "-z", strip=False)
+        for entry in listing.split("\0"):
+            if entry:
+                info, _, path = entry.partition("\t")
+                mode, sha, _ = info.split(" ")
+                if mode == "160000":
+                    gitlinks[path] = sha
+        return gitlinks
+
+    async def has_commit(self, commit: str) -> bool:
+        try:
+            await self.call_git(
+                "cat-file", "-e", f"{commit}^{{commit}}", quiet_rcs=[128]
+            )
+        except subprocess.CalledProcessError as e:
+            if e.returncode == 128:
+                return False
+            raise
+        return True
+
+    async def update_gitmodules_keys(
+        self,
+        name: str,
+        keys: Mapping[str, str | None],
+        current: Mapping[str, str],
+    ) -> bool:
+        """
+        Set (or, for `None`, remove) the ``.gitmodules`` keys of submodule
+        ``name`` that differ from ``current``.  Returns whether any did.
+        """
+        changed = False
+        for k, v in keys.items():
+            if current.get(k) == v:
+                continue
+            if v is None:
+                await self.call_git(
+                    "config",
+                    "--file",
+                    ".gitmodules",
+                    "--unset-all",
+                    f"submodule.{name}.{k}",
+                )
+            else:
+                await self.set_repo_config(
+                    f"submodule.{name}.{k}", v, file=".gitmodules"
+                )
+            changed = True
+        return changed
+
+    @classmethod
+    async def clone_mirror(cls, url: str, path: Path) -> AsyncDataset:
+        """
+        Clone an existing mirror for updating it, with the ``github`` remote
+        the rest of the code expects.  ``annex.private`` is set before
+        git-annex initializes, so that the clone's UUID is never recorded in
+        the ``git-annex`` branch that gets pushed back.
+        """
+        log.info("Cloning %s to %s", url, path)
+        await aruncmd("git", *GIT_OPTIONS, "clone", "--origin", "github", url, path)
+        ds = cls(path)
+        await ds.call_git("config", "annex.private", "true")
+        await ds.call_annex("init")
+        return ds
 
     async def get_datalad_id(self) -> str:
         r = await self.get_repo_config("datalad.dataset.id", file=".datalad/config")
@@ -1291,6 +1369,9 @@ class AsyncDataset:
         zarr_id = Path(url).name
         assert config.zarr_root is not None
         zarr_ds = AsyncDataset(config.zarr_root / zarr_id)
+        if config.clone_missing and not zarr_ds.ds.is_installed():
+            async with config.zarr_limit:
+                zarr_ds = await AsyncDataset.clone_mirror(url, zarr_ds.pathobj)
         # here we assume that HEAD among dandisets is the same as of
         # submodule, which might not necessarily be the case.
         # TODO: get for the specific commit
