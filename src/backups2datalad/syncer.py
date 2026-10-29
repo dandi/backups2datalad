@@ -7,7 +7,7 @@ import re
 from dandi.consts import EmbargoStatus
 from ghrepo import GHRepo
 
-from .adandi import RemoteDandiset
+from .adandi import RemoteAsset, RemoteDandiset
 from .adataset import AsyncDataset
 from .asyncer import Report, async_assets
 from .config import BackupConfig
@@ -123,10 +123,15 @@ class Syncer:
                     if self.config.zarr_gh_org is not None:
                         await self.update_zarr_repos_privacy()
 
-    async def sync_assets(self) -> None:
+    async def sync_assets(self, assets: list[RemoteAsset]) -> None:
         self.log.info("Syncing assets...")
         report = await async_assets(
-            self.dandiset, self.ds, self.manager, self.tracker, self.error_on_change
+            self.dandiset,
+            self.ds,
+            self.manager,
+            self.tracker,
+            assets,
+            self.error_on_change,
         )
         self.log.info("Asset sync complete!")
         self.log.info("%s added", quantify(report.added, "asset"))

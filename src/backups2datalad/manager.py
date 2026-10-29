@@ -133,8 +133,10 @@ class GitHub(AsyncResource):
     # Paces all GitHub mutations made by this process and reacts to GitHub's
     # rate-limit responses; also handed to `create_github_sibling()`
     gate: GitHubGate = field(init=False, default_factory=GitHubGate)
+    authenticated: bool = field(init=False)
 
     def __post_init__(self, token: str) -> None:
+        self.authenticated = bool(token)
         self.client = httpx.AsyncClient(
             headers={"Authorization": f"token {token}", "User-Agent": USER_AGENT},
             follow_redirects=True,
@@ -158,6 +160,39 @@ class GitHub(AsyncResource):
             isinstance(k, str) for k in data.keys()
         ), "Expected all keys to be strings"
         return cast(dict[str, Any], data)
+
+    async def repo_exists(self, repo: GHRepo) -> bool:
+        """
+        Whether ``repo`` exists.
+
+        GitHub also answers 404 for a private repository the request may not
+        see, so a 404 is trusted only from a token that can see private
+        repositories; a bad token gets 401 and fails in `get_repo()`.
+        """
+        if not self.authenticated:
+            raise RuntimeError(f"Cannot tell whether {repo} exists without a token")
+        log.debug("Checking whether repository %s exists", repo)
+        await self.gate.wait()
+        try:
+            r = await self.client.get(repo.api_url, timeout=60)
+        except httpx.RequestError:
+            pass
+        else:
+            if r.status_code == 404:
+                # Only classic tokens report their scopes
+                scopes = r.headers.get("x-oauth-scopes")
+                if scopes is not None and "repo" not in {
+                    s.strip() for s in scopes.split(",")
+                }:
+                    raise RuntimeError(
+                        f"Cannot tell whether {repo} exists: GitHub token"
+                        f" lacks the 'repo' scope (has: {scopes!r})"
+                    )
+                return False
+            elif r.is_success:
+                return True
+        await self.get_repo(repo)
+        return True
 
     async def edit_repo(self, repo: GHRepo, **kwargs: Any) -> None:
         log.debug("Editing repository %s", repo)

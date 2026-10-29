@@ -21,13 +21,13 @@ from dandi.consts import DANDISET_ID_REGEX, EmbargoStatus, dandiset_metadata_fil
 from dandi.exceptions import NotFoundError
 from datalad.api import clone
 from ghrepo import GHRepo
-from humanize import naturalsize
 from linesep import split_terminated
 from packaging.version import Version as PkgVersion
 
 from .adandi import AsyncDandiClient, RemoteDandiset, RemoteZarrAsset
 from .adataset import AssetsState, AsyncDataset
 from .aioutil import aruncmd, pool_amap
+from .asyncer import fetch_stable_assets
 from .config import BackupConfig, Mode
 from .consts import DEFAULT_BRANCH, GIT_OPTIONS
 from .logging import PrefixedLogger, log, quiet_filter
@@ -35,8 +35,11 @@ from .manager import GitHub, Manager
 from .syncer import Syncer
 from .util import (
     AssetTracker,
+    MirrorMissingError,
     assets_eq,
     custom_commit_env,
+    describe_failed_dandisets,
+    describe_superdataset,
     quantify,
     quiescence_wait,
     update_dandiset_metadata,
@@ -156,7 +159,9 @@ class DandiDatasetter(AsyncResource):
             )
         if report.failed:
             raise RuntimeError(
-                f"Backups for {quantify(len(report.failed), 'Dandiset')} failed"
+                describe_failed_dandisets(
+                    (d.identifier for d in report.failed), self.logfile
+                )
             )
         elif self.config.gh_org is not None:
             await self.set_superds_description(superds)
@@ -174,8 +179,36 @@ class DandiDatasetter(AsyncResource):
             commit_date=create_time,
             backup_remote=self.config.dandisets.remote,
             embargo_status=embargo_status,
+            before_create=partial(self.assert_dandiset_mirror_is_new, ds, dandiset_id),
         )
         return ds
+
+    async def assert_dandiset_mirror_is_new(
+        self, ds: AsyncDataset, dandiset_id: str
+    ) -> None:
+        """Raise if the Dandiset is in the superdataset or on GitHub already."""
+        superds = AsyncDataset(self.config.dandiset_root)
+        if superds.ds.is_installed() and (
+            url := await superds.get_repo_config(
+                f"submodule.{dandiset_id}.url", file=".gitmodules"
+            )
+        ):
+            raise MirrorMissingError(
+                f"Dandiset {dandiset_id} is registered in the superdataset at"
+                f" {superds.path} (url: {url}) but not installed at {ds.path};"
+                " install it (e.g., `datalad get -n` it) rather than having"
+                " it created anew"
+            )
+        if self.config.gh_org is not None:
+            gh = self.manager.gh
+            assert gh is not None
+            repo = GHRepo(self.config.gh_org, dandiset_id)
+            if await gh.repo_exists(repo):
+                raise MirrorMissingError(
+                    f"Dandiset {dandiset_id} is not installed at {ds.path}, but"
+                    f" GitHub repository {repo} exists already; clone it there"
+                    " rather than having it created anew"
+                )
 
     async def ensure_github_remote(self, ds: AsyncDataset, dandiset_id: str) -> None:
         if self.config.gh_org is not None:
@@ -319,9 +352,19 @@ class DandiDatasetter(AsyncResource):
 
         await syncer.update_embargo_status()
         await update_dandiset_metadata(dandiset, ds, log=manager.log)
-        await syncer.sync_assets()
-        await syncer.prune_deleted()
-        await syncer.dump_asset_metadata()
+
+        # Validate the listing right before use, not before (dandi-archive#2943);
+        # skip only the steps below that depend on it if it went stale.
+        assets = await fetch_stable_assets(dandiset)
+        if assets is None:
+            manager.log.info(
+                "Dandiset changed while retrieving its asset listing; not"
+                " syncing assets this run, will retry on a later run"
+            )
+        else:
+            await syncer.sync_assets(assets)
+            await syncer.prune_deleted()
+            await syncer.dump_asset_metadata()
         manager.log.debug("Checking whether repository is dirty ...")
         if await ds.is_dirty():
             manager.log.info("Committing changes")
@@ -358,7 +401,11 @@ class DandiDatasetter(AsyncResource):
                 # here we will rely on get_stats to use cached during above
                 # recursive through subdatasets ds.get_stats call
                 await self.manager.set_zarr_description(
-                    *(await AsyncDataset.get_zarr_sub_stats(sub_info, self.config))
+                    *(
+                        await AsyncDataset.get_zarr_sub_stats(
+                            sub_info["gitmodule_url"], self.config
+                        )
+                    )
                 )
         if not dandiset_ids and exclude is None:
             superds = AsyncDataset(self.config.dandiset_root)
@@ -387,19 +434,83 @@ class DandiDatasetter(AsyncResource):
             )
             return
         repo = await superds.get_ghrepo()
-        qty = 0
+        # List the archive afresh rather than reuse whatever the current run
+        # iterated over, which `--exclude` or explicit IDs may have narrowed.
+        # (Failed requests are retried by `arequest()`; one that still fails
+        # fails the run rather than leave the description out of date.)
+        on_archive: dict[str, RemoteDandiset] = {}
+        async with aclosing(self.dandi_client.get_dandisets()) as diter:
+            async for d in diter:
+                on_archive[d.identifier] = d
+        mirrored = 0
         size = 0
+        # Mirrors behind the archive, which are what explains a mirrored size
+        # well short of the archive's: those of public Dandisets as (Dandiset
+        # ID, bytes by which the archive's draft is larger than the mirror),
+        # and a mere count of embargoed ones, as the description is public
+        outdated: list[tuple[str, int]] = []
+        outdated_embargoed = 0
         for s in await superds.get_subdatasets():
-            qty += 1
+            did = s["gitmodule_path"]
+            if (remote := on_archive.get(did)) is None:
+                # Deleted from the archive (its backup was made private), or
+                # not a Dandiset at all (such a path is never an identifier
+                # on the archive, so no `DANDISET_ID_REGEX` check is needed)
+                continue
+            mirrored += 1
             ds = AsyncDataset(s["path"])
-            if (stats := await ds.get_stored_stats()) is not None:
-                size += stats.size
-        total_size = naturalsize(size)
-        desc = (
-            f"{quantify(qty, 'Dandiset')}, {total_size} total."
-            "  DataLad super-dataset of all Dandisets from https://github.com/dandisets"
+            if not ds.ds.is_installed():
+                raise RuntimeError(
+                    f"Mirror of Dandiset {did} at {ds.path} is not installed"
+                )
+            # Uses the cached stats if they are for HEAD, else recounts (and
+            # caches) them, rather than leave the mirror out of the total
+            ds_size = (await ds.get_stats(config=self.config)).size
+            size += ds_size
+            # The same tests `update_dandiset()` uses to decide whether to sync
+            state = await ds.get_backup_state()
+            if state is not None and state.timestamp > remote.version.modified:
+                raise RuntimeError(
+                    f"Remote Dandiset {did} has 'modified' timestamp"
+                    f" {remote.version.modified} BEFORE last-recorded"
+                    f" {state.timestamp}"
+                )
+            if state is None or state.timestamp < remote.version.modified:
+                if remote.embargo_status is EmbargoStatus.OPEN:
+                    outdated.append((did, max(remote.version.size - ds_size, 0)))
+                else:
+                    outdated_embargoed += 1
+        archive = await self.dandi_client.get_archive_stats()
+        if archive.dandiset_count != len(on_archive):
+            # The stats are recomputed only periodically, and the listing shows
+            # only those embargoed Dandisets the token may see
+            log.debug(
+                "Archive stats count %d Dandisets, but %d are listed",
+                archive.dandiset_count,
+                len(on_archive),
+            )
+        if outdated:
+            log.info(
+                "%s of public Dandisets behind the archive: %s",
+                quantify(len(outdated), "mirror", "mirrors"),
+                ", ".join(did for did, _ in sorted(outdated)),
+            )
+        if outdated_embargoed:
+            log.info(
+                "%s of embargoed Dandisets behind the archive",
+                quantify(outdated_embargoed, "mirror", "mirrors"),
+            )
+        await self.manager.edit_github_repo(
+            repo,
+            description=describe_superdataset(
+                mirrored=mirrored,
+                on_archive=len(on_archive),
+                size=size,
+                archive_size=archive.size,
+                outdated=outdated,
+                outdated_embargoed=outdated_embargoed,
+            ),
         )
-        await self.manager.edit_github_repo(repo, description=desc)
 
     async def tag_releases(
         self,

@@ -14,6 +14,7 @@ from aiobotocore.config import AioConfig
 from aiobotocore.session import get_session
 from botocore import UNSIGNED
 from dandi.consts import EmbargoStatus
+from ghrepo import GHRepo
 from pydantic import BaseModel
 from zarr_checksum.tree import ZarrChecksumTree
 
@@ -21,11 +22,18 @@ from .adandi import RemoteZarrAsset
 from .adataset import AsyncDataset
 from .aioutil import GitHubRateLimited
 from .annex import AsyncAnnex
-from .config import BackupConfig, ZarrMode
+from .config import BackupConfig, Mode, ZarrDirty, ZarrMode
 from .consts import MAX_ZARR_SYNCS
 from .logging import PrefixedLogger
 from .manager import Manager
-from .util import UnexpectedChangeError, is_meta_file, key2hash, maxdatetime, quantify
+from .util import (
+    MirrorMissingError,
+    UnexpectedChangeError,
+    is_meta_file,
+    key2hash,
+    maxdatetime,
+    quantify,
+)
 
 if TYPE_CHECKING:
     from types_aiobotocore_s3.client import S3Client
@@ -156,6 +164,7 @@ class ZarrSyncer:
                 return
             self.log.info("sync needed")
             i = 0
+            hold_last_sync = False
             while True:
                 orig_checksum = await self.get_local_checksum()
                 zcc = ZarrChecksumTree()
@@ -169,11 +178,22 @@ class ZarrSyncer:
                             )
                         self.log.debug("%s: Syncing", entry)
                         zcc.add_leaf(Path(entry.path), entry.size, entry.md5_digest)
+                        # `to_delete` starts out as the files in the backup.
+                        # (On a re-run pass, entries seen by the first one are
+                        # no longer in it, so they get hash-checked below,
+                        # while ones it pruned still are, until next visit.)
+                        in_backup = str(entry) in to_delete
                         to_delete.discard(str(entry))
                         if self.mode is ZarrMode.TIMESTAMP:
+                            # An entry the backup lacks is never "not modified
+                            # since last backup", however old it is: a listing
+                            # taken while the Zarr was being written can miss
+                            # it while recording a later `last_modified`, and
+                            # it would then be skipped on every visit.
                             if (
                                 last_sync is not None
                                 and entry.last_modified < last_sync
+                                and in_backup
                             ):
                                 self.log.debug(
                                     "%s: file not modified since last backup", entry
@@ -275,14 +295,33 @@ class ZarrSyncer:
                 remote_checksum = modern_asset.get_digest_value()
                 if remote_checksum is None:
                     self.log.info("Checksum still not available from server")
+                    if changed_during_sync:
+                        # Nothing to check the result against; as below.
+                        self.log.info(
+                            "Keeping the last-sync timestamp (%s) so that the"
+                            " next backup re-examines what changed since",
+                            last_sync if last_sync is not None else "unset",
+                        )
+                        hold_last_sync = True
                 elif final_checksum != remote_checksum:
                     if changed_during_sync:
                         self.log.warning(
                             "Zarr was modified during backup and there is a"
-                            " checksum mismatch: local=%s, remote=%s",
+                            " checksum mismatch: local=%s, remote=%s; keeping"
+                            " the last-sync timestamp (%s) so that the next"
+                            " backup re-examines what changed since",
                             final_checksum,
                             remote_checksum,
+                            last_sync if last_sync is not None else "unset",
                         )
+                        # The listing raced the writes, so the newest
+                        # `LastModified` it saw does not mean that everything
+                        # older was seen: an entry overwritten behind the
+                        # listing would be skipped as unmodified forever.
+                        # (Only a race in which the asset's `modified` moved
+                        # shows up at all; see "Zarr Timestamp Mode" in
+                        # CLAUDE.md.)
+                        hold_last_sync = True
                     else:
                         i += 1
                         if i < MAX_ZARR_SYNCS:
@@ -318,7 +357,7 @@ class ZarrSyncer:
                     " old checksum file present, but we are in verify mode"
                 )
             await self.ds.remove(str(OLD_CHECKSUM_FILE))
-        self.write_sync_file()
+        self.write_sync_file(last_sync if hold_last_sync else self.last_timestamp)
         await self.ds.add(str(SYNC_FILE))
 
     def read_sync_file(self) -> datetime | None:
@@ -340,11 +379,11 @@ class ZarrSyncer:
             )
         return data.last_modified
 
-    def write_sync_file(self) -> None:
+    def write_sync_file(self, last_modified: datetime | None) -> None:
         data = SyncData(
             bucket=self.s3bucket,
             prefix=self.s3prefix,
-            last_modified=self.last_timestamp,
+            last_modified=last_modified,
         )
         (self.repo / SYNC_FILE).parent.mkdir(exist_ok=True)
         (self.repo / SYNC_FILE).write_text(data.model_dump_json(indent=4) + "\n")
@@ -372,8 +411,25 @@ class ZarrSyncer:
                     try:
                         local_paths.remove(path)
                     except KeyError:
-                        self.check_change(f"entry {path!r} added")
-                        self.log.info("%s on server but not in backup", path)
+                        if obj["LastModified"] <= last_sync:
+                            # Not a change on the server: the entry was there
+                            # by the time of our last sync, which missed it.
+                            self.check_backup_complete(
+                                f"entry {path!r} (last modified"
+                                f" {obj['LastModified']}) is missing from the"
+                                " backup although it is not newer than the"
+                                f" last sync at {last_sync}"
+                            )
+                            self.log.info(
+                                "%s on server but not in backup, although last"
+                                " modified at %s, not after last sync at %s",
+                                path,
+                                obj["LastModified"],
+                                last_sync,
+                            )
+                        else:
+                            self.check_change(f"entry {path!r} added")
+                            self.log.info("%s on server but not in backup", path)
                         return True
                     if obj["LastModified"] > last_sync:
                         self.check_change(f"entry {path!r} modified")
@@ -500,6 +556,17 @@ class ZarrSyncer:
                 " server"
             )
 
+    def check_backup_complete(self, problem: str) -> None:
+        # Like `check_change()`, but for a backup that diverged from a server
+        # that did not change: verify reports it rather than repairing it, and
+        # says so instead of blaming the server's timestamp.
+        if self.error_on_change:
+            raise UnexpectedChangeError(
+                f"Dandiset {self.asset.dandiset_id}: Zarr {self.zarr_id}:"
+                f" {problem}; the backup is incomplete.  Repair it with"
+                f" `update-from-backup --mode force {self.asset.dandiset_id}`"
+            )
+
 
 async def sync_zarr(
     asset: RemoteZarrAsset,
@@ -519,6 +586,21 @@ async def sync_zarr(
                 f" Dandiset at {asset.path!r} but draft timestamp was not"
                 " updated on server"
             )
+
+        zgh = manager.config.zarrs.github_org
+
+        async def assert_mirror_is_new() -> None:
+            if zgh is None:
+                return
+            assert manager.gh is not None
+            if await manager.gh.repo_exists(repo := GHRepo(zgh, asset.zarr)):
+                raise MirrorMissingError(
+                    f"Zarr {asset.zarr} in Dandiset {asset.dandiset_id} is not"
+                    f" installed at {dsdir}, but GitHub repository {repo}"
+                    " exists already; clone it there rather than having it"
+                    " created anew"
+                )
+
         await ds.ensure_installed(
             desc=f"Zarr {asset.zarr}",
             commit_date=asset.created,
@@ -526,6 +608,7 @@ async def sync_zarr(
             backend="MD5E",
             cfg_proc=None,
             embargo_status=embargo_status,
+            before_create=assert_mirror_is_new,
         )
         if not (ds.pathobj / ".dandi" / ".gitattributes").exists():
             manager.log.debug("Excluding .dandi/ from git-annex")
@@ -569,10 +652,26 @@ async def sync_zarr(
                 "private" if embargo_status is EmbargoStatus.EMBARGOED else "public",
             )
         if await ds.is_dirty():
-            raise RuntimeError(
-                f"Zarr {asset.zarr} in Dandiset {asset.dandiset_id} is dirty;"
-                f" clean or save before running; {await ds.describe_dirt()}"
-            )
+            desc = f"Zarr {asset.zarr} in Dandiset {asset.dandiset_id}"
+            # `--mode verify` exists to report local divergence, so discarding
+            # it first would answer the question it was asked to ask.  Gate on
+            # the mode itself rather than on `error_on_change`, which is only
+            # passed down when verify *also* finds the timestamp unchanged.
+            if (
+                manager.config.zarr_dirty is ZarrDirty.RESET_CLEAN
+                and manager.config.mode is not Mode.VERIFY
+            ):
+                # Led by a token, so that a run over tens of thousands of Zarrs
+                # can be audited with `grep -c 'ZARR-RESET:'`.
+                manager.log.warning(
+                    "ZARR-RESET: %s is dirty; discarding uncommitted state", desc
+                )
+                await ds.reset_hard_clean(check_clean=True)
+            else:
+                raise RuntimeError(
+                    f"{desc} is dirty; clean or save before running;"
+                    f" {await ds.describe_dirt()}"
+                )
         async with AsyncAnnex(dsdir, digest_type="MD5") as annex:
             if (r := manager.config.zarrs.remote) is not None:
                 backup_remote = r.name

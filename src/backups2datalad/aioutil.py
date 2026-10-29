@@ -34,6 +34,7 @@ from .consts import (
     GITHUB_MUTATION_SPACING,
     GITHUB_RATE_LIMIT_ATTEMPTS,
     GITHUB_RATE_LIMIT_FALLBACK,
+    GITHUB_RATE_LIMIT_FALLBACK_MAX,
 )
 from .logging import log
 from .util import exp_wait
@@ -168,9 +169,9 @@ class GitHubGate:
       least ``spacing`` seconds apart, as GitHub's guidelines ask.
     - A rate-limited response (`is_rate_limited()`) starts a cooldown shared
       by every worker: as long as `retry-after` / `x-ratelimit-reset` say,
-      or else ``fallback`` seconds doubling per consecutive hit.  Hits that
-      arrive while a cooldown is already running are the same incident and
-      do not escalate.
+      or else ``fallback`` seconds doubling per consecutive hit, up to
+      ``fallback_max``.  Hits that arrive while a cooldown is already running
+      are the same incident and do not escalate.
     - ``attempts`` consecutive rate-limited responses are each slept out and
       retried; on the next one the gate gives up for the rest of the process:
       further mutations raise `GitHubRateLimited` at once, and reads fall
@@ -186,6 +187,7 @@ class GitHubGate:
     attempts: int = GITHUB_RATE_LIMIT_ATTEMPTS
     spacing: float = GITHUB_MUTATION_SPACING
     fallback: float = GITHUB_RATE_LIMIT_FALLBACK
+    fallback_max: float = GITHUB_RATE_LIMIT_FALLBACK_MAX
     clock: Callable[[], float] = time.monotonic
     wall: Callable[[], float] = time.time
     sleep: Callable[[float], Awaitable[None]] = anyio.sleep
@@ -223,7 +225,7 @@ class GitHubGate:
             delay = max(float(reset) - self.wall(), 1.0)
             source = "x-ratelimit-reset"
         else:
-            delay = self.fallback * 2 ** (self.consecutive - 1)
+            delay = min(self.fallback * 2 ** (self.consecutive - 1), self.fallback_max)
             source = "fallback"
         self.cooldown_until = max(self.cooldown_until, now + delay)
         if self.consecutive > self.attempts:
@@ -437,6 +439,8 @@ async def pool_amap(
                 try:
                     outp = await func(inp)
                 except Exception:
+                    # `describe_failed_dandisets()` tells users how to find
+                    # these lines in the log
                     log.exception("Job failed on input %r:", inp)
                     report.failed.append(inp)
                 else:
@@ -499,8 +503,13 @@ async def areadcmd(*args: str | Path, strip: bool = True, **kwargs: Any) -> str:
 
 
 async def stream_null_command(
-    *args: str | Path, cwd: Path | None = None
+    *args: str | Path, cwd: Path | None = None, check: bool = False
 ) -> AsyncGenerator[str, None]:
+    """
+    If ``check`` is true, raise `subprocess.CalledProcessError` when the
+    command exits nonzero.  Note that, as for any generator, this can only
+    happen if the caller iterates to exhaustion.
+    """
     argstrs = [str(a) for a in args]
     desc = f"`{shlex.join(argstrs)}`"
     if cwd is not None:
@@ -524,7 +533,9 @@ async def stream_null_command(
         desc,
         p.returncode,
     )
-    ### TODO: Raise an exception if p.returncode is nonzero?
+    if check and (rc := p.returncode) is not None and rc != 0:
+        raise subprocess.CalledProcessError(rc, argstrs)
+    ### TODO: Should `check` be the default?
 
 
 async def stream_lines_command(

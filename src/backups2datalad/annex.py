@@ -6,6 +6,7 @@ from contextlib import aclosing
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
+import shlex
 from types import TracebackType
 
 import anyio
@@ -77,7 +78,7 @@ class AsyncAnnex:
             log.error(
                 "`git annex fromkey %s %s` [cwd=%s] call failed:%s",
                 key,
-                path,
+                shlex.quote(path),
                 self.repo,
                 format_errors(r["error-messages"]),
             )

@@ -1,25 +1,35 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from contextlib import aclosing
-from dataclasses import InitVar, dataclass, field, replace
+from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from enum import Enum
 from functools import partial
 import json
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import tempfile
 import textwrap
 from typing import Any, ClassVar
 
 import anyio
+from anyio.streams.buffered import BufferedByteReceiveStream
 from anyio.to_thread import run_sync
 from dandi.consts import EmbargoStatus
 from datalad.api import Dataset
 from datalad.runner.exception import CommandError
+from datalad.support.annexrepo import AnnexRepo
 from ghrepo import GHRepo
 from pydantic import BaseModel
 import requests
@@ -30,11 +40,18 @@ from .aioutil import (
     areadcmd,
     aruncmd,
     is_rate_limited,
+    kill_on_error,
     stream_lines_command,
     stream_null_command,
 )
 from .config import BackupConfig, Remote
-from .consts import DEFAULT_BRANCH, GIT_OPTIONS, GITHUB_CREATE_TIMEOUT
+from .consts import (
+    DEFAULT_BRANCH,
+    GIT_OPTIONS,
+    GITHUB_CREATE_TIMEOUT,
+    GITHUB_SERVER_ERROR_WAITS,
+    MAX_POINTER_SIZE,
+)
 from .logging import log
 from .procedures import PROCEDURES_DIR
 from .procedures.cfg_dandiset import COMMIT_MESSAGE as POLICY_COMMIT_MESSAGE
@@ -44,11 +61,26 @@ from .procedures.cfg_dandiset import (
     ensure_dotfiles,
     get_size_limit,
 )
-from .util import custom_commit_env, exp_wait, is_meta_file, key2hash, quantify
+from .util import (
+    custom_commit_env,
+    exp_wait,
+    is_meta_file,
+    key2hash,
+    pointer_key,
+    quantify,
+)
 
 EMBARGO_STATUS_KEY = "dandi.dandiset.embargo-status"
 
 DATALAD_CREDS_REMOTE_UUID = "cf13d535-b47c-5df6-8590-0793cb08a90a"
+
+
+class GitHubServerError(RuntimeError):
+    """
+    A repository creation failed in a way that may or may not have created
+    the repository: GitHub answered with a server error (5xx), or did not
+    answer at all
+    """
 
 
 @dataclass
@@ -80,8 +112,10 @@ class AsyncDataset:
         backend: str = "SHA256E",
         cfg_proc: str | None = "dandiset",
         embargo_status: EmbargoStatus = EmbargoStatus.OPEN,
+        before_create: Callable[[], Awaitable[None]] | None = None,
     ) -> bool:
-        # Returns True if the dataset was freshly created
+        # Returns True if the dataset was freshly created.  `before_create`
+        # may veto creation by raising.
         if self.ds.is_installed():
             if cfg_proc is not None:
                 # The dataset was created by an earlier run, possibly under an
@@ -89,6 +123,8 @@ class AsyncDataset:
                 # abide by the current one.
                 await self.ensure_dandiset_policy()
             return False
+        if before_create is not None:
+            await before_create()
         log.info("Creating dataset for %s", desc)
         argv = [
             "datalad",
@@ -284,6 +320,30 @@ class AsyncDataset:
             desc += f"\n... and {len(lines) - limit} more"
         return desc
 
+    async def reset_hard_clean(self, check_clean: bool = False) -> None:
+        """
+        Discard everything not committed: ``git reset --hard`` followed by
+        ``git clean -dfx``.
+
+        `.git/annex` is not touched by either command, so annexed content
+        survives as (possibly unreferenced) objects and is not re-downloaded.
+
+        With ``check_clean``, error if that did not actually make the dataset
+        clean: `git clean` leaves an active submodule and an untracked
+        directory that is itself a git repository alone, and the `-ff` that
+        would remove the latter is deliberately never passed.
+        """
+        # --quiet / -q: `clean` prints a line per removed path, and a Zarr may
+        # hold hundreds of thousands, all of which `aruncmd` would buffer and
+        # then splice into the exception message if the command failed.
+        await self.call_git("reset", "--hard", "--quiet")
+        await self.call_git("clean", "-dfxq")
+        if check_clean and await self.is_dirty():
+            raise RuntimeError(
+                f"{self.path} is still dirty after `git reset --hard` and"
+                f" `git clean -dfx`; {await self.describe_dirt()}"
+            )
+
     async def has_changes(
         self, paths: Sequence[str | Path] = (), cached: bool = False
     ) -> bool:
@@ -303,8 +363,19 @@ class AsyncDataset:
         else:
             return False
 
-    async def get_repo_config(self, key: str, file: str | None = None) -> str | None:
-        args = ["--file", file] if file is not None else []
+    async def get_repo_config(
+        self, key: str, file: str | None = None, blob: str | None = None
+    ) -> str | None:
+        """
+        Read ``key`` from the repository's config, or from ``file`` or the
+        committed ``blob`` (e.g. ``HEAD:.gitmodules``) if given
+        """
+        if file is not None:
+            args = ["--file", file]
+        elif blob is not None:
+            args = ["--blob", blob]
+        else:
+            args = []
         try:
             return await self.read_git("config", *args, "--get", key, quiet_rcs=[1])
         except subprocess.CalledProcessError as e:
@@ -599,8 +670,9 @@ class AsyncDataset:
                 raise
 
     async def add(self, path: str) -> None:
-        # `path` must be relative to the root of the dataset
-        await self.call_annex("add", path)
+        # `path` must be relative to the root of the dataset.  git-annex takes
+        # it literally, but would take a leading "-" for an option.
+        await self.call_annex("add", "--", path)
 
     async def remove(self, path: str) -> None:
         # `path` must be relative to the root of the dataset
@@ -610,7 +682,12 @@ class AsyncDataset:
             self.ds.repo.precommit()
 
             async def _do_remove() -> None:
+                # `--literal-pathspecs`, because asset paths may contain `[`,
+                # `]` and `\` (dandi-archive's `ASSET_CHARS_REGEX` admits the
+                # whole `A-z` range), which Git would otherwise match as a
+                # glob: removing `foo[1].txt` would remove `foo1.txt` as well.
                 await self.call_git(
+                    "--literal-pathspecs",
                     "rm",
                     "-f",
                     "--ignore-unmatch",
@@ -638,7 +715,9 @@ class AsyncDataset:
                         print(p, end="\0", file=fp)
                     fp.flush()
                     fp.seek(0)
+                    # `--literal-pathspecs`: see `remove()`
                     await self.call_git(
+                        "--literal-pathspecs",
                         "rm",
                         "-f",
                         "--ignore-unmatch",
@@ -657,10 +736,11 @@ class AsyncDataset:
             partial(self.ds.update, how=how, sibling=sibling)
         )
 
-    async def get_file_stats(self) -> list[FileStat]:
-        filedict: dict[str, FileStat] = {}
+    async def aiter_file_stats(self, commit: str) -> AsyncGenerator[FileStat, None]:
         async with aclosing(
-            stream_null_command("git", "ls-tree", "-lrz", "HEAD", cwd=self.pathobj)
+            stream_null_command(
+                "git", "ls-tree", "-lrz", commit, cwd=self.pathobj, check=True
+            )
         ) as p:
             async for entry in p:
                 try:
@@ -670,11 +750,76 @@ class AsyncDataset:
                         "Error parsing ls-tree line %r for %s:", entry, self.path
                     )
                     raise
-                filedict[fst.path] = fst
-        async with aclosing(self.aiter_annexed_files()) as afiles:
-            async for f in afiles:
-                filedict[f.file] = replace(filedict[f.file], size=f.bytesize)
-        return list(filedict.values())
+                yield fst
+
+    async def get_annexed_tree_stats(self, commit: str) -> DatasetStats:
+        """
+        The number and total size of the annexed files in ``commit``, as
+        ``git annex info`` counts them
+        """
+        info = json.loads(
+            await self.read_git(
+                # A read-only query: no need to merge git-annex branches
+                "-c",
+                "annex.merge-annex-branches=false",
+                "annex",
+                "info",
+                "--fast",
+                "--json",
+                "--bytes",
+                commit,
+            )
+        )
+        # A key that records no size makes this e.g. "5500 (+ 1 unknown size)"
+        size = info["size of annexed files in tree"]
+        if not size.isdigit():
+            raise RuntimeError(
+                f"{self.path}: cannot size annexed files in {commit}: git-annex"
+                f" reports {size!r}"
+            )
+        return DatasetStats(files=info["annexed files in tree"], size=int(size))
+
+    async def get_pointer_keys(self, blobs: Iterable[str]) -> dict[str, str]:
+        """
+        Read ``blobs`` (object IDs) with one ``git cat-file --batch`` and
+        return the keys linked to by those that git-annex takes for annexed
+        files (see `pointer_key()`), by object ID
+        """
+        objects = list(dict.fromkeys(blobs))
+        keys: dict[str, str] = {}
+        if not objects:
+            return keys
+        argv = ["git", *GIT_OPTIONS, "cat-file", "--batch"]
+        desc = f"`{shlex.join(argv)}` [cwd={self.path}]"
+        log.debug("Opening pipe to %s", desc)
+        async with kill_on_error(
+            await anyio.open_process(argv, cwd=self.pathobj, stderr=None), desc
+        ) as p:
+            assert p.stdin is not None
+            assert p.stdout is not None
+            stdin = p.stdin
+
+            async def feed() -> None:
+                async with stdin:
+                    await stdin.send("".join(f"{o}\n" for o in objects).encode())
+
+            stdout = BufferedByteReceiveStream(p.stdout)
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(feed)
+                for obj in objects:
+                    header = (await stdout.receive_until(b"\n", 1024)).decode()
+                    if header.split()[:2] != [obj, "blob"]:
+                        raise RuntimeError(
+                            f"{self.path}: expected blob {obj} from {desc}, got"
+                            f" {header!r}"
+                        )
+                    content = await stdout.receive_exactly(int(header.split()[2]))
+                    await stdout.receive_exactly(1)  # The LF after the content
+                    if (key := pointer_key(content)) is not None:
+                        keys[obj] = key
+        if p.returncode != 0:
+            raise RuntimeError(f"{desc} exited with return code {p.returncode}")
+        return keys
 
     async def aiter_annexed_files(self) -> AsyncGenerator[AnnexedFile, None]:
         async with aclosing(
@@ -792,6 +937,16 @@ class AsyncDataset:
         cooldown GitHub asks for (a rate-limited creation did not create
         anything, so retrying is safe; a crash between creation and sibling
         configuration is healed by ``existing="reconfigure"``).
+
+        A server error (5xx), and a request that got no response (a
+        connection error, or the call not finishing within
+        `GITHUB_CREATE_TIMEOUT`), are retried after each of
+        `GITHUB_SERVER_ERROR_WAITS`, with the gate's lock released.  Unlike a
+        rate limit, these may have created the repository after all; the
+        retry is what finds out, since with ``existing="reconfigure"`` GitHub
+        then answers "already exists" and DataLad adopts the repository.
+        So is a 404 on DataLad's lookup of the repository it was just told
+        exists: GitHub not serving a just-created repository yet.
         """
         config = [
             ("remote.github.pushurl", f"git@github.com:{owner}/{name}"),
@@ -823,19 +978,36 @@ class AsyncDataset:
                 return_type="list",
             )
             desc = f"{owner}/{name}"
-            if gate is None:
-                if (hit := await self._create_sibling_once(create, desc)) is not None:
-                    raise RuntimeError(hit[1])
-            else:
-                async with gate.mutation():
-                    while True:
+            server_waits = iter(GITHUB_SERVER_ERROR_WAITS)
+            while True:
+                try:
+                    if gate is None:
                         hit = await self._create_sibling_once(create, desc)
-                        if hit is None:
-                            gate.note_success()
-                            break
-                        gate.note_rate_limited(*hit)
-                        gate.raise_if_gave_up()
-                        await gate.wait()
+                        if hit is not None:
+                            raise RuntimeError(hit[1])
+                    else:
+                        async with gate.mutation():
+                            while True:
+                                hit = await self._create_sibling_once(create, desc)
+                                if hit is None:
+                                    gate.note_success()
+                                    break
+                                gate.note_rate_limited(*hit)
+                                gate.raise_if_gave_up()
+                                await gate.wait()
+                except GitHubServerError as e:
+                    if (delay := next(server_waits, None)) is None:
+                        raise
+                    log.warning(
+                        "%s; retrying in %d s (adopting the repository if the"
+                        " failed request created it after all)",
+                        e,
+                        delay,
+                    )
+                    # The gate's sleep is the injectable one
+                    await (anyio.sleep if gate is None else gate.sleep)(delay)
+                else:
+                    break
             for key, value in config:
                 await self.set_repo_config(key, value)
             return True
@@ -858,25 +1030,37 @@ class AsyncDataset:
         Run DataLad's ``create_sibling_github`` once in a worker thread.
         Returns None on success; on a rate-limited response returns the
         response headers (if any) and a description of the failure for
-        `GitHubGate.note_rate_limited()`; raises for anything else.
+        `GitHubGate.note_rate_limited()`; raises `GitHubServerError` for a
+        server error (5xx), no response, or a 404 on the lookup of a
+        repository GitHub said exists, and some other exception for anything
+        else.
 
-        DataLad reports a 403 as an error result record (message text only)
-        but lets a 429 -- and any error on the ``existing="reconfigure"``
-        lookup -- escape as `requests.HTTPError`, so both shapes are handled.
+        DataLad reports a 403 -- and, since 1.5.0, a 500 -- as an error result
+        record (message text only) but lets a 429, other 5xx, and any error on
+        the ``existing="reconfigure"`` lookup escape as `requests.HTTPError`,
+        so both shapes are handled.
         """
         try:
             # DataLad's request has no timeout; do not let a hung thread hold
-            # up the caller (or the gate's lock) indefinitely.  An abandoned
-            # thread may still finish creating/configuring the sibling on its
-            # own -- outside the gate -- which `existing="reconfigure"` and
-            # the config restore above absorb on the next visit.
+            # up the caller (or the gate's lock) indefinitely.  The call may
+            # well have created the repository (001412's Zarr 325e2654-...
+            # was), so it is retried like a 5xx.  The abandoned thread may
+            # still finish configuring the sibling on its own, racing the
+            # retry; `existing="reconfigure"` and the config restore above
+            # absorb that on the next visit.
             with anyio.move_on_after(GITHUB_CREATE_TIMEOUT) as scope:
                 results = await run_sync(create, abandon_on_cancel=True)
             if scope.cancelled_caught:
-                raise RuntimeError(
+                raise GitHubServerError(
                     f"Creating GitHub sibling {desc} did not finish within"
                     f" {GITHUB_CREATE_TIMEOUT} s"
                 )
+        except (requests.ConnectionError, requests.Timeout) as e:
+            # No response: the request may or may not have reached GitHub
+            raise GitHubServerError(
+                f"No response creating GitHub sibling {desc}:"
+                f" {type(e).__name__}: {e}"
+            ) from e
         except requests.HTTPError as e:
             resp = e.response
             if resp is not None and is_rate_limited(
@@ -887,14 +1071,57 @@ class AsyncDataset:
                     f"HTTP {resp.status_code} creating GitHub sibling {desc}:"
                     f" {textwrap.shorten(resp.text, width=200)}",
                 )
+            if resp is not None and resp.status_code >= 500:
+                body = textwrap.shorten(resp.text, width=200)
+                raise GitHubServerError(
+                    f"HTTP {resp.status_code} creating GitHub sibling {desc}"
+                    + (f": {body}" if body else "")
+                ) from e
+            if (
+                resp is not None
+                and resp.status_code == 404
+                and e.request is not None
+                and e.request.method == "GET"
+            ):
+                # DataLad GETs the repository (`existing="reconfigure"`) only
+                # once the creation was answered with "already exists", so a
+                # 404 is GitHub not serving a just-created repository yet --
+                # one an earlier attempt that failed may have created, or one
+                # created concurrently.  Were it a repository we cannot see,
+                # the retries would end in this error all the same.  (A 404
+                # on the creation POST -- no such organization, or no access
+                # to it -- is never retried.)
+                raise GitHubServerError(
+                    f"HTTP 404 looking up GitHub repository {desc}, which"
+                    " GitHub reported as already existing"
+                ) from e
             raise
         for res in results:
             status = res.get("status")
             msg = format_result_message(res)
-            if status in ("ok", "notneeded"):
+            if status == "notneeded" and res.get("action") == "create_sibling_github":
+                log.info(
+                    "GitHub repository %s exists already; configuring it as the"
+                    " sibling",
+                    desc,
+                )
+            elif status in ("ok", "notneeded"):
                 log.debug("create_sibling_github(%s) %s: %s", status, desc, msg)
             elif is_rate_limited(403, {}, msg):
                 return ({}, f"create_sibling_github({status}) {desc}: {msg}")
+            elif (
+                status == "error"
+                and res.get("action") == "create_sibling_github"
+                and isinstance(res.get("message"), str)
+            ):
+                # DataLad's only creation error record with a plain-string
+                # message is the one for a 500 (GitHub's message, or "Server
+                # returned error code 500 without any further information");
+                # its others are `(format, *args)` tuples, and the status
+                # code itself is not kept.
+                raise GitHubServerError(
+                    f"create_sibling_github({status}) {desc}: {msg}"
+                )
             else:
                 raise RuntimeError(f"create_sibling_github({status}) {desc}: {msg}")
         return None
@@ -955,39 +1182,113 @@ class AsyncDataset:
         self,
         config: BackupConfig,  # for path to zarrs
     ) -> DatasetStats:
-        stored_stats = await self.get_stored_stats()
+        # Count one commit, resolved once, and never the working tree, which a
+        # concurrent or interrupted run may have left disagreeing with it
+        # (#139); the stats are cached for that same commit.
+        commit = await self.get_commit_hash()
+        stored_stats = await self.get_stored_stats(commit)
         if stored_stats is not None:
             # stats were stored and state of the dataset did not change since then
             return stored_stats
         log.info("%s: Counting up files ...", self.path)
         files = 0
         size = 0
-        # get them all and remap per path
-        subdatasets = {s["path"]: s for s in await self.get_subdatasets()}
-        for filestat in await self.get_file_stats():
-            path = Path(filestat.path)
-            if not is_meta_file(path.parts[0], dandiset=True):
-                if filestat.type is ObjectType.COMMIT:
-                    # this zarr should not be present locally as a submodule
-                    # so we should get its id from its information in submodules.
-                    sub_info = subdatasets[str(self.pathobj / path)]
-                    _, zarr_stat = await self.get_zarr_sub_stats(sub_info, config)
-                    files += zarr_stat.files
-                    size += zarr_stat.size
+        # Annexed files are symlinks (but for unlocked files, below), sized by
+        # git-annex below, less the annexed metadata files
+        symlinks = 0
+        annexed_meta: list[str] = []
+        # Blobs small enough to be pointer files, i.e. unlocked annexed files
+        maybe_unlocked: list[FileStat] = []
+        submodules: list[str] = []
+        async with aclosing(self.aiter_file_stats(commit)) as fstats:
+            async for filestat in fstats:
+                if (
+                    filestat.type is ObjectType.BLOB
+                    and filestat.mode != SYMLINK_MODE
+                    and filestat.size is not None
+                    and filestat.size <= MAX_POINTER_SIZE
+                ):
+                    maybe_unlocked.append(filestat)
+                if is_meta_file(filestat.path, dandiset=True):
+                    if filestat.mode == SYMLINK_MODE:
+                        annexed_meta.append(filestat.object)
+                elif filestat.type is ObjectType.COMMIT:
+                    submodules.append(filestat.path)
                 else:
                     files += 1
-                    assert filestat.size is not None
-                    size += filestat.size
+                    if filestat.mode == SYMLINK_MODE:
+                        symlinks += 1
+                    else:
+                        assert filestat.size is not None
+                        size += filestat.size
+        if symlinks or annexed_meta:
+            annexed = await self.get_annexed_tree_stats(commit)
+
+            def subtract_meta(key: str) -> None:
+                # E.g. .dandi/assets.json, or dandiset.yaml under a low
+                # BACKUPS2DATALAD_TEXT_SIZE_LIMIT
+                if (keysize := AnnexRepo.get_size_from_key(key)) is None:
+                    raise RuntimeError(
+                        f"{self.path}: cannot size annexed metadata file with"
+                        f" key {key} in {commit}"
+                    )
+                annexed.files -= 1
+                annexed.size -= keysize
+
+            for blob in annexed_meta:
+                # Few, so read one by one.  A symlink's blob is its target,
+                # which ends in the key.
+                subtract_meta(Path(await self.read_git("cat-file", "blob", blob)).name)
+            unlocked = 0
+            if annexed.files != symlinks:
+                # Then look for unlocked files, pointer files in Git that
+                # git-annex counts too: a plain `git add` makes them (e.g.
+                # 000026's .dandi/assets.json).  Only then, as it reads every
+                # blob small enough to be one; when the counts match, there are
+                # none, barring as many symlinks not into the annex.
+                keys = await self.get_pointer_keys(f.object for f in maybe_unlocked)
+                for f in maybe_unlocked:
+                    if (key := keys.get(f.object)) is None:
+                        continue
+                    if is_meta_file(f.path, dandiset=True):
+                        subtract_meta(key)
+                    else:
+                        # Sized by git-annex, not as a blob in Git
+                        assert f.size is not None
+                        size -= f.size
+                        unlocked += 1
+            if annexed.files != symlinks + unlocked:
+                raise RuntimeError(
+                    f"{self.path}: git-annex counts {annexed.files} annexed"
+                    f" files in {commit}, but it has {symlinks} symlinks and"
+                    f" {unlocked} unlocked files"
+                )
+            size += annexed.size
+        for path in submodules:
+            # this zarr should not be present locally as a submodule
+            # so we should get its id from its URL in .gitmodules.
+            url = await self.get_repo_config(
+                f"submodule.{path}.url", blob=f"{commit}:.gitmodules"
+            )
+            if url is None:
+                raise RuntimeError(
+                    f"{self.path}: submodule {path} has no URL in .gitmodules"
+                    f" of {commit}"
+                )
+            _, zarr_stat = await self.get_zarr_sub_stats(url, config)
+            files += zarr_stat.files
+            size += zarr_stat.size
         log.info("%s: Done counting up files", self.path)
         stats = DatasetStats(files=files, size=size)
-        await self.store_stats(stats)
+        await self.store_stats(stats, commit)
         return stats
 
     @staticmethod
     async def get_zarr_sub_stats(
-        sub_info: dict, config: BackupConfig
+        url: str, config: BackupConfig
     ) -> tuple[str, DatasetStats]:
-        zarr_id = Path(sub_info["gitmodule_url"]).name
+        """The ID and stats of the Zarr mirrored at submodule URL ``url``"""
+        zarr_id = Path(url).name
         assert config.zarr_root is not None
         zarr_ds = AsyncDataset(config.zarr_root / zarr_id)
         # here we assume that HEAD among dandisets is the same as of
@@ -996,7 +1297,8 @@ class AsyncDataset:
         zarr_stat = await zarr_ds.get_stats(config=config)
         return zarr_id, zarr_stat
 
-    async def get_stored_stats(self) -> DatasetStats | None:
+    async def get_stored_stats(self, commit: str | None = None) -> DatasetStats | None:
+        """The stats cached for ``commit`` (default: ``HEAD``), if any"""
         if (stored_stats := self.ds.config.get("dandi.stats", None)) is not None:
             try:
                 stored_commit, files_str, size_str = stored_stats.split(",")
@@ -1004,12 +1306,13 @@ class AsyncDataset:
                 size = int(size_str)
             except Exception:
                 return None
-            if stored_commit == await self.get_commit_hash():
+            if stored_commit == (commit or await self.get_commit_hash()):
                 return DatasetStats(files=files, size=size)
         return None
 
-    async def store_stats(self, stats: DatasetStats) -> None:
-        commit = await self.get_commit_hash()
+    async def store_stats(self, stats: DatasetStats, commit: str | None = None) -> None:
+        """Cache ``stats`` as those of ``commit`` (default: ``HEAD``)"""
+        commit = commit or await self.get_commit_hash()
         value = f"{commit},{stats.files},{stats.size}"
         self.ds.config.set("dandi.stats", value, scope="local")
 
@@ -1108,7 +1411,12 @@ class AsyncDataset:
             log.debug("No subdatasets to uninstall")
 
     async def add_submodule(self, path: str, url: str, datalad_id: str) -> None:
-        await self.call_git("submodule", "add", "--", url, path)
+        # `--literal-pathspecs` (see `remove()`) reaches the index lookup and
+        # the `git add` inside `git submodule add`: without it, adding
+        # "a[1].zarr" fails if "a1.zarr" is already a submodule.  (A `path`
+        # starting with "-" fails regardless, and Git would ignore such a
+        # submodule anyway; see "Asset Paths on Command Lines" in CLAUDE.md.)
+        await self.call_git("--literal-pathspecs", "submodule", "add", "--", url, path)
         await self.set_repo_config(
             f"submodule.{path}.datalad-id",
             datalad_id,
@@ -1141,19 +1449,28 @@ class ObjectType(Enum):
     TREE = "tree"
 
 
+#: The mode of a symlink in a tree, which is what an annexed file is
+SYMLINK_MODE = "120000"
+
+
 @dataclass
 class FileStat:
     path: str
+    mode: str
     type: ObjectType
+    object: str
+    #: For a symlink, the size of the link, not of the annexed file
     size: int | None
 
     @classmethod
     def from_entry(cls, entry: str) -> FileStat:
         stats, _, path = entry.partition("\t")
-        _, typename, _, sizestr = stats.split()
+        mode, typename, obj, sizestr = stats.split()
         return cls(
             path=path,
+            mode=mode,
             type=ObjectType(typename),
+            object=obj,
             size=None if sizestr == "-" else int(sizestr),
         )
 

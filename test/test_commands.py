@@ -6,6 +6,7 @@ from pathlib import Path
 import random
 from traceback import format_exception
 
+from asyncclick import Choice, Context
 from asyncclick.testing import CliRunner, Result
 from conftest import Archive, SampleDandiset
 from datalad.api import Dataset
@@ -14,10 +15,10 @@ import numpy as np
 import pytest
 from test_util import GitRepo
 
-from backups2datalad.__main__ import main
+from backups2datalad.__main__ import backup_zarrs, main, update_from_backup
 from backups2datalad.adataset import AssetsState, AsyncDataset
 from backups2datalad.aioutil import areadcmd
-from backups2datalad.config import BackupConfig, Remote, ResourceConfig
+from backups2datalad.config import BackupConfig, Remote, ResourceConfig, ZarrDirty
 from backups2datalad.logging import log as plog
 from backups2datalad.manager import Manager
 from backups2datalad.zarr import sync_zarr
@@ -406,4 +407,38 @@ async def test_backup_embargoed(
         assert any(
             u.startswith(f"{docker_archive.s3endpoint}/{docker_archive.s3bucket}/")
             for u in web_urls
+        )
+
+
+@pytest.mark.ai_generated
+def test_zarr_dirty_cli_and_config_agree() -> None:
+    """
+    Every `zarr_dirty` value the config file accepts is also accepted verbatim
+    on the command line, and round-trips back to the same enum member.
+
+    `click.Choice` over an `Enum` derives its tokens from member *names*, not
+    values, so `click.Choice(list(ZarrDirty))` would accept only `reset_clean`
+    while a config file wanted `reset+clean` -- the two surfaces silently
+    disagreeing.  Hence choices over `[m.value for m in ZarrDirty]`, and hence
+    this test.
+    """
+    for cmd in (update_from_backup, backup_zarrs):
+        (param,) = [p for p in cmd.params if p.name == "zarr_dirty"]
+        assert isinstance(param.type, Choice)
+        ctx = Context(cmd)
+        accepted = set()
+        for member in ZarrDirty:
+            # Accepted on the command line, exactly as spelled in the config.
+            token = param.type.convert(member.value, param, ctx)
+            assert ZarrDirty(token) is member
+            # And accepted by the config model under the same spelling.
+            assert BackupConfig(zarr_dirty=member.value).zarr_dirty is member
+            accepted.add(member.value)
+        assert set(param.type.choices) == accepted
+        # Case-insensitively too, as the other mode options are.
+        assert (
+            ZarrDirty(
+                param.type.convert(ZarrDirty.RESET_CLEAN.value.upper(), param, ctx)
+            )
+            is ZarrDirty.RESET_CLEAN
         )

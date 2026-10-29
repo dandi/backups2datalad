@@ -270,6 +270,307 @@ Two notes for anyone extending this:
   and, unlike ordinary deletions (which `get_deleted()` handles by popping the
   metadata first), it means the two records disagree.
 
+## Dirty Zarrs
+
+`sync_zarr()` refuses a Zarr mirror that is dirty on the way in.  `--zarr-dirty`
+(on `update-from-backup` and `backup-zarrs`, or `zarr_dirty` in the config file)
+chooses what happens instead:
+
+- `error` (default) — unchanged behaviour: fail that Zarr with
+  `describe_dirt()`.
+- `reset+clean` — log a WARNING with the dirt, run `git reset --hard` and
+  `git clean -dfx`, and carry on.
+
+The scope is the Zarrs of the Dandisets being backed up: `sync_zarr()` is
+reached through a Dandiset's own asset listing, so naming Dandisets on the
+command line is what narrows it (`update-from-backup --zarr-dirty=reset+clean
+001412`).  No Zarr outside those Dandisets is touched.
+
+Four properties to preserve when touching this:
+
+- **"Fail that Zarr" is not what failing a Zarr does.**  `sync_zarr()` is
+  `start_soon`'d into a task group (`asyncer.py`), so one `RuntimeError` cancels
+  the other in-flight Zarr syncs (up to `ZARR_LIMIT`), propagates out through
+  `sync_dataset()`, and fails the whole Dandiset and the run.  The cancelled
+  siblings are left dirty, so **each aborted run manufactures up to
+  `ZARR_LIMIT` newly dirty mirrors**.  The practical consequence: if dirt is
+  the only thing aborting the run, `reset+clean` converges -- each run heals
+  every dirty Zarr it reaches and dirties at most ten on the way out, so the
+  backlog shrinks run over run -- but a single Zarr that cannot be reset blocks
+  its Dandiset indefinitely, because nothing skips it.
+- **This does not relax the Dandiset mirror's own dirtiness gate.**  That one is
+  in `sync_dataset()` (see "Dirty Mirrors" above) and is reached *before* any
+  Zarr, so a Dandiset whose own mirror is dirty fails identically with or
+  without this option.
+- **The remedy does not always converge, and the code must not assume it
+  does.**  `git clean` leaves an active submodule and an untracked nested git
+  repository alone, and the `-ff` that would remove the latter is deliberately
+  never passed.  `reset_hard_clean(check_clean=True)` therefore re-checks and
+  errors naming what is left, rather than passing silently.  (Neither case is
+  expected in a Zarr mirror, which has no submodules and is never cloned into;
+  the re-check is cheap insurance, not a prediction.)
+- **`--mode verify` never discards.**  Verify exists to report local
+  divergence, so discarding first would answer the question it was asked to
+  ask.  The gate is `config.mode`, deliberately not the `error_on_change` flag,
+  which verify passes down only when it *also* finds the timestamp unchanged --
+  gating on that would still discard when verifying a Dandiset that had changed.
+
+Each reset logs one WARNING led by `ZARR-RESET:` so that a run over tens of
+thousands of Zarrs can be audited with `grep -c 'ZARR-RESET:'`.  What made the
+mirror dirty is deliberately *not* listed: there can be thousands of paths, and
+limiting that sensibly buys nothing the count does not already give.  The
+startup banner avoids the token so it does not inflate the count.
+
+`git reset --hard` and `git clean -dfx` do not touch `.git/annex`, so annexed
+content survives as (possibly unreferenced) objects and is not re-downloaded;
+what a reset costs is the wall clock of re-registering keys, not bytes.  What is
+genuinely lost is uncommitted work, irrecoverably -- there is no evidence kept
+today.
+
+## Zarr Timestamp Mode
+
+In `--zarr-mode timestamp` (the default), `.dandi/s3sync.json`'s
+`last_modified` is a watermark.  `needs_sync()` lists the Zarr and asks for a
+sync if an entry is missing locally, is newer than the watermark, or is gone
+from S3.  The sync then skips entries older than the watermark as "not
+modified since last backup".  An S3 listing is paginated, not a snapshot: a
+Zarr written to while we list it can have an entry missed behind the cursor
+while newer ones are seen, so the watermark ends up past it.  Hence (000108,
+001246, 001769; #66, #90):
+
+- The sync skips an old entry only if the backup has it (`in_backup`).  It
+  used to skip it regardless, so a missing entry was never added back:
+  `needs_sync()` asked for a sync, the sync skipped the entry, and every
+  `--mode verify` run raised.
+- In verify, an entry missing locally that is not newer than the watermark is
+  reported by `check_backup_complete()` as an incomplete backup, with the
+  repair (`update-from-backup --mode force <id>`), not as a server change.
+  Verify reports it and does not repair it, like any divergence.
+- An entry *overwritten* behind the cursor is present locally, so nothing
+  above catches it, and with the watermark past its new `LastModified` it
+  stays stale.  The race the sync can see is one with an ingest that
+  completes meanwhile: the Zarr asset's `modified` moved since the
+  Dandiset's asset listing (`changed_during_sync`).  Unless the server's
+  checksum then confirms the result, the previous watermark is written back,
+  so the next visit re-examines whatever changed since.  A sync that
+  overlaps an upload still in flight sees no such change (dandi-archive
+  clears the checksum for the whole upload and bumps `modified` only at
+  ingest), so the watermark still advances there: a watermark capped at the
+  listing's start, less a margin, would close that, and a verify comparing
+  content rather than timestamps would find mirrors already left stale.  A
+  Zarr whose server checksum is wrong for good is, once held, synced again on
+  every visit and fails after `MAX_ZARR_SYNCS` passes -- failing its Dandiset
+  on every run until the archive re-ingests it, where it used to warn once.
+  And should the archive move the Zarr asset's `modified` but not the
+  Dandiset's, the next `--mode verify` blames an entry newer than the held
+  watermark, though it is backed up.
+- The stored `.dandi/zarr-checksum` is computed from the server listing, not
+  from the local files, so it cannot reveal a missing entry by itself.
+
+## Per-Asset Fan-Out
+
+`Downloader.asset_loop()` is handed the whole asset listing at once
+(`fetch_stable_assets()`) and starts a task per asset straight away -- some
+36k for 001412.  Whatever such a task holds before it reaches something bounded
+(the worker-thread pool, a lock, `zarr_limit`, httpx's connection pool) is held
+that many times over, and file descriptors run out (`EMFILE`):
+
+- #130: `asha256()` kept a file open while queued for a worker thread; it now
+  opens, hashes and closes it within one thread call.
+- #133: each uninstalled Zarr runs a `git config` to look itself up in
+  `.gitmodules` (`Downloader.assert_zarr_mirror_is_new()`); `process_zarr()`
+  now does so under `zarr_limit`.
+
+Per-asset work that needs a subprocess or an open file has to happen behind
+such a bound.
+
+## Index Writes During a Dandiset Sync
+
+While a Dandiset syncs, git-annex's batch processes (`fromkey`, `addurl
+--with-files`) stage the files they create themselves: they queue them and
+run `git update-index` when the queue fills (`annex.queuesize`, 10240 by
+default) and when they exit, concurrently with whatever Git commands we run.
+If `.git/index.lock` is taken at that moment, the whole queued batch is left
+unstaged, yet git-annex has already reported success for each file and still
+exits 0, so nothing we parse notices (#72).  Our `git rm`
+(`AsyncDataset.remove()`) is retried when it finds the lock taken
+(`_retry_on_git_lock()`); git-annex's flush is not.  So any Git command of
+ours that takes the lock during the asset loop -- even one that ends up
+writing nothing -- can cost git-annex a batch of files:
+
+- `Downloader.process_blob()` runs `git rm` only for a file whose content is
+  being replaced, never for a new one.  It used to run one per new file, each
+  taking the lock and reading the whole index (~0.2 s at 177k entries) with
+  nothing to remove: 000571's 177k new files took 15.5 h of it (#62), and the
+  run ended "still dirty after committing".  This narrows the window rather
+  than closing it: replaced files still take the lock, and `fromkey` and
+  `addurl` take it themselves.
+
+## Asset Paths on Command Lines
+
+Asset paths come from the archive and are passed to Git and git-annex as they
+are.  dandi-archive's `ASSET_CHARS_REGEX` (`[A-z0-9(),&\s#+~_=-]`) admits
+whitespace and parentheses (001449's "space-Unified mouse brain atlas (Kim
+lab)", #103), a leading `-`, and -- through the `A-z` range -- `[`, `]` and
+`\`.  Hence:
+
+- Commands are argument lists, never shell strings; `shlex` only renders them
+  for logs.
+- Git takes paths as *pathspecs*, i.e. globs: `git rm -- 'foo[1].txt'` removes
+  `foo1.txt` as well.  Pass `--literal-pathspecs` (a top-level option, so it
+  goes before the subcommand: `call_git("--literal-pathspecs", "rm", ...)`)
+  wherever an asset path reaches one, including `--pathspec-from-file`; or use
+  `:(literal)` per path, as `get_superds_commit_message()` does.
+- Put `--` before paths.  `git annex add` matches its paths literally already,
+  but takes `-foo` for an option without `--`.
+- `git submodule add` needs `--literal-pathspecs` too (otherwise adding Zarr
+  `a[1].zarr` fails when `a1.zarr` is already a submodule).  A Zarr whose path
+  starts with `-` cannot be mirrored as a submodule at all: `git submodule add`
+  runs an inner `git add` without `--` (still so in Git's `master` as of
+  2026-10), and Git ignores a submodule with such a path anyway, as it "may be
+  interpreted as a command-line option".
+- The `--batch` protocols (`fromkey`, `examinekey`, `addurl --with-files`,
+  `registerurl`) split each line at its first space only, so the path may
+  contain spaces, and `addurl`'s JSON `file` comes back verbatim.  Only a
+  newline in a path (which `\s` also admits) would break them.
+
+Tests use the names in `test/obscure.py`, derived from DataLad's
+`OBSCURE_FILENAME` (`' |;&%b5{}\'"<> .datc '` on Linux): `OBSCURE_NAMES` where
+dandi-archive is not involved (`test/test_unusual_paths.py`, no Docker), and
+`obscure_asset_path()` -- as obscure as dandi-archive's regex allows, and
+checked against it -- for assets.  The `text_dandiset` fixture includes such an
+asset, so every test using it syncs one; `test_core.py::test_obscure_asset_paths`
+adds a blob, a Zarr, an update and a deletion.  Asset names lack a tab, though
+dandi-archive admits one, because DataLad 1.6.5's `status` (hence
+`assert_repo_status()`) misreports such files (datalad/datalad#7953); test helpers that parse Git
+output use `-z` (`GitRepo.readcmd_z()`), since Git quotes such paths.  Use
+these names rather than inventing plain ones when a test adds paths.
+
+## Failed Dandisets
+
+`update-from-backup` ends with a `RuntimeError` naming the Dandisets whose
+backups failed (`util.describe_failed_dandisets()`), sorted, up to
+`MAX_FAILED_NAMED` (10) of them.  Past that, it gives a `sed` command listing
+them all from the run's log file (`DandiDatasetter.logfile`), which relies on
+`pool_amap()` logging each failure as `Job failed on input <Dandiset
+000123/draft>:` -- change that line or `RemoteDandiset.__repr__()` and the
+hint breaks (`test/test_failed_dandisets.py` runs it against a real log).
+
+## Superdataset Description
+
+`DandiDatasetter.set_superds_description()` sets the GitHub description of
+the superdataset (`dandi/dandisets`) to e.g. "1194 Dandisets (1.2 PB of the
+archive's 2.4 PB; 001412 outdated, 1.1 PB behind)."
+(`util.describe_superdataset()`):
+
+- The Dandiset count compares the mirrors (submodules) against a fresh listing
+  of the archive, so Dandisets deleted from the archive -- whose submodules
+  stay, with their backups made private -- are not counted.  It is given as
+  "N of M Dandisets mirrored" only when some are not mirrored.
+- A mirror is *outdated* by the tests `update_dandiset()` uses: its
+  `get_backup_state()` is missing or older than the archive draft's
+  `modified`; one *newer* than that raises, as there.  It is "behind" by how
+  much larger the draft (`version.size` from the listing) is than the mirror,
+  floored at 0 -- net growth, not all it is missing (a draft that swapped 1 TB
+  for another 1 TB is 0 behind, and then no size is given).  Up to
+  `MAX_OUTDATED_NAMED` are named, those furthest behind first, so a stalled
+  mirror like 001412's explains the shortfall in the description itself.
+- Outdated mirrors of embargoed (or unembargoing) Dandisets are counted but
+  neither named nor sized, as the description is public.
+- Anything modified on the archive since this run synced it shows up as
+  outdated -- including Dandisets the quiescent period skipped, which may be
+  mid-way through a mass upload and so far behind -- so the description
+  routinely names a few mirrors and changes from run to run.
+- The mirrored size sums each mirror's `get_stats()`, which recounts (and
+  caches) the stats of a mirror whose cached `dandi.stats` are not for its
+  HEAD; the old code counted such a mirror as 0, silently dropping it from the
+  total.  Normally only mirrors the run did not visit need a recount
+  (`update_dandiset()` refreshes the cache), but a recount recurses into Zarr
+  stats and can be slow.
+- Nothing here is best-effort: DANDI API requests are retried by
+  `arequest()`, and a request that still fails, a mirror that is not
+  installed, or one whose stats cannot be counted fails the run rather than
+  leave the description silently out of date.
+- The archive size comes from `/api/stats/`, the number dandiarchive.org shows.
+  It counts every distinct blob/Zarr of every version (embargoed included),
+  while a mirror counts its draft's files (and a blob shared by Dandisets once
+  per Dandiset), so the two agree only roughly even when every mirror is
+  current (the remainder is mostly data only in published versions).  A large
+  gap with no outdated mirror named means something is not being counted --
+  e.g. Zarr mirrors that lag or failed under a Dandiset mirror whose own state
+  is current: Zarr stats come from the Zarr mirror's HEAD
+  (`get_zarr_sub_stats()`), and such a Dandiset is not flagged.
+
+## Dataset Stats
+
+`AsyncDataset.get_stats()` counts a mirror's files and their total size,
+leaving out metadata files (`is_meta_file()`) and counting a Zarr submodule by
+its own mirror's stats, and caches the result in `dandi.stats` as
+`<commit>,<files>,<size>`:
+
+- It counts one commit: `HEAD`, resolved once up front, and caches the stats
+  for that commit, so another process committing meanwhile cannot get them
+  filed under the wrong one.
+- Everything is read from that commit, never from the working tree.  It used
+  to match `git ls-tree HEAD` against `git annex find`, which lists the
+  *working tree*, so a file annexed but not yet committed by a concurrent run
+  raised `KeyError` (#139); Zarr submodules were likewise looked up via
+  `datalad subdatasets`, i.e. the working tree's `.gitmodules`.
+- `git ls-tree` counts the files and sizes the ones in Git.  The annexed ones
+  are sized by `git annex info --fast <commit>` (`get_annexed_tree_stats()`),
+  less the annexed metadata files -- `.dandi/assets.json`, or even
+  `dandiset.yaml` under a low `BACKUPS2DATALAD_TEXT_SIZE_LIMIT` (see
+  `test_large_text_asset`) -- each sized by its key with DataLad's
+  `AnnexRepo.get_size_from_key()`.  (`git annex info` refuses matching
+  options for a tree, and `<commit>:.dandi` would cover directories but not a
+  top-level file.)  A key without a size makes `git annex info` report e.g.
+  `5500 (+ 1 unknown size)`, which is an error.
+- An annexed file is told apart in `ls-tree` by being a symlink, and the
+  count is checked against git-annex's.  If they differ, unlocked files are
+  looked for: pointer files, blobs of up to `MAX_POINTER_SIZE` (1 KiB) that
+  `pointer_key()` reads as links to keys, by git-annex's rules, read with one
+  `git cat-file --batch` (`get_pointer_keys()`).  The mirrors do not unlock
+  files themselves, but a plain `git add` of a file matching
+  `annex.largefiles` does -- metadata too, since `annex.dotfiles=true` (as
+  000026's `.dandi/assets.json` was).  An unlocked file is sized by its key,
+  not as its pointer's blob.  Matching counts are taken to mean there are no
+  unlocked files (barring as many symlinks not into the annex), which saves
+  the read.  A symlink not into the annex, or a link to a key not recognised,
+  fails the count rather than skews it.
+- Zarr URLs come from the commit's `.gitmodules`
+  (`get_repo_config(..., blob="<commit>:.gitmodules")`), following the
+  submodule-name-is-path convention used throughout.
+- Cost: ~17 s per 100k annexed files (the old working-tree `git annex find`
+  took ~7 s; reading the symlinks with `git cat-file --batch` and parsing the
+  keys would take ~0.6 s, but would duplicate git-annex's and DataLad's
+  (`AnnexRepo.get_size_from_key()`) key handling).  The stats are cached, so
+  only a changed mirror is recounted.
+- A Zarr's stats are those of its mirror's `HEAD`, not of the commit the
+  Dandiset records for it (see the TODO in `get_zarr_sub_stats()`).
+
+## S3 URLs Without a Region
+
+dandi-archive v1.0.11 (dandi-archive#2951, 2026-10-01) started reporting asset
+S3 URLs as `https://dandiarchive.s3.us-east-2.amazonaws.com/...` instead of the
+region-less `https://dandiarchive.s3.amazonaws.com/...` they always had.  The
+change hit the `contentUrl` of every asset of every version, but no
+`modified` timestamp, so `--mode verify` raised `UnexpectedChangeError` for
+every blob asset of every mirror (see #136).
+
+Until dandi-archive#2962 restores the old form, `RemoteAsset.from_data()` in
+`adandi.py` -- through which every asset record from the API passes -- maps
+the URLs back with `strip_s3_region()`, so `.dandi/assets.json` keeps the
+region-less form and new git-annex URL registrations use it.  Like
+`BackupConfig.bucket_url`, this assumes the region-less endpoint works for the
+bucket.
+
+Mirrors synced between the server change and this workaround have the
+regional form in `.dandi/assets.json`; find them with
+`grep -lF s3.us-east-2.amazonaws.com <mirror>/.dandi/assets.json` (not
+`git grep`, which misses an annexed `assets.json`).  Until such a mirror is
+synced again, `--mode verify` still raises `UnexpectedChangeError` for it;
+`update-from-backup --mode force <ids>` puts the region-less form back.
+
 ## Testing
 
 The project uses pytest for testing, with fixtures for:
@@ -336,14 +637,41 @@ serialised ≥ 1 s apart, with a cooldown shared by every worker whenever GitHub
 answers 429, or 403 with `retry-after` / `x-ratelimit-remaining: 0` / a
 secondary-limit message.  The cooldown is whatever GitHub says (`retry-after`,
 else `x-ratelimit-reset`), else GitHub's documented fallback of a minute
-doubling per consecutive hit; after `GITHUB_RATE_LIMIT_ATTEMPTS` slept-out
-hits the gate gives up and mutations raise `GitHubRateLimited`.  Constants
+doubling per consecutive hit, capped at an hour
+(`GITHUB_RATE_LIMIT_FALLBACK_MAX`, the longest window GitHub documents for
+secondary limits); after `GITHUB_RATE_LIMIT_ATTEMPTS` (10, i.e. ~5 h of
+cooldowns) slept-out hits the gate gives up and mutations raise
+`GitHubRateLimited`.  Constants
 live in `consts.py`; there are no config/CLI knobs.  `arequest(gate=...)` is
 opt-in -- without a gate (DANDI API, S3) it behaves as before.
 
 `AsyncDataset.create_github_sibling()` still uses DataLad's
 `create_sibling_github` but inspects its result records itself, passes a real
-`description=`, and retries a rate-limited creation through the gate.
+`description=`, and retries a rate-limited creation through the gate.  A
+server error (5xx) is retried too, after each of `GITHUB_SERVER_ERROR_WAITS`
+(10, 30, 90 s; the gate's lock is released while waiting, and it does not
+count as rate limiting).  Unlike a rate limit, a 5xx may have created the
+repository after all (seen as `Server returned error code 500 without any
+further information`); the retry is what checks, since with
+`existing="reconfigure"` GitHub answers "already exists" and DataLad adopts
+the repository (logged as "GitHub repository … exists already").  DataLad
+reports a 500 as an error record without its status code (since 1.5.0;
+earlier, and for other 5xx, as `requests.HTTPError`), so such a record is
+recognised by its message being a plain string, not a `(format, args)` tuple.
+A creation that got no response -- `requests.ConnectionError`/`Timeout`, or
+DataLad's call not returning within `GITHUB_CREATE_TIMEOUT` (120 s; DataLad's
+own requests have no timeout) -- is retried the same way, as it may have
+created the repository too: 001412's Zarr `325e2654-…` was created by a call
+that timed out, and that timeout used to fail the Dandiset.  A thread
+abandoned on that timeout keeps running, may race the retry configuring the
+same sibling, and keeps the process from exiting until it ends.  A 404 on
+DataLad's lookup (`GET /repos/…`, which it makes only once the creation was
+answered "already exists") is retried the same way: GitHub not serving a
+just-created repository yet, whether an earlier failed attempt or someone else
+created it.  (Were it an existing repository the token cannot see, the
+retries would end in that error all the same.)  A 404 on the creation `POST`
+(no such organization, or no access) still fails at once; the two are told
+apart by the HTTP method of the `requests.HTTPError`'s request.
 `sync_zarr()` converges on every visit: it pushes whenever HEAD has commits
 the `github` sibling lacks (`has_unpushed_commits()`, a plain push) and
 records the description whenever the `dandi.github-description` cache is

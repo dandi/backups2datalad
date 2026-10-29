@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-from datetime import datetime, timezone
+from collections.abc import AsyncGenerator, Callable
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
 import logging
 from pathlib import Path
 from shutil import rmtree
 import subprocess
+import threading
 from time import sleep
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -17,15 +20,17 @@ import pytest
 import requests
 from test_aioutil import FakeClock, make_gate
 from test_util import GitRepo, zarr_format_of
+from zarr_checksum.tree import ZarrChecksumTree
 
 from backups2datalad.adandi import RemoteZarrAsset
 from backups2datalad.adataset import AsyncDataset, DatasetStats
 from backups2datalad.aioutil import GitHubRateLimited, arequest
-from backups2datalad.config import BackupConfig, ResourceConfig
+from backups2datalad.config import BackupConfig, Mode, ResourceConfig, ZarrDirty
 from backups2datalad.datasetter import DandiDatasetter
 from backups2datalad.logging import log as plog
 from backups2datalad.manager import Manager
-from backups2datalad.zarr import ZarrLink, sync_zarr
+from backups2datalad.util import UnexpectedChangeError, maxdatetime
+from backups2datalad.zarr import SYNC_FILE, ZarrEntry, ZarrLink, ZarrSyncer, sync_zarr
 
 log = logging.getLogger("test_backups2datalad.test_zarr")
 
@@ -223,6 +228,7 @@ async def test_backup_zarr_delete_zarr(
     assert isinstance(asset, RemoteZarrAsset)
     await new_dandiset.client.delete(asset.api_path)
     new_dandiset.rmasset("sample.zarr")
+    await new_dandiset.settle()
 
     log.info("test_backup_zarr_delete_zarr: Syncing Zarr dandiset after deleting Zarr")
     await di.update_from_backup([dandiset_id])
@@ -320,14 +326,15 @@ def _fake_create_sibling(
     monkeypatch: pytest.MonkeyPatch,
     ds: AsyncDataset,
     bare: Path,
-    outcomes: list[str | Exception],
+    outcomes: list[str | Exception | dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """
     Replace ``ds.ds.create_sibling_github`` with a fake that consumes one
     outcome per call: ``"ok"`` configures ``bare`` as the sibling and returns
     an ok record, another string becomes DataLad's 403 error record (``("%s"
-    format, message)`` tuple), and an exception is raised.  Returns the list
-    of keyword arguments of each call.
+    format, message)`` tuple), a dict is returned as the result record (after
+    configuring ``bare`` if its status is ok or notneeded), and an exception
+    is raised.  Returns the list of keyword arguments of each call.
     """
     calls: list[dict[str, Any]] = []
 
@@ -336,6 +343,10 @@ def _fake_create_sibling(
         outcome = outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
+        if isinstance(outcome, dict):
+            if outcome["status"] in ("ok", "notneeded"):
+                _add_github_remote(ds, bare)
+            return [outcome]
         if outcome == "ok":
             _add_github_remote(ds, bare)
             return [
@@ -354,11 +365,19 @@ def _fake_create_sibling(
     return calls
 
 
-def _http_error(status: int, headers: dict[str, str], body: str) -> requests.HTTPError:
+def _http_error(
+    status: int, headers: dict[str, str], body: str, method: str | None = None
+) -> requests.HTTPError:
     resp = requests.Response()
     resp.status_code = status
     resp.headers.update(headers)
     resp._content = body.encode()
+    if method is not None:
+        # Like a real response, carry the request that got it: its method is
+        # what tells DataLad's repository lookup (GET) from the creation (POST)
+        resp.request = requests.Request(
+            method, "https://api.github.com/repos/org/zarr1"
+        ).prepare()
     return requests.HTTPError(response=resp)
 
 
@@ -443,6 +462,338 @@ async def test_create_github_sibling_gives_up(
     assert gate.gave_up
 
 
+def _server_error_record(message: str | None = None) -> dict[str, Any]:
+    """DataLad's (>= 1.5.0) result record for a 500 creating the repository"""
+    return {
+        "action": "create_sibling_github",
+        "status": "error",
+        "message": message
+        or "Server returned error code 500 without any further information",
+    }
+
+
+@pytest.mark.ai_generated
+async def test_create_github_sibling_retries_server_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A 500 that DataLad reports as an error record (with or without GitHub's
+    message) and a 5xx that escapes as `requests.HTTPError` are retried after
+    `GITHUB_SERVER_ERROR_WAITS`, with the gate's lock released while waiting,
+    and do not count as rate limiting.
+    """
+    ds = await _make_dataset(tmp_path / "ds")
+    bare = _make_bare(tmp_path / "bare.git")
+    calls = _fake_create_sibling(
+        monkeypatch,
+        ds,
+        bare,
+        [
+            _server_error_record(),
+            _http_error(502, {}, "<html>Bad Gateway</html>"),
+            _server_error_record("Server Error"),
+            "ok",
+        ],
+    )
+    clock = FakeClock()
+    gate = make_gate(clock)
+    locked_while_sleeping: list[bool] = []
+
+    async def sleep(delay: float) -> None:
+        locked_while_sleeping.append(gate.lock.locked())
+        await clock.sleep(delay)
+
+    gate.sleep = sleep
+    created = await ds.create_github_sibling(
+        owner="org", name="zarr1", backup_remote=None, gate=gate
+    )
+    assert created
+    assert len(calls) == 4
+    assert all(c["existing"] == "reconfigure" for c in calls)
+    assert clock.slept == [10.0, 30.0, 90.0]
+    assert locked_while_sleeping == [False] * 3
+    assert gate.consecutive == 0
+    assert not gate.gave_up
+    assert (
+        await ds.get_repo_config("remote.github.pushurl") == "git@github.com:org/zarr1"
+    )
+
+
+@pytest.mark.ai_generated
+async def test_create_github_sibling_adopts_repo_created_despite_500(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    When the request answered with a 500 created the repository after all,
+    the retry finds it ("already exists", adopted by
+    ``existing="reconfigure"``) and the sibling is configured as if created.
+    """
+    ds = await _make_dataset(tmp_path / "ds")
+    bare = _make_bare(tmp_path / "bare.git")
+    calls = _fake_create_sibling(
+        monkeypatch,
+        ds,
+        bare,
+        [
+            _server_error_record(),
+            {
+                "action": "create_sibling_github",
+                "status": "notneeded",
+                "message": "repository already exists",
+            },
+        ],
+    )
+    clock = FakeClock()
+    created = await ds.create_github_sibling(
+        owner="org", name="zarr1", backup_remote=None, gate=make_gate(clock)
+    )
+    assert created
+    assert len(calls) == 2
+    assert calls[1]["existing"] == "reconfigure"
+    assert clock.slept == [10.0]
+    assert "error code 500" in caplog.text
+    assert "GitHub repository org/zarr1 exists already" in caplog.text
+    assert await ds.has_github_remote()
+    assert (
+        await ds.get_repo_config("remote.github.pushurl") == "git@github.com:org/zarr1"
+    )
+    assert await ds.get_repo_config("branch.draft.remote") == "github"
+
+
+@pytest.mark.ai_generated
+async def test_create_github_sibling_server_error_gives_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ds = await _make_dataset(tmp_path / "ds")
+    bare = _make_bare(tmp_path / "bare.git")
+    calls = _fake_create_sibling(monkeypatch, ds, bare, [_server_error_record()] * 4)
+    clock = FakeClock()
+    gate = make_gate(clock)
+    with pytest.raises(RuntimeError, match="error code 500"):
+        await ds.create_github_sibling(
+            owner="org", name="zarr1", backup_remote=None, gate=gate
+        )
+    assert len(calls) == 4
+    assert clock.slept == [10.0, 30.0, 90.0]
+    assert not gate.gave_up
+    assert not await ds.has_github_remote()
+
+
+@pytest.mark.ai_generated
+async def test_create_github_sibling_server_error_without_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a gate a 5xx is retried too; a 4xx `HTTPError` is not."""
+    monkeypatch.setattr("backups2datalad.adataset.GITHUB_SERVER_ERROR_WAITS", (0, 0, 0))
+    ds = await _make_dataset(tmp_path / "ds")
+    bare = _make_bare(tmp_path / "bare.git")
+    calls = _fake_create_sibling(
+        monkeypatch, ds, bare, [_http_error(503, {}, ""), "ok"]
+    )
+    assert await ds.create_github_sibling(owner="org", name="zarr1", backup_remote=None)
+    assert len(calls) == 2
+
+    ds2 = await _make_dataset(tmp_path / "ds2")
+    calls = _fake_create_sibling(
+        monkeypatch, ds2, bare, [_http_error(404, {}, '{"message": "Not Found"}')]
+    )
+    with pytest.raises(requests.HTTPError):
+        await ds2.create_github_sibling(owner="org", name="zarr2", backup_remote=None)
+    assert len(calls) == 1
+
+
+@pytest.mark.ai_generated
+@pytest.mark.parametrize(
+    "exc",
+    [
+        requests.ConnectionError("Connection reset by peer"),
+        requests.ReadTimeout("Read timed out"),
+    ],
+)
+async def test_create_github_sibling_retries_without_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exc: Exception
+) -> None:
+    """
+    A creation request that got no response may have created the repository
+    all the same; it is retried like a 5xx, adopting the repository.
+    """
+    ds = await _make_dataset(tmp_path / "ds")
+    bare = _make_bare(tmp_path / "bare.git")
+    calls = _fake_create_sibling(
+        monkeypatch,
+        ds,
+        bare,
+        [
+            exc,
+            {
+                "action": "create_sibling_github",
+                "status": "notneeded",
+                "message": "repository already exists",
+            },
+        ],
+    )
+    clock = FakeClock()
+    gate = make_gate(clock)
+    assert await ds.create_github_sibling(
+        owner="org", name="zarr1", backup_remote=None, gate=gate
+    )
+    assert len(calls) == 2
+    assert clock.slept == [10.0]
+    assert gate.consecutive == 0
+    assert (
+        await ds.get_repo_config("remote.github.pushurl") == "git@github.com:org/zarr1"
+    )
+
+
+@pytest.mark.ai_generated
+@pytest.mark.parametrize(
+    "before,slept",
+    [([_server_error_record()], [10.0, 30.0]), ([], [10.0])],
+    ids=["after-500", "first-attempt"],
+)
+async def test_create_github_sibling_retries_lookup_404(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    before: list[str | Exception | dict[str, Any]],
+    slept: list[float],
+) -> None:
+    """
+    GitHub may answer a creation with "already exists" and then 404 DataLad's
+    lookup of that repository, not serving it yet -- e.g. after a 500 that
+    created it.  That 404 is retried, and the repository adopted once GitHub
+    serves it.
+    """
+    ds = await _make_dataset(tmp_path / "ds")
+    bare = _make_bare(tmp_path / "bare.git")
+    outcomes: list[str | Exception | dict[str, Any]] = [
+        *before,
+        _http_error(404, {}, '{"message": "Not Found"}', method="GET"),
+        {
+            "action": "create_sibling_github",
+            "status": "notneeded",
+            "message": "repository already exists",
+        },
+    ]
+    n = len(outcomes)
+    calls = _fake_create_sibling(monkeypatch, ds, bare, outcomes)
+    clock = FakeClock()
+    gate = make_gate(clock)
+    assert await ds.create_github_sibling(
+        owner="org", name="zarr1", backup_remote=None, gate=gate
+    )
+    assert len(calls) == n
+    assert clock.slept == slept
+    assert gate.consecutive == 0
+    assert "HTTP 404 looking up GitHub repository org/zarr1" in caplog.text
+    assert (
+        await ds.get_repo_config("remote.github.pushurl") == "git@github.com:org/zarr1"
+    )
+
+
+@pytest.mark.ai_generated
+@pytest.mark.parametrize(
+    "before,slept",
+    [([], []), ([_server_error_record()], [10.0])],
+    ids=["first-attempt", "after-500"],
+)
+async def test_create_github_sibling_post_404_not_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    before: list[str | Exception | dict[str, Any]],
+    slept: list[float],
+) -> None:
+    """
+    A 404 on the creation POST -- no such organization, or no access to it --
+    is not retried, whatever came before it.
+    """
+    ds = await _make_dataset(tmp_path / "ds")
+    bare = _make_bare(tmp_path / "bare.git")
+    outcomes: list[str | Exception | dict[str, Any]] = [
+        *before,
+        _http_error(404, {}, '{"message": "Not Found"}', method="POST"),
+    ]
+    n = len(outcomes)
+    calls = _fake_create_sibling(monkeypatch, ds, bare, outcomes)
+    clock = FakeClock()
+    with pytest.raises(requests.HTTPError):
+        await ds.create_github_sibling(
+            owner="org", name="zarr1", backup_remote=None, gate=make_gate(clock)
+        )
+    assert len(calls) == n
+    assert clock.slept == slept
+    assert not await ds.has_github_remote()
+
+
+@pytest.mark.ai_generated
+async def test_create_github_sibling_retries_after_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A DataLad call that does not finish within `GITHUB_CREATE_TIMEOUT` is
+    abandoned and retried like a 5xx, with the gate's lock released while
+    waiting, adopting the repository the abandoned call created.
+    """
+    # Real seconds (`move_on_after`); the call that is not stalled has to
+    # finish within it, git subprocesses and all
+    monkeypatch.setattr("backups2datalad.adataset.GITHUB_CREATE_TIMEOUT", 2)
+    ds = await _make_dataset(tmp_path / "ds")
+    bare = _make_bare(tmp_path / "bare.git")
+    calls = _fake_create_sibling(
+        monkeypatch,
+        ds,
+        bare,
+        [
+            # taken by the retry
+            {
+                "action": "create_sibling_github",
+                "status": "notneeded",
+                "message": "repository already exists",
+            },
+            # taken by the stalled call once released at the end
+            RuntimeError("abandoned call"),
+        ],
+    )
+    fake = ds.ds.create_sibling_github
+    release = threading.Event()
+    started = 0
+
+    def stalling(**kwargs: Any) -> Any:
+        nonlocal started
+        started += 1
+        if started == 1:
+            # As DataLad's untimed request may
+            release.wait(60)
+        return fake(**kwargs)
+
+    monkeypatch.setattr(ds.ds, "create_sibling_github", stalling)
+    clock = FakeClock()
+    gate = make_gate(clock)
+    locked_while_sleeping: list[bool] = []
+
+    async def sleep(delay: float) -> None:
+        locked_while_sleeping.append(gate.lock.locked())
+        await clock.sleep(delay)
+
+    gate.sleep = sleep
+    try:
+        assert await ds.create_github_sibling(
+            owner="org", name="zarr1", backup_remote=None, gate=gate
+        )
+        ncalls = len(calls)
+    finally:
+        release.set()
+    assert started == 2
+    assert ncalls == 1, "only the retry got through"
+    assert clock.slept == [10.0]
+    assert locked_while_sleeping == [False]
+    assert "did not finish within 2 s; retrying in 10 s" in caplog.text
+    assert "GitHub repository org/zarr1 exists already" in caplog.text
+    assert (
+        await ds.get_repo_config("remote.github.pushurl") == "git@github.com:org/zarr1"
+    )
+
+
 @pytest.mark.ai_generated
 async def test_create_github_sibling_restores_missing_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -519,6 +870,7 @@ async def test_sync_zarr_converges_github_state(
     )
     gh = MagicMock()
     gh.edit_repo = AsyncMock()
+    gh.repo_exists = AsyncMock(return_value=False)  # a brand-new Zarr
     gh.gate = make_gate(FakeClock())
     manager = Manager(config=config, gh=gh, log=plog, token="token")
     asset = MagicMock(spec=RemoteZarrAsset)
@@ -608,3 +960,312 @@ async def test_set_zarr_description_uses_given_dataset(tmp_path: Path) -> None:
     ), "must not leak into the global git config"
     with pytest.raises(RuntimeError, match="no dataset at"):
         await manager.set_zarr_description("missing", stats)
+
+
+@pytest.mark.ai_generated
+async def test_zarr_dirty_reset_clean(
+    tmp_path: Path, monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    `--zarr-dirty=reset+clean` discards a dirty Zarr's uncommitted state and
+    carries on, but still fails when that did not make the Zarr clean -- which
+    `git clean` cannot do for an untracked nested git repository, since the
+    `-ff` that would remove it is deliberately not used.
+    """
+    zarr_root = tmp_path / "zarrs"
+    config = BackupConfig(
+        backup_root=tmp_path,
+        zarrs=ResourceConfig(path="zarrs"),
+        dandisets=ResourceConfig(path="dandisets"),
+    )
+    manager = Manager(config=config, gh=None, log=plog, token="token")
+    asset = MagicMock(spec=RemoteZarrAsset)
+    asset.zarr = "zarr1"
+    asset.dandiset_id = "000001"
+    asset.path = "sample.zarr"
+    asset.created = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    dsdir = zarr_root / "zarr1"
+
+    monkeypatch.setattr("backups2datalad.zarr.ZarrSyncer.run", AsyncMock())
+
+    async def visit(error_on_change: bool = False) -> None:
+        link = ZarrLink(zarr_dspath=dsdir, timestamp=None, asset_paths=["sample.zarr"])
+        await sync_zarr(
+            asset, None, dsdir, manager, link=link, error_on_change=error_on_change
+        )
+
+    await visit()
+    ds = AsyncDataset(dsdir)
+
+    # Default is unchanged: a dirty Zarr is refused.
+    (ds.pathobj / "stray.txt").write_text("x\n")
+    with pytest.raises(RuntimeError, match=r"(?s)is dirty.*stray\.txt"):
+        await visit()
+    assert (ds.pathobj / "stray.txt").exists()
+
+    # reset+clean discards it and carries on, announcing itself on one line
+    # under a token a run of 20k Zarrs can be audited by.  The dirty paths are
+    # deliberately not listed: there can be thousands of them.
+    config.zarr_dirty = ZarrDirty.RESET_CLEAN
+    with caplog.at_level(logging.WARNING, logger="backups2datalad"):
+        await visit()
+    warnings = [
+        r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].startswith("ZARR-RESET: ")
+    assert "stray.txt" not in warnings[0]
+    assert "\n" not in warnings[0]
+    assert not (ds.pathobj / "stray.txt").exists()
+    assert not await ds.is_dirty()
+
+    # Tracked modifications are discarded too, and `.git/annex` survives.
+    annex_marker = ds.pathobj / ".git" / "annex" / "keep-me"
+    annex_marker.parent.mkdir(parents=True, exist_ok=True)
+    annex_marker.write_text("object\n")
+    (ds.pathobj / ".dandi" / ".gitattributes").write_text("tampered\n")
+    await visit()
+    assert not await ds.is_dirty()
+    assert annex_marker.read_text() == "object\n"
+    assert (ds.pathobj / ".dandi" / ".gitattributes").read_text() != "tampered\n"
+
+    # An untracked nested git repo survives `clean -dfx`, so the Zarr still
+    # fails -- loudly, naming what is left, rather than passing silently.
+    orphan = ds.pathobj / "orphan.zarr"
+    orphan.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(orphan)], check=True)
+    (orphan / "payload").write_text("irreplaceable\n")
+    with pytest.raises(RuntimeError, match=r"(?s)still dirty after.*orphan\.zarr"):
+        await visit()
+    assert (orphan / "payload").read_text() == "irreplaceable\n"
+    rmtree(orphan)
+
+    # `--mode verify` is a diagnostic; it must not discard what it was asked to
+    # report.  The gate is the mode itself, not the `error_on_change` that
+    # verify only passes down once it also finds the timestamp unchanged --
+    # otherwise verifying a Dandiset that *had* changed would still discard.
+    (ds.pathobj / "stray.txt").write_text("x\n")
+    config.mode = Mode.VERIFY
+    for eoc in (False, True):
+        with pytest.raises(RuntimeError, match=r"(?s)is dirty.*stray\.txt"):
+            await visit(error_on_change=eoc)
+        assert (ds.pathobj / "stray.txt").exists()
+
+
+class FakeZarrListing:
+    """
+    Stand-in for a Zarr's S3 listing, patched over `ZarrSyncer`'s two listing
+    methods so that `ZarrSyncer.run()` can be exercised without S3
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.entries: dict[str, ZarrEntry] = {}
+        listing = self
+
+        async def aiter_objects(
+            self: ZarrSyncer, _client: Any
+        ) -> AsyncGenerator[dict[str, Any], None]:
+            for e in sorted(listing.entries.values(), key=str):
+                yield {"Key": self.s3prefix + e.path, "LastModified": e.last_modified}
+
+        async def aiter_file_entries(
+            self: ZarrSyncer, _client: Any
+        ) -> AsyncGenerator[ZarrEntry, None]:
+            for e in sorted(listing.entries.values(), key=str):
+                self.last_timestamp = maxdatetime(self.last_timestamp, e.last_modified)
+                yield e
+
+        monkeypatch.setattr(ZarrSyncer, "aiter_objects", aiter_objects)
+        monkeypatch.setattr(ZarrSyncer, "aiter_file_entries", aiter_file_entries)
+
+    def put(self, path: str, content: bytes, last_modified: datetime) -> None:
+        self.entries[path] = ZarrEntry(
+            path=path,
+            size=len(content),
+            md5_digest=hashlib.md5(content).hexdigest(),
+            last_modified=last_modified,
+            bucket_url=f"https://bucket.example/{path}",
+        )
+
+
+@pytest.mark.ai_generated
+async def test_sync_zarr_readds_entry_predating_last_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A Zarr backup lacking an entry whose S3 `LastModified` is not newer than
+    the last sync gets it back on the next timestamp-mode sync -- it used to be
+    skipped as "not modified since last backup" on every visit, so the backup
+    stayed incomplete for good (000108, 001246, 001769; #66) -- and verify
+    reports it as an incomplete backup rather than as a server-side change.
+    """
+    config = BackupConfig(
+        backup_root=tmp_path,
+        zarrs=ResourceConfig(path="zarrs"),
+        dandisets=ResourceConfig(path="dandisets"),
+    )
+    manager = Manager(config=config, gh=None, log=plog, token="token")
+    t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    asset = MagicMock(spec=RemoteZarrAsset)
+    asset.zarr = "zarr1"
+    asset.dandiset_id = "000001"
+    asset.path = "sample.zarr"
+    asset.created = t0
+    asset.modified = t0
+    asset.aclient = MagicMock(api_url="https://api.example")
+    # Same `modified` and no checksum: the Zarr did not change during a sync.
+    asset.refetch = AsyncMock(
+        return_value=MagicMock(modified=t0, get_digest_value=lambda: None)
+    )
+    dsdir = tmp_path / "zarrs" / "zarr1"
+    repo = GitRepo(dsdir)
+    listing = FakeZarrListing(monkeypatch)
+    listing.put(".zattrs", b"{}\n", t0 + timedelta(minutes=1))
+    listing.put("0/0", b"chunk 0\n", t0 + timedelta(minutes=2))
+    listing.put("0/1", b"chunk 1\n", t0 + timedelta(minutes=3))
+
+    def sync_file() -> dict[str, Any]:
+        data = json.loads((dsdir / SYNC_FILE).read_text())
+        assert isinstance(data, dict)
+        return data
+
+    async def visit(error_on_change: bool = False) -> None:
+        await sync_zarr(asset, None, dsdir, manager, error_on_change=error_on_change)
+
+    def tracked() -> set[str]:
+        return set(repo.readcmd_z("ls-tree", "-rz", "--name-only", "HEAD"))
+
+    await visit()
+    assert {".zattrs", "0/0", "0/1"} <= tracked()
+    assert sync_file()["last_modified"].startswith("2024-01-01T00:03:00")
+
+    def lose(path: str) -> None:
+        # As a listing that raced the upload of `path` would have left it
+        repo.runcmd("rm", "-q", "--", path, check=True)
+        repo.runcmd("commit", "-q", "-m", f"Lose {path}", check=True)
+        assert path not in tracked()
+
+    lose(".zattrs")
+    caplog.clear()
+    await visit()
+    assert ".zattrs" in tracked()
+    assert not await AsyncDataset(dsdir).is_dirty()
+    head = repo.readcmd("log", "-1", "--format=%s")
+    assert head == "[backups2datalad] 1 file added"
+    # Old entries the backup has are still skipped.
+    assert "0/0: file not modified since last backup" in caplog.text
+
+    # Verify does not repair it, and says what is wrong instead of blaming
+    # the server's timestamp -- also for an entry exactly as old as the last
+    # sync, which that sync's listing must have included.
+    for path in [".zattrs", "0/1"]:
+        lose(path)
+        with pytest.raises(UnexpectedChangeError) as excinfo:
+            await visit(error_on_change=True)
+        msg = str(excinfo.value)
+        assert repr(path) in msg
+        assert "missing from the backup although it is not newer than" in msg
+        assert "--mode force 000001" in msg
+        assert "timestamp was not updated" not in msg
+        assert path not in tracked()
+        await visit()
+        assert path in tracked()
+
+    # An entry that is new on the server is still a server-side change.
+    listing.put("0/2", b"chunk 2\n", t0 + timedelta(minutes=4))
+    with pytest.raises(UnexpectedChangeError, match="timestamp was not updated"):
+        await visit(error_on_change=True)
+
+
+@pytest.mark.ai_generated
+async def test_sync_zarr_keeps_last_sync_when_modified_during_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An entry overwritten behind the cursor of a listing that raced an upload
+    is repaired by the next sync: when the Zarr's ingest completed during the
+    sync and the server's checksum does not confirm the result, `s3sync.json`
+    keeps the previous last-sync timestamp instead of one past the
+    overwritten entry's, which would have had it skipped as unmodified.
+    """
+    config = BackupConfig(
+        backup_root=tmp_path,
+        zarrs=ResourceConfig(path="zarrs"),
+        dandisets=ResourceConfig(path="dandisets"),
+    )
+    manager = Manager(config=config, gh=None, log=plog, token="token")
+    t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    asset = MagicMock(spec=RemoteZarrAsset)
+    asset.zarr = "zarr1"
+    asset.dandiset_id = "000001"
+    asset.path = "sample.zarr"
+    asset.created = t0
+    asset.modified = t0
+    asset.aclient = MagicMock(api_url="https://api.example")
+    dsdir = tmp_path / "zarrs" / "zarr1"
+    listing = FakeZarrListing(monkeypatch)
+
+    def server_checksum() -> str:
+        zcc = ZarrChecksumTree()
+        for e in listing.entries.values():
+            zcc.add_leaf(Path(e.path), e.size, e.md5_digest)
+        return str(zcc.process())
+
+    def last_modified() -> str:
+        data = json.loads((dsdir / SYNC_FILE).read_text())
+        assert isinstance(data["last_modified"], str)
+        return data["last_modified"]
+
+    def annexed_md5(path: str) -> str:
+        return (dsdir / path).resolve().name.split("--")[1]
+
+    listing.put("0/0", b"chunk 0\n", t0 + timedelta(minutes=1))
+    asset.refetch = AsyncMock(
+        return_value=MagicMock(modified=t0, get_digest_value=server_checksum)
+    )
+    await sync_zarr(asset, None, dsdir, manager)
+    assert last_modified().startswith("2024-01-01T00:01:00")
+
+    # An upload overwrites `0/0` after the listing has passed it and adds
+    # `0/1`, which the listing does see; its ingest completes before the sync
+    # ends.
+    old_00 = listing.entries["0/0"]
+    listing.put("0/0", b"chunk 0, rewritten\n", t0 + timedelta(minutes=2))
+    listing.put("0/1", b"chunk 1\n", t0 + timedelta(minutes=3))
+    new_00 = listing.entries["0/0"]
+    final_checksum = server_checksum()
+    listing.entries["0/0"] = old_00
+    asset.refetch.return_value = MagicMock(
+        modified=t0 + timedelta(minutes=5), get_digest_value=lambda: final_checksum
+    )
+    await sync_zarr(asset, None, dsdir, manager)
+    assert (dsdir / "0" / "1").is_symlink()
+    assert annexed_md5("0/0") == old_00.md5_digest
+    assert last_modified().startswith("2024-01-01T00:01:00")
+
+    # The next sync sees the overwritten entry as newer than the last sync,
+    # repairs it, matches the server's checksum, and moves the timestamp on.
+    listing.entries["0/0"] = new_00
+    asset.modified = t0 + timedelta(minutes=5)
+    asset.refetch.return_value = MagicMock(
+        modified=t0 + timedelta(minutes=5), get_digest_value=server_checksum
+    )
+    await sync_zarr(asset, None, dsdir, manager)
+    assert annexed_md5("0/0") == new_00.md5_digest
+    assert last_modified().startswith("2024-01-01T00:03:00")
+
+    # Likewise when the Zarr changes during a sync and its checksum is not
+    # available yet: nothing confirms the result.
+    listing.put("0/2", b"chunk 2\n", t0 + timedelta(minutes=4))
+    asset.refetch.return_value = MagicMock(
+        modified=t0 + timedelta(minutes=6), get_digest_value=lambda: None
+    )
+    await sync_zarr(asset, None, dsdir, manager)
+    assert (dsdir / "0" / "2").is_symlink()
+    assert last_modified().startswith("2024-01-01T00:03:00")
+    asset.modified = t0 + timedelta(minutes=6)
+    asset.refetch.return_value = MagicMock(
+        modified=t0 + timedelta(minutes=6), get_digest_value=server_checksum
+    )
+    await sync_zarr(asset, None, dsdir, manager)
+    assert last_modified().startswith("2024-01-01T00:04:00")

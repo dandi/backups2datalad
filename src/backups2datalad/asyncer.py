@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Iterable
 from contextlib import aclosing
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -12,6 +12,7 @@ from operator import attrgetter
 import os
 import os.path
 from pathlib import Path, PurePosixPath
+import shlex
 import subprocess
 from types import TracebackType
 
@@ -37,6 +38,7 @@ from .manager import Manager
 from .procedures.cfg_dandiset import size_limit_bytes
 from .util import (
     AssetTracker,
+    MirrorMissingError,
     UnexpectedChangeError,
     format_errors,
     key2hash,
@@ -113,8 +115,13 @@ class Downloader:
     tracker: AssetTracker
     s3client: httpx.AsyncClient
     annex: AsyncAnnex
-    nursery: anyio.abc.TaskGroup
     error_on_change: bool = False
+    # Set after construction, once the task group it will run under exists --
+    # see `async_assets()`, which enters `async with dm:` *around* the task
+    # group so that `__aexit__` (which must force-close `addurl`) only runs
+    # once every task in the group -- including `addurl`'s own feeder/reader
+    # tasks -- has actually finished or been cancelled.
+    nursery: anyio.abc.TaskGroup | None = None
     addurl: TextProcess | None = None
     addurl_lock: anyio.Lock = field(init=False, default_factory=anyio.Lock)
     last_timestamp: datetime | None = None
@@ -171,6 +178,7 @@ class Downloader:
                     await self.addurl.force_aclose()
 
     async def asset_loop(self, aia: AsyncIterator[RemoteAsset | None]) -> None:
+        assert self.nursery is not None
         now = datetime.now(timezone.utc)
         downloading = True
         async with self.download_sender:
@@ -286,8 +294,14 @@ class Downloader:
                     )
                     to_update = True
                     self.report.updated += 1
+                    # Only a file being replaced needs a `git rm`.  One per
+                    # *new* file took `.git/index.lock` and read the whole
+                    # index even with nothing to remove -- 177k of them took
+                    # 000571 15.5 h -- and git-annex's own index updates,
+                    # which are not retried, lose their files while we hold
+                    # that lock (#72).
+                    await self.ds.remove(blob.path)
             if to_update:
-                await self.ds.remove(blob.path)
                 # Text files above the size limit are annexed as well; cf. the
                 # `.gitattributes` policy set by `cfg_dandiset`.
                 if blob.is_binary() or blob.asset.size > size_limit_bytes():
@@ -327,6 +341,7 @@ class Downloader:
     async def process_zarr(
         self, asset: RemoteZarrAsset, zarr_digest: str | None
     ) -> None:
+        assert self.nursery is not None
         if self.manager.config.zarr_mode is ZarrMode.ASSET_CHECKSUM:
             if not self.tracker.register_asset_by_timestamp(
                 asset, force=self.config.force
@@ -355,6 +370,13 @@ class Downloader:
                 timestamp=None,
                 asset_paths=[asset.path],
             )
+            # Claim the Zarr before awaiting anything, so that another asset
+            # of the same Zarr does not start a second sync of it
+            self.zarrs[asset.zarr] = zl
+            if not AsyncDataset(zarr_dspath).ds.is_installed():
+                # Bounded: all uninstalled Zarrs get here at once (#133)
+                async with self.config.zarr_limit:
+                    await self.assert_zarr_mirror_is_new(asset, zarr_dspath)
             self.nursery.start_soon(
                 partial(
                     sync_zarr,
@@ -367,7 +389,22 @@ class Downloader:
                 zarr_dspath,
                 self.manager.with_sublogger(f"Zarr {asset.zarr}"),
             )
-            self.zarrs[asset.zarr] = zl
+
+    async def assert_zarr_mirror_is_new(
+        self, asset: RemoteZarrAsset, zarr_dspath: Path
+    ) -> None:
+        url = await self.ds.get_repo_config(
+            f"submodule.{asset.path}.url", file=".gitmodules"
+        )
+        if url is not None and PurePosixPath(url).name.removesuffix(".git") == (
+            asset.zarr
+        ):
+            raise MirrorMissingError(
+                f"Zarr {asset.zarr} is a submodule of Dandiset"
+                f" {self.dandiset_id} at {asset.path} (url: {url}) but not"
+                f" installed at {zarr_dspath}; clone it there rather than"
+                " having it created anew"
+            )
 
     async def get_annex_hash(self, filepath: Path) -> str:
         # OPT: do not bother checking or talking to annex --
@@ -384,6 +421,7 @@ class Downloader:
             return await self.asha256(filepath)
 
     async def ensure_addurl(self) -> None:
+        assert self.nursery is not None
         async with self.addurl_lock:
             if self.addurl is None:
                 env = os.environ.copy()
@@ -420,6 +458,15 @@ class Downloader:
                         # Lock dataset while there are any downloads in
                         # progress in order to prevent conflicts with `git rm`.
                         await self.ds.lock.acquire()
+                    # A path must not be in flight twice: the first result
+                    # would pop the entry and the second would then hit a
+                    # bare `KeyError` in `pop_in_progress()`.
+                    if td.blob.path in self.in_progress:
+                        raise RuntimeError(
+                            f"Dandiset {self.dandiset_id}: {td.blob.path} sent"
+                            " for download while a download of it is already"
+                            " in progress"
+                        )
                     self.in_progress[td.blob.path] = td
                     td.blob.log.info("Downloading from %s", td.url)
                     await self.addurl.send(f"{td.url} {td.blob.path}\n")
@@ -433,6 +480,7 @@ class Downloader:
 
     async def read_addurl(self) -> None:
         assert self.addurl is not None
+        assert self.nursery is not None
         async for line in self.addurl:
             data = json.loads(line)
             if "byte-progress" in data:
@@ -481,16 +529,52 @@ class Downloader:
 
     async def asha256(self, path: Path) -> str:
         self.log.debug("Starting to compute sha256 digest of %s", path)
-        tp = anyio.Path(path)
-        digester = hashlib.sha256()
-        async with await tp.open("rb") as fp:
-            while True:
-                blob = await fp.read(65535)
-                if blob == b"":
-                    break
-                digester.update(blob)
+        # Open, read and close within one worker thread call, so that a file
+        # is open only while a thread is hashing it: opening it in one call and
+        # reading it in others left it open while queued for a thread (#130).
+        digest = await anyio.to_thread.run_sync(sha256_file, path)
         self.log.debug("Finished computing sha256 digest of %s", path)
-        return digester.hexdigest()
+        return digest
+
+
+def sha256_file(path: Path) -> str:
+    with open(path, "rb") as fp:
+        return hashlib.file_digest(fp, "sha256").hexdigest()
+
+
+async def run_downloader(
+    dm: Downloader, aia: AsyncIterator[RemoteAsset | None]
+) -> None:
+    # `dm` must wrap the task group, not sit inside it: its `__aexit__`
+    # force-closes `addurl`, and that has to happen after every task in the
+    # group (including addurl's own feeder/reader) has finished/been
+    # cancelled -- not right after merely *scheduling* `asset_loop` with
+    # `start_soon`. Pulled out into its own function (rather than inlined in
+    # `async_assets()`) so a test can exercise this exact nesting directly.
+    async with dm:
+        async with anyio.create_task_group() as nursery:
+            dm.nursery = nursery
+            nursery.start_soon(dm.asset_loop, aia)
+
+
+async def git_add_manually(
+    ds: AsyncDataset, paths: Iterable[str], log: PrefixedLogger
+) -> int:
+    """
+    `git add` each of ``paths``, which `addurl` failed to add, and return how
+    many of them failed again.  Pulled out of `async_assets()` so that a test
+    can reach it without making `addurl` fail.
+    """
+    failed = 0
+    for fpath in paths:
+        log.info("Manually running `git add %s`", shlex.quote(fpath))
+        try:
+            # `--literal-pathspecs`: see `AsyncDataset.remove()`
+            await ds.call_git("--literal-pathspecs", "add", "--", fpath)
+        except subprocess.CalledProcessError:
+            log.error("Manual `git add %s` failed", shlex.quote(fpath))
+            failed += 1
+    return failed
 
 
 async def async_assets(
@@ -498,6 +582,7 @@ async def async_assets(
     ds: AsyncDataset,
     manager: Manager,
     tracker: AssetTracker,
+    assets: list[RemoteAsset],
     error_on_change: bool = False,
 ) -> Report:
     if datalad.support.external_versions.external_versions["cmd:annex"] < "10.20220724":
@@ -507,13 +592,12 @@ async def async_assets(
         )
     done_flag = anyio.Event()
     total_report = Report()
-    async with aclosing(aiterassets(dandiset, done_flag)) as aia:
+    async with aclosing(aiterassets(dandiset, assets, done_flag)) as aia:
         while not done_flag.is_set():
             try:
                 async with (
                     AsyncAnnex(ds.pathobj) as annex,
                     httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as s3client,
-                    anyio.create_task_group() as nursery,
                 ):
                     dm = Downloader(
                         dandiset_id=dandiset.identifier,
@@ -524,23 +608,15 @@ async def async_assets(
                         tracker=tracker,
                         s3client=s3client,
                         annex=annex,
-                        nursery=nursery,
                         error_on_change=error_on_change,
                     )
-                    async with dm:
-                        nursery.start_soon(dm.asset_loop, aia)
+                    await run_downloader(dm, aia)
             finally:
                 tracker.dump()
 
             await ds.add(".dandi/assets.json")
 
-            for fpath in dm.need_add:
-                manager.log.info("Manually running `git add %s`", fpath)
-                try:
-                    await ds.call_git("add", fpath)
-                except subprocess.CalledProcessError:
-                    manager.log.error("Manual `git add %s` failed", fpath)
-                    dm.report.failed += 1
+            dm.report.failed += await git_add_manually(ds, dm.need_add, manager.log)
 
             timestamp = dm.last_timestamp
             for zarr_id, zarrlink in dm.zarrs.items():
@@ -644,8 +720,56 @@ async def async_assets(
     return total_report
 
 
+async def fetch_stable_assets(dandiset: RemoteDandiset) -> list[RemoteAsset] | None:
+    """
+    Fetch the full asset listing, then return `None` if the Dandiset's
+    ``modified`` timestamp moved during the fetch (dandi-archive#2943:
+    paginated listing has no snapshot guarantee) -- caller should skip syncing
+    this run, like a quiescent-period miss.
+
+    The timestamp is fetched afresh immediately before and after the listing,
+    both times via the same endpoint, rather than compared against
+    ``dandiset.version``: that was captured when the run started (possibly
+    much earlier, and possibly via the ``/dandisets/`` list endpoint), so a
+    change made before the listing began -- which cannot invalidate it --
+    would otherwise be taken for one made during it.
+    """
+    draft = dandiset.version_id == "draft"
+    # Published versions are immutable; no need to re-check them.
+    before = await _draft_modified(dandiset) if draft else None
+    last_ts: datetime | None = None
+    assets: list[RemoteAsset] = []
+    async for asset in dandiset.aget_assets():
+        assert last_ts is None or last_ts <= asset.created, (
+            f"Asset {asset.path} created at {asset.created} but"
+            f" returned after an asset created at {last_ts}!"
+        )
+        last_ts = asset.created
+        assets.append(asset)
+    if draft:
+        after = await _draft_modified(dandiset)
+        if after != before:
+            log.info(
+                "Dandiset %s: modified timestamp changed from %s to %s while"
+                " retrieving its asset listing (%s assets fetched); listing is"
+                " no longer valid",
+                dandiset.identifier,
+                before,
+                after,
+                len(assets),
+            )
+            return None
+    return assets
+
+
+async def _draft_modified(dandiset: RemoteDandiset) -> datetime:
+    current = await dandiset.aclient.get_dandiset(dandiset.identifier)
+    modified: datetime = current.version.modified
+    return modified
+
+
 async def aiterassets(
-    dandiset: RemoteDandiset, done_flag: anyio.Event
+    dandiset: RemoteDandiset, assets: list[RemoteAsset], done_flag: anyio.Event
 ) -> AsyncGenerator[RemoteAsset | None, None]:
     last_ts: datetime | None = None
     if dandiset.version_id == "draft":
@@ -654,11 +778,7 @@ async def aiterassets(
         versions = deque(vs)
     else:
         versions = deque()
-    async for asset in dandiset.aget_assets():
-        assert last_ts is None or last_ts <= asset.created, (
-            f"Asset {asset.path} created at {asset.created} but"
-            f" returned after an asset created at {last_ts}!"
-        )
+    for asset in assets:
         if (
             versions
             and (last_ts is None or last_ts < versions[0].created)

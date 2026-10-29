@@ -9,9 +9,10 @@ import subprocess
 from typing import Any
 
 from dandi.utils import find_files
+import pytest
 
 from backups2datalad.procedures.cfg_dandiset import BLOCK_END, BLOCK_START
-from backups2datalad.util import is_meta_file
+from backups2datalad.util import is_meta_file, pointer_key
 
 
 @dataclass
@@ -25,6 +26,17 @@ class GitRepo:
         r = self.runcmd(*args, stdout=subprocess.PIPE, text=True, check=True)
         assert isinstance(r.stdout, str)
         return r.stdout.strip()
+
+    def readcmd_z(self, *args: str | Path) -> list[str]:
+        """
+        The NUL-terminated fields output by a Git command given ``-z``: unlike
+        lines, they hold paths verbatim (neither quoted nor stripped)
+        """
+        r = self.runcmd(*args, stdout=subprocess.PIPE, text=True, check=True)
+        assert isinstance(r.stdout, str)
+        fields = r.stdout.split("\0")
+        assert fields.pop() == ""
+        return fields
 
     def get_tag_date(self, tag: str) -> str:
         return unzulu(
@@ -78,14 +90,10 @@ class GitRepo:
         return self.readcmd("tag", "-l", "--sort=creatordate").splitlines()
 
     def get_diff_tree(self, commitish: str) -> dict[str, str]:
-        stat = self.readcmd(
-            "diff-tree", "--no-commit-id", "--name-status", "-r", commitish
+        fields = self.readcmd_z(
+            "diff-tree", "--no-commit-id", "--name-status", "-r", "-z", commitish
         )
-        status: dict[str, str] = {}
-        for line in stat.splitlines():
-            sym, _, path = line.partition("\t")
-            status[path] = sym
-        return status
+        return dict(zip(fields[1::2], fields[::2]))
 
     def get_backup_commits(self) -> list[str]:
         return self.readcmd(
@@ -95,9 +103,7 @@ class GitRepo:
     def get_asset_files(self, commitish: str) -> set[str]:
         return {
             fname
-            for fname in self.readcmd(
-                "ls-tree", "-r", "--name-only", commitish
-            ).splitlines()
+            for fname in self.readcmd_z("ls-tree", "-r", "--name-only", "-z", commitish)
             if not is_meta_file(fname, dandiset=True)
         }
 
@@ -162,3 +168,33 @@ def zarr_format_of(names: Iterable[str]) -> str:
     if any(n.endswith(".zarray") or n.endswith(".zgroup") for n in seen):
         return "2"
     raise ValueError(f"Cannot determine Zarr format from files: {sorted(seen)!r}")
+
+
+KEY = "SHA256E-s1000--44f8354494a5ba03ba1792a8d3e9c534c47a9181980fde7a3f44b06ef2ae7c7f.bin"
+
+
+@pytest.mark.ai_generated
+@pytest.mark.parametrize(
+    "content,key",
+    [
+        # Each as `git annex find --branch` (10.20260901) takes it
+        (f"/annex/objects/{KEY}\n", KEY),
+        (f"/annex/objects/{KEY}", KEY),
+        (f"/annex/objects/{KEY}\r\n", KEY),
+        (f"../../.git/annex/objects/Xx/Yy/{KEY}/{KEY}", KEY),
+        (f"foo /annex/objects/{KEY}\n", KEY),
+        (f"/annex/objects/{KEY}.\n", f"{KEY}."),
+        (
+            "/annex/objects/MD5E-s0-S1048576-C1--d41d8cd98f00b204e9800998ecf8427e\n",
+            "MD5E-s0-S1048576-C1--d41d8cd98f00b204e9800998ecf8427e",
+        ),
+        # Appended content
+        (f"/annex/objects/{KEY}\n\n", None),
+        (f"/annex/objects/{KEY}\nextra\n", None),
+        ("/annex/objects/notakey\n", None),
+        (f"{KEY}\n", None),
+        ("", None),
+    ],
+)
+def test_pointer_key(content: str, key: str | None) -> None:
+    assert pointer_key(content.encode()) == key

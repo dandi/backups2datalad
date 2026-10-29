@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from difflib import unified_diff
@@ -9,6 +9,8 @@ import json
 import os
 from pathlib import Path
 import random
+import re
+import shlex
 import sys
 import textwrap
 from types import TracebackType
@@ -19,6 +21,7 @@ from dandi.dandiset import Dandiset
 from dandi.utils import yaml_dump, yaml_load
 from datalad.api import Dataset
 from datalad.support.json_py import dump
+from humanize import naturalsize
 
 from .config import BackupConfig
 from .consts import MINIMUM_GIT_ANNEX_VERSION
@@ -230,6 +233,98 @@ def quiescence_wait(
     return period - (now - modified).total_seconds()
 
 
+#: How many outdated mirrors `describe_superdataset()` names
+MAX_OUTDATED_NAMED = 3
+
+
+def describe_superdataset(
+    mirrored: int,
+    on_archive: int,
+    size: int,
+    archive_size: int,
+    outdated: Sequence[tuple[str, int]] = (),
+    outdated_embargoed: int = 0,
+) -> str:
+    """
+    The GitHub description of the superdataset: how many of the Dandisets on
+    the archive are mirrored, how much data those mirrors hold next to the
+    archive's own total, and -- as what explains a shortfall -- which mirrors
+    are behind the archive and by how much.
+
+    ``outdated`` gives the mirrors of public Dandisets that are behind, as
+    pairs of Dandiset ID & bytes by which the archive's draft is larger than
+    the mirror (its net growth since, not all that the mirror is missing).
+    ``outdated_embargoed`` counts those of embargoed Dandisets, which are
+    neither named nor sized, as this description is public.
+
+    The two sizes are not computed alike: a mirror counts the files in its
+    draft (each Dandiset separately), while the archive counts every distinct
+    blob and Zarr in any version.  They agree only roughly even when every
+    mirror is current.
+    """
+    if mirrored == on_archive:
+        count = quantify(on_archive, "Dandiset")
+    else:
+        count = f"{mirrored} of {quantify(on_archive, 'Dandiset')} mirrored"
+    sizes = f"{naturalsize(size)} of the archive's {naturalsize(archive_size)}"
+    if n_outdated := len(outdated) + outdated_embargoed:
+        behind = sum(lag for _, lag in outdated)
+        behind_str = f", {naturalsize(behind)} behind" if behind else ""
+        if n_outdated == 1 and outdated:
+            sizes += f"; {outdated[0][0]} outdated{behind_str}"
+        else:
+            sizes += f"; {quantify(n_outdated, 'mirror')} outdated{behind_str}"
+            if outdated:
+                # Name the mirrors furthest behind, as those are what to look
+                # into
+                worst = sorted(outdated, key=lambda o: (-o[1], o[0]))
+                named = worst[:MAX_OUTDATED_NAMED]
+                ids = ", ".join(did for did, _ in named)
+                if n_outdated > len(named):
+                    # More public ones, or embargoed ones
+                    ids += ", ..."
+                sizes += f": {ids}"
+    return (
+        f"{count} ({sizes})."
+        "  DataLad super-dataset of all Dandisets from https://github.com/dandisets"
+    )
+
+
+#: How many failed Dandisets `describe_failed_dandisets()` names
+MAX_FAILED_NAMED = 10
+
+
+def describe_failed_dandisets(
+    failed: Iterable[str], logfile: Path | None = None
+) -> str:
+    """
+    The error with which ``update-from-backup`` ends when backing up some
+    Dandisets failed: how many, and -- so that what to look into is in the
+    error itself rather than buried in the log -- which, up to
+    `MAX_FAILED_NAMED` of them.  When there are more, it gives a command that
+    lists them all from ``logfile`` (the run's log), relying on `pool_amap()`
+    logging each failure as ``Job failed on input <Dandiset 000123/draft>:``.
+    """
+    ids = sorted(failed)
+    named = ids[:MAX_FAILED_NAMED]
+    msg = f"Backups for {quantify(len(ids), 'Dandiset')} failed: {', '.join(named)}"
+    if len(ids) > len(named):
+        msg += f", ... ({len(ids) - len(named)} more)"
+        if logfile is not None:
+            cmd = shlex.join(
+                [
+                    "sed",
+                    "-nE",
+                    r"/Job failed/s,.*Dandiset ([0-9]{6})/.*,\1,gp",
+                    str(logfile),
+                ]
+            )
+            msg += f"\nList them all with: {cmd}"
+        else:
+            msg += "; see the 'Job failed' lines in the log for the rest"
+    return msg
+
+
 def quantify(qty: int, singular: str, plural: str | None = None) -> str:
     if qty == 1:
         return f"{qty} {singular}"
@@ -241,6 +336,28 @@ def quantify(qty: int, singular: str, plural: str | None = None) -> str:
 
 def key2hash(key: str) -> str:
     return key.split("-")[-1].partition(".")[0]
+
+
+#: A git-annex key, as `pointer_key()` tells one: a backend, fields such as
+#: ``-s<size>``, then ``--`` and the name
+ANNEX_KEY_RGX = re.compile(r"[A-Z0-9]+(?:-[a-zA-Z][0-9]+)*--.*", flags=re.DOTALL)
+
+
+def pointer_key(content: bytes) -> str | None:
+    """
+    The key linked to by a blob with content ``content``, if git-annex would
+    take the blob for an annexed file, or else `None`.  That is, as with
+    git-annex 10.20260901: a single line (with or without a final newline,
+    and a trailing CR dropped) containing ``/annex/objects/`` and ending in a
+    key -- a pointer file (``/annex/objects/<key>``, i.e. an unlocked file),
+    or a symlink's target.
+    """
+    line, _, rest = content.partition(b"\n")
+    line = line.removesuffix(b"\r")
+    if rest or b"/annex/objects/" not in line:
+        return None
+    key = line.rpartition(b"/")[2].decode("utf-8", "surrogateescape")
+    return key if ANNEX_KEY_RGX.fullmatch(key) else None
 
 
 def format_errors(messages: list[str]) -> str:
@@ -305,6 +422,10 @@ def diff_metadata(old: Any, new: Any) -> str:
 
 class UnexpectedChangeError(Exception):
     pass
+
+
+class MirrorMissingError(RuntimeError):
+    """A mirror to be created exists already but is not installed locally"""
 
 
 def check_git_annex_version() -> None:
