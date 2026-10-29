@@ -26,6 +26,7 @@ from .config import BackupConfig, Mode, ZarrDirty, ZarrMode
 from .consts import DEFAULT_QUIESCENT_PERIOD, GIT_OPTIONS
 from .datasetter import DandiDatasetter
 from .logging import log
+from .mirrorstate import EmbargoedPolicy, MirrorResult
 from .register_s3 import register_s3urls
 from .util import check_git_annex_version, format_errors, pdb_excepthook, quantify
 
@@ -115,7 +116,7 @@ P = ParamSpec("P")
 
 
 def print_logfile(
-    f: Callable[Concatenate[DandiDatasetter, P], Awaitable[None]]
+    f: Callable[Concatenate[DandiDatasetter, P], Awaitable[None]],
 ) -> Callable[Concatenate[DandiDatasetter, P], Awaitable[None]]:
     @wraps(f)
     async def wrapped(
@@ -239,6 +240,25 @@ def print_logfile(
         " This will overwrite remote Git history!"
     ),
 )
+@click.option(
+    "--clone-missing",
+    is_flag=True,
+    help=(
+        "Clone mirrors that the superdataset (or, for a Zarr, its Dandiset)"
+        " records but that are not present locally, instead of refusing to"
+        " create them anew.  For runs on a checkout without the mirrors, as"
+        " in CI."
+    ),
+)
+@click.option(
+    "--results-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    help=(
+        "Do not update the superdataset; write what it should record for"
+        " each Dandiset to DIR/<id>.json instead, for `record`"
+    ),
+    metavar="DIR",
+)
 @click.argument("dandisets", nargs=-1)
 @click.pass_obj
 @print_logfile
@@ -256,6 +276,8 @@ async def update_from_backup(
     zarr_dirty: str | None,
     force_push: tuple[str, ...],
     quiescent_period: float | None,
+    clone_missing: bool,
+    results_dir: Path | None,
 ) -> None:
     """
     Create & update local mirrors of Dandisets and the Zarrs within them.
@@ -299,7 +321,156 @@ async def update_from_backup(
                     " Git history!",
                     ", ".join(sorted(datasetter.config.force_push)),
                 )
+        if clone_missing:
+            datasetter.config.clone_missing = True
+        if results_dir is not None:
+            datasetter.config.results_dir = results_dir
         await datasetter.update_from_backup(dandisets, exclude=exclude)
+
+
+@main.command()
+@click.option(
+    "-e",
+    "--exclude",
+    help="Skip dandisets matching the given regex",
+    metavar="REGEX",
+    type=re.compile,
+)
+@click.option(
+    "--embargoed",
+    type=click.Choice(list(EmbargoedPolicy), case_sensitive=False),
+    default=EmbargoedPolicy.SKIP,
+    show_default=True,
+    help=(
+        "Whether to plan embargoed Dandisets too ('include'), or only them"
+        " ('only').  With 'skip', they are only counted, as a plan made in a"
+        " public CI log must not name them."
+    ),
+)
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["json", "ids"]),
+    default="json",
+    show_default=True,
+    help="Print the plan as JSON, or just the planned IDs, one per line",
+)
+@click.option(
+    "--max",
+    "max_dandisets",
+    type=click.IntRange(min=1),
+    help="Plan at most this many Dandisets; the rest wait for a later run",
+)
+@click.option(
+    "--mode",
+    type=click.Choice(list(Mode), case_sensitive=False),
+    default=None,
+    help="With 'force', plan every Dandiset",
+)
+@click.option(
+    "--quiescent-period",
+    type=click.FloatRange(min=0),
+    default=None,
+    metavar="SECONDS",
+    help="As for `update-from-backup`",
+)
+@click.option(
+    "--tags/--no-tags",
+    default=None,
+    help="Whether untagged releases make a Dandiset stale  [default: yes]",
+)
+@click.argument("dandisets", nargs=-1)
+@click.pass_obj
+@print_logfile
+async def plan(
+    datasetter: DandiDatasetter,
+    dandisets: Sequence[str],
+    exclude: re.Pattern[str] | None,
+    embargoed: EmbargoedPolicy,
+    fmt: str,
+    max_dandisets: int | None,
+    mode: Mode | None,
+    quiescent_period: float | None,
+    tags: bool | None,
+) -> None:
+    """
+    Print which Dandisets `update-from-backup` needs to visit.
+
+    Needs only a checkout of the superdataset, not the mirrors: it compares
+    the archive's listing against the state recorded in `.gitmodules`.  The
+    JSON is ordered as the Dandisets should be visited.
+    """
+    async with datasetter:
+        if mode is not None:
+            datasetter.config.mode = mode
+        if quiescent_period is not None:
+            datasetter.config.quiescent_period = quiescent_period
+        if tags is not None:
+            datasetter.config.enable_tags = tags
+        p = await datasetter.plan(
+            dandisets,
+            exclude=exclude,
+            embargoed=embargoed,
+            max_dandisets=max_dandisets,
+        )
+        log.info(
+            "Planned %s; %d deferred, %d embargoed skipped, %d quiescent,"
+            " %d unembargoing, %d deleted",
+            quantify(len(p.dandisets), "Dandiset"),
+            p.deferred,
+            p.embargoed_skipped,
+            p.quiescent,
+            p.unembargoing,
+            len(p.deleted),
+        )
+        if fmt == "json":
+            print(json.dumps(p.as_json(), indent=2))
+        else:
+            for d in p.dandisets:
+                print(d.identifier)
+
+
+@main.command()
+@click.option(
+    "-e",
+    "--exclude",
+    help="Do not make mirrors of Dandisets matching the given regex private",
+    metavar="REGEX",
+    type=re.compile,
+)
+@click.option(
+    "--push/--no-push",
+    default=True,
+    show_default=True,
+    help="Push the superdataset to its `origin`",
+)
+@click.argument(
+    "results",
+    nargs=-1,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.pass_obj
+@print_logfile
+async def record(
+    datasetter: DandiDatasetter,
+    results: Sequence[Path],
+    exclude: re.Pattern[str] | None,
+    push: bool,
+) -> None:
+    """
+    Record in the superdataset what `update-from-backup --results-dir` runs
+    found.
+
+    Needs only a checkout of the superdataset.  Also makes mirrors of
+    Dandisets deleted from the archive private and updates the
+    superdataset's GitHub description, as `update-from-backup` does.
+    """
+    async with datasetter:
+        await datasetter.record(
+            [MirrorResult.from_json(p.read_text()) for p in results],
+            push=push,
+            exclude=exclude,
+        )
 
 
 @main.command()

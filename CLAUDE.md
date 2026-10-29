@@ -571,6 +571,49 @@ regional form in `.dandi/assets.json`; find them with
 synced again, `--mode verify` still raises `UnexpectedChangeError` for it;
 `update-from-backup --mode force <ids>` puts the region-less form back.
 
+## CI Mirroring
+
+So that the update can run in CI on a checkout of the superdataset without
+the ~1400 mirrors (design: `docs/ci-mirroring-plan.md`; the workflow lives in
+`dandi/dandisets`), per-Dandiset state is recorded in the superdataset's
+`.gitmodules` and three pieces work from it.  The workflow only wraps them;
+keep the logic here.
+
+- **State keys** (`mirrorstate.py`): `dandiset-last-modified` (the state in
+  the mirror's `HEAD`, as `get_committed_assets_state()`),
+  `dandiset-tagged-releases`, `dandiset-stats` (`<commit>,<files>,<bytes>`,
+  like `dandi.stats`).  `update_dandiset()` notes a `MirrorResult` per mirror
+  it gets to the end of (`note_result()`), and `update_from_backup()` writes
+  the keys that differ after its superdataset commit
+  (`record_mirror_state()`, a commit of its own).  **Embargoed Dandisets get
+  no `dandiset-stats`**: `.gitmodules` is public.
+- **`plan`** (`plan_updates()`, pure): which Dandisets need a sync, by the
+  tests `update_dandiset()` applies but against the keys; also untagged
+  releases (`most_recent_published_version`) and embargo status vs
+  `github-access-status`.  `--embargoed skip` (default) only *counts*
+  embargoed Dandisets -- keep it that way, the JSON ends up in public logs.
+- **`update-from-backup --clone-missing`**: a mirror the superdataset (or,
+  for a Zarr, its Dandiset) records but that is absent is cloned rather than
+  refused by #124's guard (`AsyncDataset.clone_mirror()`: plain `git clone
+  --origin github`, then `annex.private=true` *before* `git annex init`, so
+  the clone's UUID never reaches the pushed `git-annex` branch; `datalad
+  clone` would initialize first).  A cloned Dandiset's `dandi.stats` is
+  seeded from `dandiset-stats` when that is for the cloned commit.  Known
+  gap: a recount clones every Zarr of the Dandiset (`get_zarr_sub_stats()`),
+  as Zarr stats are not recorded anywhere but the Zarr mirrors.
+- **`update-from-backup --results-dir DIR`** + **`record`**: the former
+  leaves the superdataset alone (no commit, deleted pass or description) and
+  writes `DIR/<id>.json`; `record` applies those to a checkout without
+  subdatasets (`git update-index` gitlinks + keys), runs the make-private
+  pass, commits, pushes, and on a rejected push fetches, `reset --hard`s to
+  the remote branch and redoes it (`RECORD_PUSH_ATTEMPTS`).  It then sets the
+  superdataset description, which for mirrors not installed reads the keys
+  (stats only if for the gitlinked commit; embargoed ones count but add 0
+  bytes) and fails for a public one without them, as before.
+
+The keys are bootstrapped by the first `update-from-backup` on drogon, which
+visits every mirror; until then `plan` reports every Dandiset as `no-state`.
+
 ## Testing
 
 The project uses pytest for testing, with fixtures for:

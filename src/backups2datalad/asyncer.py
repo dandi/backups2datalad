@@ -376,7 +376,7 @@ class Downloader:
             if not AsyncDataset(zarr_dspath).ds.is_installed():
                 # Bounded: all uninstalled Zarrs get here at once (#133)
                 async with self.config.zarr_limit:
-                    await self.assert_zarr_mirror_is_new(asset, zarr_dspath)
+                    await self.provide_zarr_mirror(asset, zarr_dspath)
             self.nursery.start_soon(
                 partial(
                     sync_zarr,
@@ -390,21 +390,37 @@ class Downloader:
                 self.manager.with_sublogger(f"Zarr {asset.zarr}"),
             )
 
+    async def provide_zarr_mirror(
+        self, asset: RemoteZarrAsset, zarr_dspath: Path
+    ) -> None:
+        # Clone the mirror of a Zarr the Dandiset records (if allowed), else
+        # make sure it is new
+        if self.config.clone_missing and (url := await self.registered_zarr_url(asset)):
+            await AsyncDataset.clone_mirror(url, zarr_dspath)
+        else:
+            await self.assert_zarr_mirror_is_new(asset, zarr_dspath)
+
     async def assert_zarr_mirror_is_new(
         self, asset: RemoteZarrAsset, zarr_dspath: Path
     ) -> None:
-        url = await self.ds.get_repo_config(
-            f"submodule.{asset.path}.url", file=".gitmodules"
-        )
-        if url is not None and PurePosixPath(url).name.removesuffix(".git") == (
-            asset.zarr
-        ):
+        if (url := await self.registered_zarr_url(asset)) is not None:
             raise MirrorMissingError(
                 f"Zarr {asset.zarr} is a submodule of Dandiset"
                 f" {self.dandiset_id} at {asset.path} (url: {url}) but not"
                 f" installed at {zarr_dspath}; clone it there rather than"
                 " having it created anew"
             )
+
+    async def registered_zarr_url(self, asset: RemoteZarrAsset) -> str | None:
+        """The URL of the Dandiset's submodule for ``asset``, if it is this Zarr"""
+        url = await self.ds.get_repo_config(
+            f"submodule.{asset.path}.url", file=".gitmodules"
+        )
+        if url is not None and PurePosixPath(url).name.removesuffix(".git") == (
+            asset.zarr
+        ):
+            return url
+        return None
 
     async def get_annex_hash(self, filepath: Path) -> str:
         # OPT: do not bother checking or talking to annex --

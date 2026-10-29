@@ -76,6 +76,12 @@ class BackupConfig(BaseModel):
     zarr_mode: ZarrMode = ZarrMode.TIMESTAMP
     zarr_dirty: ZarrDirty = ZarrDirty.ERROR
     force_push: set[str] = Field(default_factory=set)  # "dandisets", "zarrs", "all"
+    #: Clone mirrors registered (in the superdataset, or in a Dandiset for a
+    #: Zarr) but absent locally, rather than refuse to create them anew
+    clone_missing: bool = False
+    #: Leave the superdataset alone and write a `MirrorResult` per Dandiset
+    #: here instead, for `record`
+    results_dir: Path | None = None
     # `default_factory` rather than `default` so that the constant is
     # looked up at instantiation time, which lets the test suite disable
     # the gate wholesale by patching it.

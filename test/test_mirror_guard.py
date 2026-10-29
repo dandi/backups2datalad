@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -158,6 +159,9 @@ async def test_zarr_registered_in_dandiset_is_not_recreated(tmp_path: Path) -> N
         dandiset, "sub-1/sample.ome.zarr", f"https://github.com/dandizarrs/{ZARR_ID}"
     )
     fake = SimpleNamespace(ds=AsyncDataset(dandiset), dandiset_id="000108")
+    fake.registered_zarr_url = partial(
+        Downloader.registered_zarr_url, cast(Downloader, fake)
+    )
     asset = SimpleNamespace(path="sub-1/sample.ome.zarr", zarr=ZARR_ID)
     with pytest.raises(MirrorMissingError, match="is a submodule of Dandiset"):
         await Downloader.assert_zarr_mirror_is_new(
@@ -387,6 +391,7 @@ async def test_feed_addurl_refuses_path_already_in_flight() -> None:
     assert isinstance(exc, RuntimeError)
     assert f"{path} sent for download while a download of it is already" in str(exc)
     assert sent == [f"https://example.com/x {path}\n"]
+
 
 # --- GitHub.repo_exists() -----------------------------------------------------
 
