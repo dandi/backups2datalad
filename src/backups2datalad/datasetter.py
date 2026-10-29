@@ -551,6 +551,7 @@ class DandiDatasetter(AsyncResource):
                 extant = {d.identifier async for d in diter}
             access_status = await self.make_deleted_private(superds, extant, exclude)
         branch = await superds.read_git("rev-parse", "--abbrev-ref", "HEAD")
+        remote = await superds.get_repo_config(f"branch.{branch}.remote") or "origin"
         for attempt in range(1, RECORD_PUSH_ATTEMPTS + 1):
             if not await self.apply_results(superds, results, access_status):
                 log.info("Nothing to record")
@@ -558,16 +559,17 @@ class DandiDatasetter(AsyncResource):
             if not push:
                 break
             try:
-                await superds.call_git("push", "origin", f"HEAD:{branch}")
+                await superds.call_git("push", remote, f"HEAD:{branch}")
             except subprocess.CalledProcessError:
                 if attempt == RECORD_PUSH_ATTEMPTS:
                     raise
                 log.info(
                     "Push of superdataset rejected; recording again on top of"
-                    " the remote's %s",
+                    " %s/%s",
+                    remote,
                     branch,
                 )
-                await superds.call_git("fetch", "origin", branch)
+                await superds.call_git("fetch", remote, branch)
                 await superds.call_git("reset", "--hard", "FETCH_HEAD")
             else:
                 break

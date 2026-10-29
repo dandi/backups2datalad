@@ -442,7 +442,7 @@ async def plan(
     "--push/--no-push",
     default=True,
     show_default=True,
-    help="Push the superdataset to its `origin`",
+    help="Push the superdataset to its branch's upstream remote",
 )
 @click.argument(
     "results",
