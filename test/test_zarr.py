@@ -369,6 +369,8 @@ def _http_error(
     resp.headers.update(headers)
     resp._content = body.encode()
     if method is not None:
+        # Like a real response, carry the request that got it: its method is
+        # what tells DataLad's repository lookup (GET) from the creation (POST)
         resp.request = requests.Request(
             method, "https://api.github.com/repos/org/zarr1"
         ).prepare()
@@ -640,37 +642,44 @@ async def test_create_github_sibling_retries_without_response(
 
 
 @pytest.mark.ai_generated
-async def test_create_github_sibling_retries_lookup_404_after_500(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize(
+    "before,slept",
+    [([_server_error_record()], [10.0, 30.0]), ([], [10.0])],
+    ids=["after-500", "first-attempt"],
+)
+async def test_create_github_sibling_retries_lookup_404(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    before: list[str | Exception | dict[str, Any]],
+    slept: list[float],
 ) -> None:
     """
-    After a 500, GitHub may answer the retry with "already exists" and then
-    404 DataLad's lookup of that repository (not served yet); that 404 is
-    retried too, and the repository adopted once GitHub serves it.
+    GitHub may answer a creation with "already exists" and then 404 DataLad's
+    lookup of that repository, not serving it yet -- e.g. after a 500 that
+    created it.  That 404 is retried, and the repository adopted once GitHub
+    serves it.
     """
     ds = await _make_dataset(tmp_path / "ds")
     bare = _make_bare(tmp_path / "bare.git")
-    calls = _fake_create_sibling(
-        monkeypatch,
-        ds,
-        bare,
-        [
-            _server_error_record(),
-            _http_error(404, {}, '{"message": "Not Found"}', method="GET"),
-            {
-                "action": "create_sibling_github",
-                "status": "notneeded",
-                "message": "repository already exists",
-            },
-        ],
-    )
+    outcomes: list[str | Exception | dict[str, Any]] = [
+        *before,
+        _http_error(404, {}, '{"message": "Not Found"}', method="GET"),
+        {
+            "action": "create_sibling_github",
+            "status": "notneeded",
+            "message": "repository already exists",
+        },
+    ]
+    n = len(outcomes)
+    calls = _fake_create_sibling(monkeypatch, ds, bare, outcomes)
     clock = FakeClock()
     gate = make_gate(clock)
     assert await ds.create_github_sibling(
         owner="org", name="zarr1", backup_remote=None, gate=gate
     )
-    assert len(calls) == 3
-    assert clock.slept == [10.0, 30.0]
+    assert len(calls) == n
+    assert clock.slept == slept
     assert gate.consecutive == 0
     assert "HTTP 404 looking up GitHub repository org/zarr1" in caplog.text
     assert (
@@ -680,32 +689,28 @@ async def test_create_github_sibling_retries_lookup_404_after_500(
 
 @pytest.mark.ai_generated
 @pytest.mark.parametrize(
-    "outcomes,slept",
-    [
-        # A lookup 404 with no uncertain attempt before it: GitHub says the
-        # repository exists but we cannot see it, which waiting will not fix
-        ([_http_error(404, {}, '{"message": "Not Found"}', method="GET")], []),
-        # A 404 on the creation POST: no such organization, or no access
-        (
-            [
-                _server_error_record(),
-                _http_error(404, {}, '{"message": "Not Found"}', method="POST"),
-            ],
-            [10.0],
-        ),
-    ],
-    ids=["lookup-first-attempt", "post-after-500"],
+    "before,slept",
+    [([], []), ([_server_error_record()], [10.0])],
+    ids=["first-attempt", "after-500"],
 )
-async def test_create_github_sibling_404_not_retried(
+async def test_create_github_sibling_post_404_not_retried(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    outcomes: list[str | Exception | dict[str, Any]],
+    before: list[str | Exception | dict[str, Any]],
     slept: list[float],
 ) -> None:
+    """
+    A 404 on the creation POST -- no such organization, or no access to it --
+    is not retried, whatever came before it.
+    """
     ds = await _make_dataset(tmp_path / "ds")
     bare = _make_bare(tmp_path / "bare.git")
+    outcomes: list[str | Exception | dict[str, Any]] = [
+        *before,
+        _http_error(404, {}, '{"message": "Not Found"}', method="POST"),
+    ]
     n = len(outcomes)
-    calls = _fake_create_sibling(monkeypatch, ds, bare, list(outcomes))
+    calls = _fake_create_sibling(monkeypatch, ds, bare, outcomes)
     clock = FakeClock()
     with pytest.raises(requests.HTTPError):
         await ds.create_github_sibling(

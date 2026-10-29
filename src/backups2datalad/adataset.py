@@ -892,9 +892,8 @@ class AsyncDataset:
         rate limit, these may have created the repository after all; the
         retry is what finds out, since with ``existing="reconfigure"`` GitHub
         then answers "already exists" and DataLad adopts the repository.
-        Once such a failure has happened, a 404 on DataLad's lookup of the
-        repository it was just told exists is retried the same way: GitHub
-        not serving a just-created repository yet.
+        So is a 404 on DataLad's lookup of the repository it was just told
+        exists: GitHub not serving a just-created repository yet.
         """
         config = [
             ("remote.github.pushurl", f"git@github.com:{owner}/{name}"),
@@ -927,21 +926,16 @@ class AsyncDataset:
             )
             desc = f"{owner}/{name}"
             server_waits = iter(GITHUB_SERVER_ERROR_WAITS)
-            retrying = False
             while True:
                 try:
                     if gate is None:
-                        hit = await self._create_sibling_once(
-                            create, desc, retrying=retrying
-                        )
+                        hit = await self._create_sibling_once(create, desc)
                         if hit is not None:
                             raise RuntimeError(hit[1])
                     else:
                         async with gate.mutation():
                             while True:
-                                hit = await self._create_sibling_once(
-                                    create, desc, retrying=retrying
-                                )
+                                hit = await self._create_sibling_once(create, desc)
                                 if hit is None:
                                     gate.note_success()
                                     break
@@ -951,7 +945,6 @@ class AsyncDataset:
                 except GitHubServerError as e:
                     if (delay := next(server_waits, None)) is None:
                         raise
-                    retrying = True
                     log.warning(
                         "%s; retrying in %d s (adopting the repository if the"
                         " failed request created it after all)",
@@ -978,16 +971,16 @@ class AsyncDataset:
             return False
 
     async def _create_sibling_once(
-        self, create: Callable[[], Any], desc: str, *, retrying: bool = False
+        self, create: Callable[[], Any], desc: str
     ) -> tuple[Mapping[str, str], str] | None:
         """
         Run DataLad's ``create_sibling_github`` once in a worker thread.
         Returns None on success; on a rate-limited response returns the
         response headers (if any) and a description of the failure for
         `GitHubGate.note_rate_limited()`; raises `GitHubServerError` for a
-        server error (5xx) or no response -- and, if ``retrying`` after one,
-        for a 404 on the lookup of the repository -- and some other exception
-        for anything else.
+        server error (5xx), no response, or a 404 on the lookup of a
+        repository GitHub said exists, and some other exception for anything
+        else.
 
         DataLad reports a 403 -- and, since 1.5.0, a 500 -- as an error result
         record (message text only) but lets a 429, other 5xx, and any error on
@@ -1032,18 +1025,19 @@ class AsyncDataset:
                     + (f": {body}" if body else "")
                 ) from e
             if (
-                retrying
-                and resp is not None
+                resp is not None
                 and resp.status_code == 404
                 and e.request is not None
                 and e.request.method == "GET"
             ):
                 # DataLad GETs the repository (`existing="reconfigure"`) only
-                # once the creation was answered with "already exists"; after
-                # an attempt that may itself have created it, a 404 is GitHub
-                # not serving the new repository yet.  (A 404 on the creation
-                # POST -- no such organization, or no access to it -- is
-                # never retried.)
+                # once the creation was answered with "already exists", so a
+                # 404 is GitHub not serving a just-created repository yet --
+                # one an earlier attempt that failed may have created, or one
+                # created concurrently.  Were it a repository we cannot see,
+                # the retries would end in this error all the same.  (A 404
+                # on the creation POST -- no such organization, or no access
+                # to it -- is never retried.)
                 raise GitHubServerError(
                     f"HTTP 404 looking up GitHub repository {desc}, which"
                     " GitHub reported as already existing"
