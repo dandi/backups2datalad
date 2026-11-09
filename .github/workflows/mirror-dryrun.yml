@@ -29,6 +29,9 @@ on:
       exclude:
         description: "Dandisets to skip (regex)"
         default: '00(0571|1412|1411)$'
+      canaries:
+        description: "Without IDs: also force-sync this many Dandisets (expected: no change)"
+        default: "3"
 
 concurrency:
   group: mirror-dryrun-${{ github.ref }}
@@ -43,6 +46,7 @@ env:
   MODE: ${{ inputs.mode || 'timestamp' }}
   ZARR_MODE: ${{ inputs.zarr_mode }}
   EXCLUDE: ${{ inputs.exclude || '00(0571|1412|1411)$' }}
+  CANARIES: ${{ inputs.canaries || '3' }}
   # Optional: without it, the run is anonymous and sees public Dandisets only.
   # (The repository's DANDI_API_KEY secret is refused by the archive.)
   DANDI_API_KEY: ${{ secrets.MIRROR_DANDI_API_KEY }}
@@ -57,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
-      ids: ${{ steps.plan.outputs.ids }}
+      matrix: ${{ steps.plan.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -84,7 +88,21 @@ jobs:
           if [ -n "$IDS" ]; then args+=(--mode force); fi
           # shellcheck disable=SC2086
           backups2datalad "${global[@]}" plan "${args[@]}" $IDS > plan.json
-          echo "ids=$(jq -c '[.dandisets[].id]' plan.json)" >> "$GITHUB_OUTPUT"
+          # Canaries: Dandisets up to date already, synced again from the
+          # recorded commit with --mode force, which should change nothing
+          # -- the cron keeps the archive's changes few and far between
+          if [ -z "$IDS" ] && [ "$CANARIES" -gt 0 ]; then
+            backups2datalad "${global[@]}" plan --mode force --max "$CANARIES" \
+              -e "$EXCLUDE" > canaries.json
+            jq -s '.[1] as $c | .[0] | (.dandisets | map(.id)) as $ids
+              | .dandisets += [$c.dandisets[]
+                  | select(.reason == "forced" and (.id as $i | $ids | index($i) | not))]' \
+              plan.json canaries.json > merged.json
+            mv merged.json plan.json
+          fi
+          echo "matrix=$(jq -c --arg mode "$MODE" '[.dandisets[]
+            | {id, mode: (if .reason == "forced" then "force" else $mode end)}]' plan.json)" \
+            >> "$GITHUB_OUTPUT"
           jq . plan.json
       - uses: actions/upload-artifact@v4
         with:
@@ -93,16 +111,17 @@ jobs:
 
   sync:
     needs: plan
-    if: needs.plan.outputs.ids != '[]'
+    if: needs.plan.outputs.matrix != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
       max-parallel: 5
       matrix:
-        id: ${{ fromJSON(needs.plan.outputs.ids) }}
+        dandiset: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
-      ID: ${{ matrix.id }}
+      ID: ${{ matrix.dandiset.id }}
+      SYNC_MODE: ${{ matrix.dandiset.mode }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -122,12 +141,12 @@ jobs:
           git config --global user.email "team@dandiarchive.org"
           git config --global annex.private true
       - id: sync
-        name: Sync ${{ matrix.id }}
+        name: Sync ${{ matrix.dandiset.id }} (--mode ${{ matrix.dandiset.mode }})
         run: |
           set -eu
           global=(--no-github -B "$GITHUB_WORKSPACE" -c "$CONFIG")
           if [ -z "$DANDI_API_KEY" ]; then global+=(--anonymous); fi
-          args=(--clone-missing --clone-at-gitlink --results-dir results --mode "$MODE")
+          args=(--clone-missing --clone-at-gitlink --results-dir results --mode "$SYNC_MODE")
           if [ -n "$ZARR_MODE" ]; then args+=(--zarr-mode "$ZARR_MODE"); fi
           backups2datalad "${global[@]}" update-from-backup "${args[@]}" "$ID"
       - name: Compare with drogon's mirror
@@ -171,7 +190,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: dryrun-${{ matrix.id }}
+          name: dryrun-${{ matrix.dandiset.id }}
           path: |
             results/
             compare/
