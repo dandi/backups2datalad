@@ -110,6 +110,8 @@ class MirrorResult:
     #: Subjects of the commits the superdataset does not record yet, newest
     #: first, for its commit message
     subjects: list[str] = field(default_factory=list)
+    #: The tree of `commit`, by which the content of two runs can be compared
+    tree: str | None = None
 
     @property
     def access(self) -> str:
@@ -175,6 +177,8 @@ class PlannedDandiset:
     embargoed: bool
     #: When the recorded backup is from; `None` if there is none
     last_modified: datetime | None
+    #: Where `last_modified` comes from: "gitmodules", "history", or `None`
+    source: str | None = None
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -182,6 +186,10 @@ class PlannedDandiset:
             "reason": str(self.reason),
             "size": self.size,
             "embargoed": self.embargoed,
+            "last_modified": (
+                self.last_modified.isoformat() if self.last_modified else None
+            ),
+            "state_from": self.source,
         }
 
 
@@ -220,11 +228,18 @@ def plan_updates(
     embargoed: EmbargoedPolicy = EmbargoedPolicy.SKIP,
     max_dandisets: int | None = None,
     enable_tags: bool = True,
+    recorded_dates: Mapping[str, datetime] | None = None,
 ) -> Plan:
     """
     Decide which Dandisets need a sync, by the tests `update_dandiset()`
     applies, but against the state recorded in ``.gitmodules`` rather than in
     the mirrors.
+
+    For a mirror without recorded state (until the keys are bootstrapped),
+    ``recorded_dates`` -- when the superdataset last recorded a new commit of
+    it -- stands in for its last backup: a backup is committed after the
+    state it backs up, so a Dandiset modified since cannot be up to date.
+    Releases are then not checked, as which are tagged is unknown.
 
     Order: the Dandisets stale longest take up to a quarter of a capped batch,
     so big ones cannot starve; the rest goes smallest first, so small updates
@@ -242,14 +257,23 @@ def plan_updates(
             continue
         entry = gitmodules.get(r.identifier)
         last_modified: datetime | None = None
+        source: str | None = None
         reason: Reason | None
         if entry is None:
             reason = Reason.NEW
         else:
+            tagged: set[str] | None = None
             if (lm := entry.get(KEY_LAST_MODIFIED)) is not None:
                 last_modified = datetime.fromisoformat(lm)
+                source = "gitmodules"
+                # Recorded state without the key means no tags
+                tagged = (
+                    tagged_releases_from_key(entry.get(KEY_TAGGED_RELEASES)) or set()
+                )
+            elif recorded_dates and r.identifier in recorded_dates:
+                last_modified = recorded_dates[r.identifier]
+                source = "history"
             access = "private" if r.embargoed else "public"
-            tagged = tagged_releases_from_key(entry.get(KEY_TAGGED_RELEASES))
             if last_modified is None:
                 reason = Reason.NO_STATE
             elif last_modified < r.modified:
@@ -259,7 +283,8 @@ def plan_updates(
             elif (
                 enable_tags
                 and r.latest_published is not None
-                and (tagged is None or r.latest_published not in tagged)
+                and tagged is not None
+                and r.latest_published not in tagged
             ):
                 reason = Reason.UNTAGGED
             elif force:
@@ -287,6 +312,7 @@ def plan_updates(
                 size=r.size,
                 embargoed=r.embargoed,
                 last_modified=last_modified,
+                source=source,
             )
         )
     by_size = sorted(candidates, key=lambda d: (d.size, d.identifier))

@@ -419,6 +419,24 @@ class AsyncDataset:
                     gitlinks[path] = sha
         return gitlinks
 
+    async def get_gitlink_change_dates(self) -> dict[str, datetime]:
+        """
+        When each top-level submodule last got a new commit recorded, by
+        commit date; empty in a shallow clone, whose history is cut short
+        """
+        if await self.read_git("rev-parse", "--is-shallow-repository") == "true":
+            return {}
+        dates: dict[str, datetime] = {}
+        when: datetime | None = None
+        for line in (
+            await self.read_git("log", "--format=@@%cI", "--name-only", "HEAD")
+        ).splitlines():
+            if line.startswith("@@"):
+                when = datetime.fromisoformat(line[2:])
+            elif line and "/" not in line and when is not None:
+                dates.setdefault(line, when)
+        return dates
+
     async def has_commit(self, commit: str) -> bool:
         try:
             await self.call_git(

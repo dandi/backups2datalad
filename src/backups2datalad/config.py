@@ -79,6 +79,9 @@ class BackupConfig(BaseModel):
     #: Clone mirrors registered (in the superdataset, or in a Dandiset for a
     #: Zarr) but absent locally, rather than refuse to create them anew
     clone_missing: bool = False
+    #: Have such clones start from the commit the superdataset records, not
+    #: from the mirror's latest one (for comparing runs, not for pushing)
+    clone_at_gitlink: bool = False
     #: Leave the superdataset alone and write a `MirrorResult` per Dandiset
     #: here instead, for `record`
     results_dir: Path | None = None

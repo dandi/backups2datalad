@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -316,3 +317,65 @@ async def test_record_registers_updates_and_retries(tmp_path: Path) -> None:
     before = git(forge, "rev-parse", "HEAD")
     await di.record(results, push=True)
     assert git(forge, "rev-parse", "HEAD") == before
+
+
+@pytest.mark.ai_generated
+def test_plan_falls_back_to_history() -> None:
+    """
+    Without recorded state, when the superdataset last recorded the mirror
+    stands in for its last backup, and releases are not checked
+    """
+    gm = {"000001": {"path": "000001"}, "000002": {"path": "000002"}}
+    plan = plan_updates(
+        [
+            # Modified after the superdataset last recorded it
+            remote("000001", modified=T0 + timedelta(hours=1)),
+            # Recorded after its last modification, with a release
+            remote("000002", modified=T0 - timedelta(hours=1), published="0.1"),
+            # Not in the history either
+            remote("000003"),
+        ],
+        {**gm, "000003": {"path": "000003"}},
+        now=NOW,
+        recorded_dates={"000001": T0, "000002": T0},
+    )
+    assert [(d.identifier, d.reason, d.source) for d in plan.dandisets] == [
+        ("000001", Reason.MODIFIED, "history"),
+        ("000003", Reason.NO_STATE, None),
+    ]
+    # Recorded state wins over the history
+    plan = plan_updates(
+        [remote("000001", modified=T0 + timedelta(hours=1))],
+        {"000001": recorded(last_modified=T0 + timedelta(hours=2))},
+        now=NOW,
+        recorded_dates={"000001": T0},
+    )
+    assert plan.dandisets == []
+
+
+@pytest.mark.ai_generated
+async def test_get_gitlink_change_dates(tmp_path: Path) -> None:
+    sub = make_mirror(tmp_path / "sub")
+    repo = tmp_path / "super"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "draft")
+    for did, date in [
+        ("000001", "2026-01-01T00:00:00+00:00"),
+        ("000002", "2026-02-01T00:00:00+00:00"),
+        ("000001", "2026-03-01T00:00:00+00:00"),
+    ]:
+        sha = sub if did == "000002" else make_mirror(tmp_path / f"m-{date[:7]}")
+        git(repo, "update-index", "--add", "--cacheinfo", f"160000,{sha},{did}")
+        subprocess.run(
+            ["git", "commit", "-q", "-m", f"Update {did}"],
+            cwd=repo,
+            check=True,
+            env={**os.environ, "GIT_COMMITTER_DATE": date},
+        )
+    dates = await AsyncDataset(repo).get_gitlink_change_dates()
+    assert dates["000001"] == datetime(2026, 3, 1, tzinfo=timezone.utc)
+    assert dates["000002"] == datetime(2026, 2, 1, tzinfo=timezone.utc)
+    # A shallow clone's history is cut short, so it gives nothing
+    shallow = tmp_path / "shallow"
+    git(tmp_path, "clone", "-q", "--depth=1", f"file://{repo}", str(shallow))
+    assert await AsyncDataset(shallow).get_gitlink_change_dates() == {}

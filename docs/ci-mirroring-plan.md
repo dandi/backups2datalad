@@ -338,6 +338,20 @@ sleeps out rate limits for up to ~5 h before giving up -- the job timeout
 * Things that do not matter on fresh clones: `--zarr-dirty` (a clone is
   never dirty), the dirty-mirror gate.
 
+### 5.6 Dry run in this repository
+
+Before the workflow goes to `dandi/dandisets`, `mirror-dryrun.yml` runs the
+same flow on every PR here and by dispatch: `plan` against the live archive
+(falling back to the superdataset's history until the keys exist, §3.1),
+one sync job per Dandiset with `--no-github --clone-at-gitlink`, and
+`record --no-push`.  Nothing is pushed anywhere.  Each sync starts from the
+commit the superdataset records -- where drogon's cron starts -- and is
+compared with what drogon has pushed for that Dandiset by then: the same
+tree means the same content (commit SHAs differ by their dates), drogon's
+state being older means it has not got there yet.  The bundles of CI's
+commits are kept as artifacts for comparing later.  The summary is one PR
+comment, updated by each run.
+
 ## 6. Embargoed Dandisets
 
 They must not be synced by a workflow in a public repository.  In the

@@ -620,7 +620,24 @@ keep the logic here.
   applies `insteadOf` and in CI would put the token into `.gitmodules`.
 
 The keys are bootstrapped by the first `update-from-backup` on drogon, which
-visits every mirror; until then `plan` reports every Dandiset as `no-state`.
+visits every mirror.  Until then, `plan` stands in when the superdataset last
+recorded a new commit of each mirror (`get_gitlink_change_dates()`, from the
+history, so it needs a full clone) for its last backup: a Dandiset modified
+since is stale.  Releases are then not checked (`state_from: history`).
+
+**Dry run** (`.github/workflows/mirror-dryrun.yml`, on every PR and by
+dispatch): the whole flow against the live archive and a checkout of
+`dandi/dandisets`, with `--no-github` (the GitHub organizations are dropped
+from the config, so nothing is created, pushed or changed there),
+`--clone-at-gitlink` (each clone starts from the commit the superdataset
+records, i.e. where drogon started, rather than from the mirror's latest) and
+`record --no-push`.  Each sync job then compares its result with what drogon
+has pushed meanwhile (same tree = same content; commit SHAs always differ) and
+uploads a bundle of its commits; the report job posts one PR comment, updated
+on every run (`.github/scripts/mirror_dryrun_report.py`).  Without a
+`DANDI_API_KEY` secret it runs `--anonymous`, which sees no embargoed
+Dandisets.  Never put the key into anything that is posted: secret masking
+covers logs only.
 
 ## Testing
 

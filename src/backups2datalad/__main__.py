@@ -56,6 +56,22 @@ from .util import check_git_annex_version, format_errors, pdb_excepthook, quanti
     help="Set logging level",
     show_default=True,
 )
+@click.option(
+    "--anonymous",
+    is_flag=True,
+    help=(
+        "Query the archive without an API key (DANDI_API_KEY may then be"
+        " unset); embargoed Dandisets are then invisible"
+    ),
+)
+@click.option(
+    "--no-github",
+    is_flag=True,
+    help=(
+        "Never touch GitHub: create, push to or update no repository, as if"
+        " no GitHub organizations were configured (for dry runs)"
+    ),
+)
 @click.option("--pdb", is_flag=True, help="Drop into debugger if an error occurs")
 @click.option(
     "--quiet-debug",
@@ -72,6 +88,8 @@ async def main(
     quiet_debug: bool,
     backup_root: Path,
     config: Path | None,
+    anonymous: bool,
+    no_github: bool,
 ) -> None:
     """
     Mirror Dandisets as git-annex repositories.
@@ -86,9 +104,16 @@ async def main(
         cfg.backup_root = backup_root
     if jobs is not None:
         cfg.jobs = jobs
+    if no_github:
+        cfg.dandisets.github_org = None
+        if cfg.zarrs is not None:
+            cfg.zarrs.github_org = None
     api_token = os.environ.get("DANDI_API_KEY", "").strip()
-    if api_token == "":
-        raise click.UsageError("DANDI_API_KEY environment variable not set")
+    if api_token == "" and not anonymous:
+        raise click.UsageError(
+            "DANDI_API_KEY environment variable not set (and --anonymous not"
+            " given)"
+        )
     ctx.obj = DandiDatasetter(
         dandi_client=AsyncDandiClient.for_dandi_instance(
             cfg.dandi_instance, token=api_token
@@ -251,6 +276,16 @@ def print_logfile(
     ),
 )
 @click.option(
+    "--clone-at-gitlink",
+    is_flag=True,
+    help=(
+        "With --clone-missing, start each cloned Dandiset mirror from the"
+        " commit the superdataset records rather than its latest, so that a"
+        " run can be compared with another one started from the same state"
+        " (with --no-github; pushing from there may not fast-forward)"
+    ),
+)
+@click.option(
     "--results-dir",
     type=click.Path(file_okay=False, path_type=Path),
     help=(
@@ -277,6 +312,7 @@ async def update_from_backup(
     force_push: tuple[str, ...],
     quiescent_period: float | None,
     clone_missing: bool,
+    clone_at_gitlink: bool,
     results_dir: Path | None,
 ) -> None:
     """
@@ -323,6 +359,8 @@ async def update_from_backup(
                 )
         if clone_missing:
             datasetter.config.clone_missing = True
+        if clone_at_gitlink:
+            datasetter.config.clone_at_gitlink = True
         if results_dir is not None:
             datasetter.config.results_dir = results_dir
         await datasetter.update_from_backup(dandisets, exclude=exclude)

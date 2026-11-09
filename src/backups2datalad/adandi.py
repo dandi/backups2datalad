@@ -61,10 +61,9 @@ class AsyncDandiClient(AsyncResource):
 
     @classmethod
     def for_dandi_instance(cls, instance: str, token: str) -> AsyncDandiClient:
-        headers = {
-            "User-Agent": USER_AGENT,
-            "Authorization": f"token {token}",
-        }
+        headers = {"User-Agent": USER_AGENT}
+        if token:
+            headers["Authorization"] = f"token {token}"
         return cls(
             session=httpx.AsyncClient(
                 base_url=known_instances[instance].api,

@@ -420,6 +420,18 @@ class DandiDatasetter(AsyncResource):
         if entry is None or (url := entry.get("url")) is None:
             return False
         ds = await AsyncDataset.clone_mirror(url, dsdir)
+        if self.config.clone_at_gitlink and (
+            recorded := (await superds.get_gitlinks()).get(dandiset_id)
+        ):
+            if await ds.has_commit(recorded):
+                await ds.call_git("reset", "-q", "--hard", recorded)
+            else:
+                log.warning(
+                    "Dandiset %s: recorded commit %s is not in its mirror;"
+                    " starting from the mirror's latest",
+                    dandiset_id,
+                    recorded,
+                )
         commit = await ds.get_commit_hash()
         if (stats := stats_from_key(entry.get(KEY_STATS), commit)) is not None:
             await ds.store_stats(DatasetStats(files=stats[0], size=stats[1]), commit)
@@ -447,6 +459,7 @@ class DandiDatasetter(AsyncResource):
                 embargoed=embargoed,
             ),
             changed=changed,
+            tree=await ds.read_git("rev-parse", f"{commit}^{{tree}}"),
         )
         if self.config.results_dir is not None:
             superds = AsyncDataset(self.config.dandiset_root)
@@ -683,6 +696,7 @@ class DandiDatasetter(AsyncResource):
             embargoed=embargoed,
             max_dandisets=max_dandisets,
             enable_tags=self.config.enable_tags,
+            recorded_dates=await superds.get_gitlink_change_dates(),
         )
         if dandiset_ids:
             # Only the whole listing tells which Dandisets are gone
