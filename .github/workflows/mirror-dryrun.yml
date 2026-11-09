@@ -140,6 +140,9 @@ jobs:
           git config --global user.name "DANDI Mirror Dry Run"
           git config --global user.email "team@dandiarchive.org"
           git config --global annex.private true
+          # No SSH key here; public mirrors can be cloned over HTTPS, whatever
+          # URL .gitmodules records (some keep the SSH URL from their embargo)
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
       - id: sync
         name: Sync ${{ matrix.dandiset.id }} (--mode ${{ matrix.dandiset.mode }})
         run: |
@@ -164,6 +167,11 @@ jobs:
           fi
           state() { git -C "$d" show "$1:.dandi/assets-state.json" 2>/dev/null | jq -r .timestamp; }
           ci=$(git -C "$d" rev-parse HEAD)
+          # Whether GitHub has the commit the superdataset records
+          rec_on_gh=false
+          if [ -n "$recorded" ] && git -C "$d" cat-file -e "$recorded^{commit}" 2>/dev/null; then
+            rec_on_gh=true
+          fi
           dr=""; dr_tree=""; dr_state=""; shortstat=""; files=""
           if git -C "$d" fetch -q github draft; then
             dr=$(git -C "$d" rev-parse FETCH_HEAD)
@@ -172,19 +180,22 @@ jobs:
             shortstat=$(git -C "$d" diff --shortstat FETCH_HEAD HEAD)
             files=$(git -C "$d" diff --name-status FETCH_HEAD HEAD | head -40)
           fi
-          jq -n --arg o "$OUTCOME" --arg rec "$recorded" \
+          jq -n --arg o "$OUTCOME" --arg rec "$recorded" --argjson rec_on_gh "$rec_on_gh" \
             --arg ci "$ci" --arg ci_tree "$(git -C "$d" rev-parse 'HEAD^{tree}')" \
             --arg ci_state "$(state HEAD)" \
             --arg dr "$dr" --arg dr_tree "$dr_tree" --arg dr_state "$dr_state" \
             --arg shortstat "$shortstat" --arg files "$files" \
-            '{outcome: $o, recorded: $rec, ci_commit: $ci, ci_tree: $ci_tree,
+            '{outcome: $o, recorded: $rec, recorded_on_github: $rec_on_gh,
+              ci_commit: $ci, ci_tree: $ci_tree,
               ci_state: $ci_state, drogon_commit: $dr, drogon_tree: $dr_tree,
               drogon_state: $dr_state, diff_shortstat: $shortstat,
               diff_files: ($files | split("\n") | map(select(. != "")))}' > "$out"
           cat "$out"
           # CI's new commits, to compare against later pushes from drogon
-          if [ -n "$recorded" ] && [ "$ci" != "$recorded" ]; then
-            git -C "$d" bundle create "$PWD/bundles/$ID.bundle" HEAD "^$recorded"
+          base=""
+          if [ "$rec_on_gh" = true ]; then base=$recorded; elif [ -n "$dr" ]; then base=$dr; fi
+          if [ -n "$base" ] && [ "$ci" != "$base" ]; then
+            git -C "$d" bundle create "$PWD/bundles/$ID.bundle" HEAD "^$base" || :
           fi
           cp dandisets/.git/dandi/backups2datalad/*/*/*.log "bundles/$ID.log" 2>/dev/null || :
       - uses: actions/upload-artifact@v4

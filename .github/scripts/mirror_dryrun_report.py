@@ -83,7 +83,8 @@ def main() -> None:
             " vs. drogon's mirror now |",
             "| --- | --- | ---: | --- | --- |",
         ]
-        details = []
+        details: list[str] = []
+        missing: list[str] = []
         for d in planned:
             did = d["id"]
             r = results.get(did)
@@ -97,6 +98,9 @@ def main() -> None:
                 )
             else:
                 ci = f"no change (`{short(r['commit'])}`)"
+            if c.get("recorded") and c.get("recorded_on_github") is False:
+                ci += f" ⚠️ recorded `{short(c['recorded'])}` not on GitHub"
+                missing.append(did)
             lines.append(
                 f"| {did} | {d['reason']} | {d['size']:,} | {ci} |"
                 f" {vs_drogon(c)} |"
@@ -110,6 +114,14 @@ def main() -> None:
                 details.append("```")
                 details += c["diff_files"]
                 details += ["```", ""]
+        if missing:
+            lines += [
+                "",
+                f"⚠️ The superdataset records commits GitHub lacks for"
+                f" {', '.join(missing)}: CI started from GitHub's latest"
+                " instead, so differences from drogon's mirror may be what"
+                " drogon never pushed.",
+            ]
         if details:
             lines += ["", "<details><summary>Details</summary>", ""]
             lines += details
