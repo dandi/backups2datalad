@@ -635,7 +635,7 @@ records, i.e. where drogon started, rather than from the mirror's latest) and
 has pushed meanwhile (same tree = same content; commit SHAs always differ) and
 uploads a bundle of its commits; the report job posts one PR comment, updated
 on every run (`.github/scripts/mirror_dryrun_report.py`).  Without a
-`DANDI_API_KEY` secret it runs `--anonymous`, which sees no embargoed
+`MIRROR_DANDI_API_KEY` secret it runs `--anonymous`, which sees no embargoed
 Dandisets.  Never put the key into anything that is posted: secret masking
 covers logs only.
 

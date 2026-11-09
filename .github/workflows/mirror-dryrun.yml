@@ -43,7 +43,9 @@ env:
   MODE: ${{ inputs.mode || 'timestamp' }}
   ZARR_MODE: ${{ inputs.zarr_mode }}
   EXCLUDE: ${{ inputs.exclude || '00(0571|1412|1411)$' }}
-  DANDI_API_KEY: ${{ secrets.DANDI_API_KEY }}
+  # Optional: without it, the run is anonymous and sees public Dandisets only.
+  # (The repository's DANDI_API_KEY secret is refused by the archive.)
+  DANDI_API_KEY: ${{ secrets.MIRROR_DANDI_API_KEY }}
   CONFIG: dandisets/tools/backups2datalad.cfg.yaml
 
 defaults:
