@@ -437,6 +437,15 @@ class AsyncDataset:
                 dates.setdefault(line, when)
         return dates
 
+    async def get_upstream_commit(self) -> str | None:
+        """The commit of the current branch's upstream, if it has one"""
+        try:
+            return await self.read_git(
+                "rev-parse", "--verify", "-q", "@{upstream}", quiet_rcs=[1, 128]
+            )
+        except subprocess.CalledProcessError:
+            return None
+
     async def has_commit(self, commit: str) -> bool:
         try:
             await self.call_git(

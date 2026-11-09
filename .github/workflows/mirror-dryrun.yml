@@ -172,24 +172,27 @@ jobs:
           if [ -n "$recorded" ] && git -C "$d" cat-file -e "$recorded^{commit}" 2>/dev/null; then
             rec_on_gh=true
           fi
-          dr=""; dr_tree=""; dr_state=""; shortstat=""; files=""
+          dr=""; dr_tree=""; dr_state=""; shortstat=""; files=""; patch=""
           if git -C "$d" fetch -q github draft; then
             dr=$(git -C "$d" rev-parse FETCH_HEAD)
             dr_tree=$(git -C "$d" rev-parse 'FETCH_HEAD^{tree}')
             dr_state=$(state FETCH_HEAD)
             shortstat=$(git -C "$d" diff --shortstat FETCH_HEAD HEAD)
             files=$(git -C "$d" diff --name-status FETCH_HEAD HEAD | head -40)
+            # The text of the differences (annexed files differ as links)
+            patch=$(git -C "$d" diff FETCH_HEAD HEAD | head -150)
           fi
           jq -n --arg o "$OUTCOME" --arg rec "$recorded" --argjson rec_on_gh "$rec_on_gh" \
             --arg ci "$ci" --arg ci_tree "$(git -C "$d" rev-parse 'HEAD^{tree}')" \
             --arg ci_state "$(state HEAD)" \
             --arg dr "$dr" --arg dr_tree "$dr_tree" --arg dr_state "$dr_state" \
-            --arg shortstat "$shortstat" --arg files "$files" \
+            --arg shortstat "$shortstat" --arg files "$files" --arg patch "$patch" \
             '{outcome: $o, recorded: $rec, recorded_on_github: $rec_on_gh,
               ci_commit: $ci, ci_tree: $ci_tree,
               ci_state: $ci_state, drogon_commit: $dr, drogon_tree: $dr_tree,
               drogon_state: $dr_state, diff_shortstat: $shortstat,
-              diff_files: ($files | split("\n") | map(select(. != "")))}' > "$out"
+              diff_files: ($files | split("\n") | map(select(. != ""))),
+              diff_patch: $patch}' > "$out"
           cat "$out"
           # CI's new commits, to compare against later pushes from drogon
           base=""

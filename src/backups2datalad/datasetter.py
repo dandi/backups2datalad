@@ -468,6 +468,9 @@ class DandiDatasetter(AsyncResource):
             if recorded is not None:
                 if await ds.has_commit(recorded):
                     since = [f"{recorded}..{commit}"]
+                elif upstream := await ds.get_upstream_commit():
+                    # What this run added to what it was cloned from
+                    since = [f"{upstream}..{commit}"]
             else:
                 # Not `git remote get-url`, which applies `insteadOf` and so
                 # would hand out the token CI rewrites URLs with

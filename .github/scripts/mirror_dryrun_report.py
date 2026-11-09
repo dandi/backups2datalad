@@ -111,8 +111,8 @@ def main() -> None:
                 details.append("")
             if c.get("diff_files"):
                 details += [f"**{did}**, differences from drogon's mirror:", ""]
-                details.append("```")
-                details += c["diff_files"]
+                details.append("```diff")
+                details += (c.get("diff_patch") or "\n".join(c["diff_files"])).splitlines()
                 details += ["```", ""]
         if missing:
             lines += [
