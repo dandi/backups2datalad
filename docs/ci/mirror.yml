@@ -81,7 +81,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install "$BACKUPS2DATALAD" git-annex "ruamel.yaml>=0.18,<0.19" "dandi==0.82.0"
+      - run: |
+          pip install "$BACKUPS2DATALAD" git-annex "ruamel.yaml==0.18.12" "dandi==0.82.0"
+          # As on drogon (see backups2datalad's .github/mirror-constraints.txt)
+          pip uninstall -y ruamel.yaml.clib
       - id: plan
         run: |
           set -eu
@@ -133,7 +136,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install "$BACKUPS2DATALAD" git-annex "ruamel.yaml>=0.18,<0.19" "dandi==0.82.0"
+      - run: |
+          pip install "$BACKUPS2DATALAD" git-annex "ruamel.yaml==0.18.12" "dandi==0.82.0"
+          # As on drogon (see backups2datalad's .github/mirror-constraints.txt)
+          pip uninstall -y ruamel.yaml.clib
       - name: Configure Git
         run: |
           git config --global user.name "DANDI Mirror Bot"
@@ -178,7 +184,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install "$BACKUPS2DATALAD" git-annex "ruamel.yaml>=0.18,<0.19" "dandi==0.82.0"
+      - run: |
+          pip install "$BACKUPS2DATALAD" git-annex "ruamel.yaml==0.18.12" "dandi==0.82.0"
+          # As on drogon (see backups2datalad's .github/mirror-constraints.txt)
+          pip uninstall -y ruamel.yaml.clib
       - uses: actions/download-artifact@v4
         if: needs.sync.result != 'skipped'
         with:

@@ -79,7 +79,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install ./b2d git-annex
+      - run: |
+          pip install ./b2d git-annex
+          # Drogon's dandiset.yaml comes from ruamel.yaml's pure-Python emitter
+          pip uninstall -y ruamel.yaml.clib
       - id: plan
         run: |
           set -eu
@@ -136,7 +139,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install ./b2d git-annex
+      - run: |
+          pip install ./b2d git-annex
+          # Drogon's dandiset.yaml comes from ruamel.yaml's pure-Python emitter
+          pip uninstall -y ruamel.yaml.clib
       - name: Configure Git
         run: |
           git config --global user.name "DANDI Mirror Dry Run"
@@ -215,7 +221,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install ./b2d git-annex
+      - run: |
+          pip install ./b2d git-annex
+          # Drogon's dandiset.yaml comes from ruamel.yaml's pure-Python emitter
+          pip uninstall -y ruamel.yaml.clib
       - uses: actions/download-artifact@v4
         with:
           path: art

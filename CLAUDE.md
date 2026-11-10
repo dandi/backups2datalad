@@ -640,8 +640,10 @@ the same archive state (`.dandi/assets-state.json`), looked up in its history,
 since a busy Dandiset (001697) is rarely at the same state in both; the report
 job looks again, so re-running that job later catches drogon's later pushes.
 Package versions are pinned to drogon's in `.github/mirror-constraints.txt`
-(`PIP_CONSTRAINT`): `ruamel.yaml` 0.19 wraps `dandiset.yaml` lines
-differently from 0.18.  Without a
+(`PIP_CONSTRAINT`): where `dandiset.yaml` lines break depends on the
+`ruamel.yaml` version and on whether its C emitter is used; drogon's output is
+that of the pure-Python emitter of 0.18.12, so the workflows also uninstall
+`ruamel.yaml.clib`.  Without a
 `MIRROR_DANDI_API_KEY` secret it runs `--anonymous`, which sees no embargoed
 Dandisets.  Never put the key into anything that is posted: secret masking
 covers logs only.

@@ -1,9 +1,14 @@
 # Versions for the CI mirroring (mirror-dryrun.yml, and docs/ci/mirror.yml),
 # so that its mirrors are byte-for-byte what the cron on drogon makes.
 #
-# dandiset.yaml is written by dandi's yaml_dump() with ruamel.yaml's default
-# width; ruamel.yaml 0.19 breaks long lines at other places than 0.18 does
-# (and leaves a trailing space), so the same metadata comes out differently.
-# Drogon has 0.18.  Lift these together with drogon's environment.
-ruamel.yaml >= 0.18, < 0.19
+# dandiset.yaml is written by dandi's yaml_dump() (ruamel.yaml, typ="safe",
+# default width), and where ruamel.yaml breaks long lines depends on its
+# version and on whether its C emitter (ruamel.yaml.clib) is used.  What drogon
+# writes today (checked on 001697, 2026-11) is reproduced exactly by the
+# pure-Python emitter of ruamel.yaml 0.17.40 to 0.18.12; 0.18.13+ (and 0.19)
+# break lines elsewhere, and the C emitter does not wrap e.g. a long
+# '@context' URL.  Hence 0.18.12 here, and the workflows uninstall
+# ruamel.yaml.clib (a constraint cannot exclude a package).  Lift these
+# together with drogon's environment.
+ruamel.yaml == 0.18.12
 dandi == 0.82.0
