@@ -632,9 +632,16 @@ from the config, so nothing is created, pushed or changed there),
 `--clone-at-gitlink` (each clone starts from the commit the superdataset
 records, i.e. where drogon started, rather than from the mirror's latest) and
 `record --no-push`.  Each sync job then compares its result with what drogon
-has pushed meanwhile (same tree = same content; commit SHAs always differ) and
-uploads a bundle of its commits; the report job posts one PR comment, updated
-on every run (`.github/scripts/mirror_dryrun_report.py`).  Without a
+has pushed (same tree = same content; commit SHAs always differ) and uploads a
+bundle of its commits; the report job posts one PR comment, updated on every
+run (`.github/scripts/mirror_dryrun_report.py`).  The comparison
+(`.github/scripts/mirror_dryrun_compare.sh`) is against drogon's commit at
+the same archive state (`.dandi/assets-state.json`), looked up in its history,
+since a busy Dandiset (001697) is rarely at the same state in both; the report
+job looks again, so re-running that job later catches drogon's later pushes.
+Package versions are pinned to drogon's in `.github/mirror-constraints.txt`
+(`PIP_CONSTRAINT`): `ruamel.yaml` 0.19 wraps `dandiset.yaml` lines
+differently from 0.18.  Without a
 `MIRROR_DANDI_API_KEY` secret it runs `--anonymous`, which sees no embargoed
 Dandisets.  Never put the key into anything that is posted: secret masking
 covers logs only.

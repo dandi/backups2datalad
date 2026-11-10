@@ -81,7 +81,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install "$BACKUPS2DATALAD" git-annex
+      - run: pip install "$BACKUPS2DATALAD" git-annex "ruamel.yaml>=0.18,<0.19" "dandi==0.82.0"
       - id: plan
         run: |
           set -eu
@@ -133,7 +133,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install "$BACKUPS2DATALAD" git-annex
+      - run: pip install "$BACKUPS2DATALAD" git-annex "ruamel.yaml>=0.18,<0.19" "dandi==0.82.0"
       - name: Configure Git
         run: |
           git config --global user.name "DANDI Mirror Bot"
@@ -178,7 +178,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install "$BACKUPS2DATALAD" git-annex
+      - run: pip install "$BACKUPS2DATALAD" git-annex "ruamel.yaml>=0.18,<0.19" "dandi==0.82.0"
       - uses: actions/download-artifact@v4
         if: needs.sync.result != 'skipped'
         with:

@@ -33,6 +33,12 @@ def vs_drogon(cmp: dict[str, Any]) -> str:
     if not cmp.get("drogon_commit"):
         return "no mirror on GitHub"
     ci_state, dr_state = cmp.get("ci_state"), cmp.get("drogon_state")
+    if cmp.get("match_commit"):
+        # Drogon's commit at the same archive state: the like-for-like one
+        at = f"drogon's `{short(cmp['match_commit'])}` at the same state"
+        if cmp.get("ci_tree") == cmp.get("match_tree"):
+            return f"✅ same content as {at}"
+        return f"❌ differs from {at}: {cmp.get('diff_shortstat') or '?'}"
     if cmp.get("ci_tree") == cmp.get("drogon_tree"):
         return "✅ same content"
     if ci_state and dr_state and dr_state < ci_state:
@@ -80,7 +86,7 @@ def main() -> None:
     if planned:
         lines += [
             "| Dandiset | planned as | size | CI sync (from recorded commit) |"
-            " vs. drogon's mirror now |",
+            " vs. drogon's mirror |",
             "| --- | --- | ---: | --- | --- |",
         ]
         details: list[str] = []
@@ -110,7 +116,14 @@ def main() -> None:
                 details += [f"- {s}" for s in r["subjects"][:10]]
                 details.append("")
             if c.get("diff_files"):
-                details += [f"**{did}**, differences from drogon's mirror:", ""]
+                against = c.get("diff_against")
+                details += [
+                    f"**{did}**, differences from drogon's"
+                    + (f" `{short(against)}`" if against else " mirror")
+                    + (" (at the same state)" if c.get("match_commit") else " (latest)")
+                    + ":",
+                    "",
+                ]
                 details.append("```diff")
                 details += (c.get("diff_patch") or "\n".join(c["diff_files"])).splitlines()
                 details += ["```", ""]

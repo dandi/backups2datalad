@@ -346,9 +346,14 @@ same flow on every PR here and by dispatch: `plan` against the live archive
 one sync job per Dandiset with `--no-github --clone-at-gitlink`, and
 `record --no-push`.  Nothing is pushed anywhere.  Each sync starts from the
 commit the superdataset records -- where drogon's cron starts -- and is
-compared with what drogon has pushed for that Dandiset by then: the same
-tree means the same content (commit SHAs differ by their dates), drogon's
-state being older means it has not got there yet.  The bundles of CI's
+compared with drogon's commit at the same archive state
+(`.dandi/assets-state.json`), looked up in the history drogon has pushed;
+failing that, with drogon's latest.  The same tree means the same content
+(commit SHAs differ by their dates); drogon's state being older means it has
+not got there yet.  The report job looks again, so re-running it later
+compares with what drogon pushed since.  Package versions follow drogon's
+(`.github/mirror-constraints.txt`): with `ruamel.yaml` 0.19 instead of
+drogon's 0.18, `dandiset.yaml` came out wrapped differently.  The bundles of CI's
 commits are kept as artifacts for comparing later.  The summary is one PR
 comment, updated by each run.
 
