@@ -32,13 +32,21 @@ if git -C "$repo" fetch -q github draft; then
     dr_tree=$(git -C "$repo" rev-parse "$dr^{tree}")
     dr_state=$(state "$dr")
     if [ -n "$ci_state" ]; then
-        # States only grow along the history (ISO 8601 UTC, same format), so
-        # stop at the first one older than CI's
+        # The commits that set a state, newest first.  States only grow along
+        # the history (ISO 8601 UTC, same format), so stop at the first one
+        # older than CI's.  Later commits may keep a state (metadata-only
+        # updates), so the commit at that state is the last one before the
+        # next state was set: the parent of `newer`, or drogon's latest
+        newer=""
         while read -r c; do
             s=$(state "$c")
-            if [ "$s" = "$ci_state" ]; then match=$c; break; fi
+            if [ "$s" = "$ci_state" ]; then
+                if [ -n "$newer" ]; then match=$(git -C "$repo" rev-parse "$newer^"); else match=$dr; fi
+                break
+            fi
             if [ -n "$s" ] && [[ "$s" < "$ci_state" ]]; then break; fi
-        done < <(git -C "$repo" log --format=%H -n "$MAX_HISTORY" "$dr" -- .dandi/assets-state.json)
+            newer=$c
+        done < <(git -C "$repo" log --first-parent --format=%H -n "$MAX_HISTORY" "$dr" -- .dandi/assets-state.json)
     fi
     if [ -n "$match" ]; then
         match_tree=$(git -C "$repo" rev-parse "$match^{tree}")
