@@ -73,3 +73,7 @@ GITHUB_CREATE_TIMEOUT = 120
 # raised.  Such a failure may have created the repository after all, which
 # the retry adopts (`existing="reconfigure"`).
 GITHUB_SERVER_ERROR_WAITS = (10, 30, 90)
+
+#: How many times `record` redoes its commit on top of the remote's branch
+#: when a concurrent push beat it
+RECORD_PUSH_ATTEMPTS = 5

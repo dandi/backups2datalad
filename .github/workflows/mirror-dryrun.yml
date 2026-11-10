@@ -1,0 +1,303 @@
+# Dry run of the CI mirroring (docs/ci-mirroring-plan.md) with this branch's
+# backups2datalad: plan -> one sync job per Dandiset -> record, against the
+# live archive and a checkout of dandi/dandisets -- but with --no-github, so
+# nothing is pushed or changed on GitHub, and `record --no-push`.  Each sync
+# starts from the commit the superdataset records (--clone-at-gitlink), i.e.
+# from where the cron on drogon started, and its result is compared with what
+# drogon has pushed by then.  The summary goes to the PR as one comment,
+# updated on every run.
+name: Mirror dry run
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      ids:
+        description: "Dandiset IDs, space-separated (blank: plan)"
+        default: ""
+      max:
+        description: "Most Dandisets to take on"
+        default: "8"
+      mode:
+        description: "update-from-backup --mode"
+        type: choice
+        options: [timestamp, force, verify]
+        default: timestamp
+      zarr_mode:
+        description: "update-from-backup --zarr-mode (blank: config default, as on drogon)"
+        default: ""
+      exclude:
+        description: "Dandisets to skip (regex)"
+        default: '00(0571|1412|1411)$'
+      canaries:
+        description: "Without IDs: also force-sync this many Dandisets (expected: no change)"
+        default: "3"
+
+concurrency:
+  group: mirror-dryrun-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IDS: ${{ inputs.ids }}
+  MAX: ${{ inputs.max || '8' }}
+  MODE: ${{ inputs.mode || 'timestamp' }}
+  ZARR_MODE: ${{ inputs.zarr_mode }}
+  EXCLUDE: ${{ inputs.exclude || '00(0571|1412|1411)$' }}
+  CANARIES: ${{ inputs.canaries || '3' }}
+  # Optional: without it, the run is anonymous and sees public Dandisets only.
+  # (The repository's DANDI_API_KEY secret is refused by the archive.)
+  DANDI_API_KEY: ${{ secrets.MIRROR_DANDI_API_KEY }}
+  CONFIG: dandisets/tools/backups2datalad.cfg.yaml
+  # Same versions as on drogon (see the file)
+  PIP_CONSTRAINT: b2d/.github/mirror-constraints.txt
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: b2d
+      - uses: actions/checkout@v4
+        with:
+          repository: dandi/dandisets
+          ref: draft
+          path: dandisets
+          # Until .gitmodules records the mirrors' state, `plan` reads when
+          # each was last recorded from the history
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: |
+          pip install ./b2d git-annex
+          # Drogon's dandiset.yaml comes from ruamel.yaml's pure-Python emitter
+          pip uninstall -y ruamel.yaml.clib
+      - id: plan
+        run: |
+          set -eu
+          git config --global annex.private true
+          global=(--no-github -B "$GITHUB_WORKSPACE" -c "$CONFIG")
+          if [ -z "$DANDI_API_KEY" ]; then global+=(--anonymous); fi
+          args=(--max "$MAX" -e "$EXCLUDE")
+          if [ -n "$IDS" ]; then args+=(--mode force); fi
+          # shellcheck disable=SC2086
+          backups2datalad "${global[@]}" plan "${args[@]}" $IDS > plan.json
+          # Canaries: Dandisets up to date already, synced again from the
+          # recorded commit with --mode force, which should change nothing
+          # -- the cron keeps the archive's changes few and far between
+          if [ -z "$IDS" ] && [ "$CANARIES" -gt 0 ]; then
+            backups2datalad "${global[@]}" plan --mode force --max "$CANARIES" \
+              -e "$EXCLUDE" > canaries.json
+            jq -s '.[1] as $c | .[0] | (.dandisets | map(.id)) as $ids
+              | .dandisets += [$c.dandisets[]
+                  | select(.reason == "forced" and (.id as $i | $ids | index($i) | not))]' \
+              plan.json canaries.json > merged.json
+            mv merged.json plan.json
+          fi
+          echo "matrix=$(jq -c --arg mode "$MODE" '[.dandisets[]
+            | {id, mode: (if .reason == "forced" then "force" else $mode end)}]' plan.json)" \
+            >> "$GITHUB_OUTPUT"
+          jq . plan.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: plan.json
+
+  sync:
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        dandiset: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      ID: ${{ matrix.dandiset.id }}
+      SYNC_MODE: ${{ matrix.dandiset.mode }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: b2d
+      - uses: actions/checkout@v4
+        with:
+          repository: dandi/dandisets
+          ref: draft
+          path: dandisets
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: |
+          pip install ./b2d git-annex
+          # Drogon's dandiset.yaml comes from ruamel.yaml's pure-Python emitter
+          pip uninstall -y ruamel.yaml.clib
+      - name: Configure Git
+        run: |
+          git config --global user.name "DANDI Mirror Dry Run"
+          git config --global user.email "team@dandiarchive.org"
+          git config --global annex.private true
+          # No SSH key here; public mirrors can be cloned over HTTPS, whatever
+          # URL .gitmodules records (some keep the SSH URL from their embargo)
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+      - id: sync
+        name: Sync ${{ matrix.dandiset.id }} (--mode ${{ matrix.dandiset.mode }})
+        run: |
+          set -eu
+          global=(--no-github -B "$GITHUB_WORKSPACE" -c "$CONFIG")
+          if [ -z "$DANDI_API_KEY" ]; then global+=(--anonymous); fi
+          args=(--clone-missing --clone-at-gitlink --results-dir results --mode "$SYNC_MODE")
+          if [ -n "$ZARR_MODE" ]; then args+=(--zarr-mode "$ZARR_MODE"); fi
+          backups2datalad "${global[@]}" update-from-backup "${args[@]}" "$ID"
+      - name: Compare with drogon's mirror
+        if: always()
+        env:
+          OUTCOME: ${{ steps.sync.outcome }}
+        run: |
+          set -u
+          mkdir -p compare bundles
+          out="compare/$ID.json"
+          d="dandisets/$ID"
+          recorded=$(git -C dandisets ls-files -s -- "$ID" | awk '{print $2}')
+          if [ ! -e "$d/.git" ]; then
+            jq -n --arg o "$OUTCOME" '{outcome: $o}' > "$out"; exit 0
+          fi
+          ci=$(git -C "$d" rev-parse HEAD)
+          # Whether GitHub has the commit the superdataset records
+          rec_on_gh=false
+          if [ -n "$recorded" ] && git -C "$d" cat-file -e "$recorded^{commit}" 2>/dev/null; then
+            rec_on_gh=true
+          fi
+          b2d/.github/scripts/mirror_dryrun_compare.sh "$d" "$ci" \
+            | jq --arg o "$OUTCOME" --arg rec "$recorded" --argjson rec_on_gh "$rec_on_gh" \
+                '{outcome: $o, recorded: $rec, recorded_on_github: $rec_on_gh} + .' > "$out"
+          dr=$(jq -r .drogon_commit "$out")
+          cat "$out"
+          # CI's new commits, to compare against later pushes from drogon
+          base=""
+          if [ "$rec_on_gh" = true ]; then base=$recorded; elif [ -n "$dr" ]; then base=$dr; fi
+          if [ -n "$base" ] && [ "$ci" != "$base" ]; then
+            git -C "$d" bundle create "$PWD/bundles/$ID.bundle" HEAD "^$base" || :
+          fi
+          cp dandisets/.git/dandi/backups2datalad/*/*/*.log "bundles/$ID.log" 2>/dev/null || :
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dryrun-${{ matrix.dandiset.id }}
+          path: |
+            results/
+            compare/
+            bundles/
+          if-no-files-found: ignore
+
+  report:
+    needs: [plan, sync]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: b2d
+      - uses: actions/checkout@v4
+        with:
+          repository: dandi/dandisets
+          ref: draft
+          path: dandisets
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: |
+          pip install ./b2d git-annex
+          # Drogon's dandiset.yaml comes from ruamel.yaml's pure-Python emitter
+          pip uninstall -y ruamel.yaml.clib
+      - uses: actions/download-artifact@v4
+        with:
+          path: art
+          pattern: '{plan,dryrun-*}'
+          merge-multiple: true
+      - name: Record (not pushed)
+        run: |
+          set -eu
+          git config --global user.name "DANDI Mirror Dry Run"
+          git config --global user.email "team@dandiarchive.org"
+          git config --global annex.private true
+          shopt -s nullglob
+          results=(art/results/*.json)
+          before=$(git -C dandisets rev-parse HEAD)
+          echo "$before" > base.txt
+          global=(--no-github -B "$GITHUB_WORKSPACE" -c "$CONFIG")
+          if [ -z "$DANDI_API_KEY" ]; then global+=(--anonymous); fi
+          backups2datalad "${global[@]}" record --no-push "${results[@]}"
+          if [ "$(git -C dandisets rev-parse HEAD)" != "$before" ]; then
+            git -C dandisets show --stat --format=%B HEAD > superds-stat.txt
+          else
+            : > superds-stat.txt
+          fi
+      - name: Look again for drogon's commits at CI's states
+        # The sync jobs compared with drogon's mirror when they ended; drogon
+        # may have pushed the same state since.  Re-running this job later
+        # (it keeps the run's artifacts) looks again.
+        run: |
+          set -u
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          shopt -s nullglob
+          for f in art/compare/*.json; do
+            id=$(basename "$f" .json)
+            ci=$(jq -r '.ci_commit // empty' "$f")
+            if [ -z "$ci" ] || [ -n "$(jq -r '.match_commit // empty' "$f")" ]; then continue; fi
+            url=$(git -C dandisets config -f .gitmodules "submodule.$id.url") || continue
+            m="mirrors/$id"
+            git clone -q --filter=blob:none --no-checkout --origin github "$url" "$m" || continue
+            if [ -e "art/bundles/$id.bundle" ]; then
+              git -C "$m" fetch -q "$PWD/art/bundles/$id.bundle" HEAD || :
+            fi
+            git -C "$m" cat-file -e "$ci^{commit}" 2>/dev/null || continue
+            b2d/.github/scripts/mirror_dryrun_compare.sh "$m" "$ci" > again.json || continue
+            jq -s '.[0] + .[1]' "$f" again.json > merged.json && mv merged.json "$f"
+            jq -c '{match_commit, diff_shortstat}' "$f" | sed "s/^/$id: /"
+          done
+      - name: Report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EVENT_PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -eu
+          base=$(cat base.txt)
+          # Never put the API key itself in here: the comment is public
+          access="with an API key"
+          if [ -z "$DANDI_API_KEY" ]; then access="anonymous (embargoed Dandisets invisible)"; fi
+          header="[Run ${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}]($RUN_URL) ($GITHUB_EVENT_NAME, $(date -u +%FT%TZ)): backups2datalad \`$(git -C b2d rev-parse --short HEAD)\`, dandisets \`draft\` at \`${base:0:8}\` ($(git -C dandisets show -s --format=%cI "$base")), mode \`$MODE\`${ZARR_MODE:+, zarr mode \`$ZARR_MODE\`}, $access."
+          python b2d/.github/scripts/mirror_dryrun_report.py \
+            --plan art/plan.json --results art/results --compare art/compare \
+            --superds-stat superds-stat.txt --header "$header" > report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          pr="$EVENT_PR"
+          if [ -z "$pr" ]; then
+            pr=$(gh pr list --repo "$REPO" --head "$GITHUB_REF_NAME" --json number --jq '.[0].number // empty')
+          fi
+          if [ -z "$pr" ]; then echo "No PR to comment on"; exit 0; fi
+          marker='<!-- backups2datalad:mirror-dryrun -->'
+          id=$(gh api "repos/$REPO/issues/$pr/comments" --paginate \
+            --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | tail -n1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@report.md > /dev/null
+          else
+            gh api -X POST "repos/$REPO/issues/$pr/comments" -F body=@report.md > /dev/null
+          fi

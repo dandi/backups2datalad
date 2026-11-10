@@ -61,10 +61,9 @@ class AsyncDandiClient(AsyncResource):
 
     @classmethod
     def for_dandi_instance(cls, instance: str, token: str) -> AsyncDandiClient:
-        headers = {
-            "User-Agent": USER_AGENT,
-            "Authorization": f"token {token}",
-        }
+        headers = {"User-Agent": USER_AGENT}
+        if token:
+            headers["Authorization"] = f"token {token}"
         return cls(
             session=httpx.AsyncClient(
                 base_url=known_instances[instance].api,
@@ -132,9 +131,9 @@ class AsyncDandiClient(AsyncResource):
 
     async def get_dandisets(self) -> AsyncGenerator[RemoteDandiset, None]:
         # Unlike the synchronous method, this always uses the draft version
-        async with aclosing(
-            self.paginate("/dandisets/", params={"embargoed": "true"})
-        ) as ait:
+        # Asking for embargoed Dandisets without a key is refused (401)
+        params = {"embargoed": "true"} if self.token else {}
+        async with aclosing(self.paginate("/dandisets/", params=params)) as ait:
             async for data in ait:
                 yield RemoteDandiset.from_data(self, data)
 
